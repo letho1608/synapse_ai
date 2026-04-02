@@ -1,0 +1,1 @@
+from synapse.apputil.anim import create_animation_mp4
