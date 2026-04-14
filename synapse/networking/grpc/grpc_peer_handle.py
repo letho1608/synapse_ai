@@ -231,7 +231,9 @@ class GRPCPeerHandle(PeerHandle):
     )
     loss = response.loss
     if train and not shard.is_first_layer():
-      grads = np.frombuffer(response.grads.tensor_data, dtype=np.dtype(response.grads.dtype)).reshape(response.grads.shape)
+      grads = None
+      if response.HasField("grads") and response.grads.tensor_data and response.grads.dtype:
+        grads = np.frombuffer(response.grads.tensor_data, dtype=np.dtype(response.grads.dtype)).reshape(response.grads.shape)
       return loss, grads
     else:
       return loss
