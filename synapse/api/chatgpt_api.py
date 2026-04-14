@@ -1613,6 +1613,25 @@ class ChatGPTAPI:
     max_steps = int(job.get("max_steps", 0) or 0)
     batch_size = int(job.get("batch_size", 1))
     max_length = min(int(job.get("max_length", 128)), 2048)
+    min_max_length = 64
+
+    def _is_cuda_oom_error(exc: Exception) -> bool:
+      msg = str(exc).lower()
+      patterns = (
+        "cuda out of memory",
+        "cuda_oom",
+        "outofmemoryerror",
+        "cublas_status_alloc_failed",
+      )
+      return any(p in msg for p in patterns)
+
+    def _clear_cuda_cache() -> None:
+      try:
+        import torch
+        if torch.cuda.is_available():
+          torch.cuda.empty_cache()
+      except Exception:
+        pass
 
     # GPU <= 3GB không phù hợp full fine-tune với batch/seq lớn.
     # Giảm cấu hình để tránh OOM ngay từ bước đầu.
@@ -1625,10 +1644,11 @@ class ChatGPTAPI:
             batch_size = 1
           if max_length > 128:
             max_length = 128
-          job["effective_batch_size"] = batch_size
-          job["effective_max_length"] = max_length
     except Exception:
       pass
+    job["effective_batch_size"] = batch_size
+    job["effective_max_length"] = max_length
+    job["oom_retries"] = 0
     try:
       path = Path(dataset_path)
       if not path.is_absolute():
@@ -1677,17 +1697,33 @@ class ChatGPTAPI:
         job["error"] = "Không có mẫu hợp lệ sau khi format"
         self.log_activity("Training Failed", model, "failed")
         return
-      def tokenize_one(text):
-        enc = tokenizer(text, truncation=True, max_length=max_length, padding="max_length", return_tensors="np")
-        ids = enc["input_ids"][0]
-        lab = np.array([x if x != pad_id else -100 for x in ids], dtype=np.int64)
-        return ids.astype(np.int64), lab, np.array([ids.shape[0]], dtype=np.int64)
+
+      def tokenize_batch(batch_texts: List[str], current_max_length: int):
+        # Dynamic padding theo batch giảm VRAM đáng kể so với padding="max_length" toàn cục.
+        enc = tokenizer(
+          batch_texts,
+          truncation=True,
+          max_length=current_max_length,
+          padding=True,
+          return_tensors="np",
+        )
+        input_ids = enc["input_ids"].astype(np.int64)
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is None:
+          attention_mask = (input_ids != pad_id).astype(np.int64)
+        else:
+          attention_mask = attention_mask.astype(np.int64)
+        labels = np.where(attention_mask > 0, input_ids, -100).astype(np.int64)
+        lengths = np.maximum(attention_mask.sum(axis=1), 1).astype(np.int64)
+        return input_ids, labels, lengths
+
       planned_steps = (len(texts) + batch_size - 1) // batch_size * epochs
       if max_steps > 0:
         total_steps = max(1, min(planned_steps, max_steps))
       else:
         total_steps = max(1, planned_steps)
       step_count = 0
+      effective_max_length = max_length
       for epoch in range(epochs):
         if self._training_job is None or self._training_job.get("job_id") != job_id:
           return
@@ -1700,33 +1736,80 @@ class ChatGPTAPI:
           if max_steps > 0 and step_count >= max_steps:
             break
           batch_idx = indices[start : start + batch_size]
-          batch_texts = [texts[i] for i in batch_idx]
-          batch_ids, batch_labels, batch_lengths = [], [], []
-          for t in batch_texts:
-            ids, lab, ln = tokenize_one(t)
-            batch_ids.append(ids)
-            batch_labels.append(lab)
-            batch_lengths.append(ln)
-          example_np = np.stack(batch_ids).astype(np.int64)
-          target_np = np.stack(batch_labels).astype(np.int64)
-          length_np = np.concatenate(batch_lengths).astype(np.int64)
-          try:
-            loss = await self.node.enqueue_example(base_shard, example_np, target_np, length_np, request_id=str(uuid.uuid4()), train=True)
-            if loss is not None and isinstance(loss, (int, float)):
-              job["loss"] = round(float(loss), 4)
-          except Exception as e:
-            if DEBUG >= 1:
-              traceback.print_exc()
-            job["status"] = "failed"
-            job["error"] = str(e)
-            self.log_activity("Training Failed", model, "failed")
-            return
-          step_count += 1
-          job["current_step"] = step_count
-          job["current_epoch"] = epoch
-          job["progress"] = min(100, int(100 * step_count / total_steps))
-          # Nhường event loop để endpoint status vẫn phản hồi được trong lúc train.
-          await asyncio.sleep(0)
+          pending_batches = [[texts[i] for i in batch_idx]]
+          while pending_batches:
+            if max_steps > 0 and step_count >= max_steps:
+              break
+            current_batch_texts = pending_batches.pop(0)
+            if not current_batch_texts:
+              continue
+
+            try:
+              example_np, target_np, length_np = tokenize_batch(current_batch_texts, effective_max_length)
+              loss = await self.node.enqueue_example(
+                base_shard,
+                example_np,
+                target_np,
+                length_np,
+                request_id=str(uuid.uuid4()),
+                train=True,
+              )
+              if loss is None:
+                raise RuntimeError("Training step trả về loss=None")
+              if isinstance(loss, (int, float)):
+                job["loss"] = round(float(loss), 4)
+              step_count += 1
+              job["current_step"] = step_count
+              job["current_epoch"] = epoch
+              job["progress"] = min(100, int(100 * step_count / total_steps))
+              # Nhường event loop để endpoint status vẫn phản hồi được trong lúc train.
+              await asyncio.sleep(0)
+            except Exception as e:
+              if not _is_cuda_oom_error(e):
+                if DEBUG >= 1:
+                  traceback.print_exc()
+                job["status"] = "failed"
+                job["error"] = str(e)
+                self.log_activity("Training Failed", model, "failed")
+                return
+
+              job["oom_retries"] = int(job.get("oom_retries", 0)) + 1
+              _clear_cuda_cache()
+
+              if effective_max_length > min_max_length:
+                prev_len = effective_max_length
+                effective_max_length = max(min_max_length, effective_max_length // 2)
+                job["effective_max_length"] = effective_max_length
+                pending_batches.insert(0, current_batch_texts)
+                if DEBUG >= 1:
+                  print(
+                    f"[training:{job_id}] CUDA OOM -> giảm max_length {prev_len} -> {effective_max_length} và retry"
+                  )
+                continue
+
+              if len(current_batch_texts) > 1:
+                mid = max(1, len(current_batch_texts) // 2)
+                left = current_batch_texts[:mid]
+                right = current_batch_texts[mid:]
+                if right:
+                  pending_batches.insert(0, right)
+                if left:
+                  pending_batches.insert(0, left)
+                if DEBUG >= 1:
+                  print(
+                    f"[training:{job_id}] CUDA OOM ở max_length={effective_max_length} -> tách batch {len(current_batch_texts)} thành {len(left)} + {len(right)}"
+                  )
+                continue
+
+              if DEBUG >= 1:
+                traceback.print_exc()
+              job["status"] = "failed"
+              job["error"] = (
+                "CUDA OOM dù đã giảm max_length và batch tối thiểu. "
+                "Hãy chọn model nhỏ hơn hoặc giảm max_length trong Training settings."
+              )
+              self.log_activity("Training Failed", model, "failed")
+              return
       if self._training_job and self._training_job.get("job_id") == job_id:
         job["status"] = "completed"
         job["progress"] = 100

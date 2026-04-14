@@ -471,7 +471,7 @@ class Node:
       self.outstanding_requests.pop(request_id)
       print(f"Error processing example for shard {shard}: {e}")
       traceback.print_exc()
-      return None
+      raise
         
   async def process_tensor(
     self,
