@@ -325,7 +325,10 @@
                                         <i class="fas fa-robot"></i>
                                     </div>
                                     <div class="chat-msg-bubble">
-                                        <div class="chat-msg-content" x-text="msg.content" style="white-space: pre-wrap;"></div>
+                                        <div x-show="msg.image" style="margin-bottom: 8px;">
+                                            <img :src="msg.image" style="max-width: 100%; max-height: 200px; border-radius: 4px; border: 1px solid var(--border-color);" />
+                                        </div>
+                                        <div class="chat-msg-content" x-text="msg.content" style="white-space: pre-wrap;" x-show="msg.content"></div>
                                         <div class="chat-msg-usage text-muted" x-show="msg.usage" x-text="msg.usage"></div>
                                     </div>
                                     <div class="chat-msg-avatar chat-msg-avatar-user" x-show="msg.role === 'user'">
@@ -340,15 +343,25 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="chat-input-wrap">
+                        <div style="padding: 0 16px;">
+                            <div x-show="testImageBase64" style="margin-bottom: 8px; position: relative; display: inline-block;">
+                                <img :src="testImageBase64" style="max-height: 80px; border-radius: 4px; border: 1px solid var(--border-color);" />
+                                <button type="button" class="btn btn-sm btn-danger" style="position: absolute; top: -8px; right: -8px; border-radius: 50%; padding: 2px 6px; font-size: 10px;" @click="testImageBase64 = null"><i class="fas fa-times"></i></button>
+                            </div>
+                        </div>
+                        <div class="chat-input-wrap" style="display: flex; gap: 8px; align-items: flex-end;">
+                            <input type="file" x-ref="chatImageInput" accept="image/*" class="d-none" @change="handleChatImageUpload($event)">
+                            <button type="button" class="btn btn-outline" style="padding: 10px 14px; margin-bottom: 0px; height: 100%;" @click="$refs.chatImageInput.click()" title="Đính kèm ảnh">
+                                <i class="fas fa-image"></i>
+                            </button>
                             <textarea class="chat-input" rows="1" placeholder="Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)"
                                 x-model="testInput"
-                                @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); if (isTesting) cancelTest(); else if (selectedModel && testInput.trim()) runTest(); }"
+                                @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); if (isTesting) cancelTest(); else if (selectedModel && (testInput.trim() || testImageBase64)) runTest(); }"
                                 :disabled="isTesting"></textarea>
                             <button type="button" class="btn chat-send-btn" 
                                 :class="isTesting ? 'btn-danger' : 'btn-primary'" 
                                 @click="isTesting ? cancelTest() : runTest()" 
-                                :disabled="!isTesting && (!selectedModel || !testInput.trim())" 
+                                :disabled="!isTesting && (!selectedModel || (!testInput.trim() && !testImageBase64))" 
                                 :title="isTesting ? 'Dừng (Enter)' : 'Gửi (Enter)'">
                                 <i class="fas fa-paper-plane" x-show="!isTesting"></i>
                                 <i class="fas fa-stop" x-show="isTesting"></i>
@@ -465,6 +478,9 @@
                             <div style="display: flex; gap: 8px; flex-wrap: wrap;">
                                 <button type="button" class="btn btn-outline btn-sm" @click="datasetCreateOpen = true">
                                     <i class="fas fa-plus"></i> Tạo dataset
+                                </button>
+                                <button type="button" class="btn btn-outline btn-sm" @click="datasetLinkOpen = true">
+                                    <i class="fas fa-link"></i> Link Folder Ảnh
                                 </button>
                                 <input type="file" x-ref="datasetUploadInput" accept=".json,.jsonl" class="d-none" @change="uploadDatasetFile($event)">
                                 <button type="button" class="btn btn-primary" :disabled="uploadLoading" @click="$refs.datasetUploadInput && $refs.datasetUploadInput.click()">
@@ -610,6 +626,30 @@
                         </div>
                     </div>
                 </div>
+
+                <!-- Modal Link Image Dataset -->
+                <div class="card" x-show="datasetLinkOpen" x-cloak style="max-width: 500px; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 1000; box-shadow: 0 10px 25px rgba(0,0,0,0.2);">
+                    <div class="card-header">
+                        <h2 class="card-title">Liên kết thư mục dữ liệu</h2>
+                        <button type="button" class="btn btn-outline btn-sm" @click="datasetLinkOpen = false">Đóng</button>
+                    </div>
+                    <div style="padding: 16px;">
+                        <p class="text-muted" style="font-size: 13px; margin-bottom: 12px;">Nhập đường dẫn tuyệt đối đến thư mục chứa ảnh và <strong>transcription.pk</strong> trên máy tính của bạn.</p>
+                        <div class="form-group">
+                            <label class="form-label">Tên hiển thị</label>
+                            <input type="text" class="form-input" x-model="datasetLinkName" placeholder="vd: My OCR Dataset">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Đường dẫn thư mục (Path)</label>
+                            <input type="text" class="form-input" x-model="datasetLinkPath" placeholder="C:\Users\...\data_folder">
+                        </div>
+                        <button type="button" class="btn btn-primary" :disabled="!datasetLinkName.trim() || !datasetLinkPath.trim() || datasetLinkLoading" @click="linkDataset()">
+                            <i class="fas fa-spinner fa-spin" x-show="datasetLinkLoading"></i>
+                            <span x-text="datasetLinkLoading ? 'Đang liên kết...' : 'Liên kết'"></span>
+                        </button>
+                    </div>
+                </div>
+                <div class="modal-backdrop" x-show="datasetLinkOpen" x-cloak @click="datasetLinkOpen = false" style="position: fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:999;"></div>
 
                 <!-- Giám Sát -->
                 <div x-show="currentPage === 'monitoring'" x-cloak>
@@ -1011,9 +1051,25 @@
                 datasetRenameLoading: false,
                 datasetValidateResult: null,
                 validateDatasetLoading: '',
+                datasetLinkOpen: false,
+                datasetLinkName: '',
+                datasetLinkPath: '',
+                datasetLinkLoading: false,
                 settingsForm: { default_model: '', theme: 'light' },
                 settingsLoading: false,
                 terminalLines: [],
+                testImageBase64: null,
+
+                handleChatImageUpload(ev) {
+                    const file = ev.target.files && ev.target.files[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        this.testImageBase64 = e.target.result;
+                    };
+                    reader.readAsDataURL(file);
+                    ev.target.value = '';
+                },
 
                 init() {
                     this.fetchStats();
@@ -1180,6 +1236,35 @@
                     } finally {
                         this.uploadLoading = false;
                         ev.target.value = '';
+                    }
+                },
+
+                async linkDataset() {
+                    if (!this.datasetLinkName.trim() || !this.datasetLinkPath.trim() || this.datasetLinkLoading) return;
+                    this.datasetLinkLoading = true;
+                    try {
+                        const res = await fetch('/v1/datasets/link', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                name: this.datasetLinkName,
+                                path: this.datasetLinkPath
+                            })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.datasetLinkOpen = false;
+                            this.datasetLinkName = '';
+                            this.datasetLinkPath = '';
+                            await this.fetchDatasets();
+                            await this.fetchStats();
+                        } else {
+                            alert(data.message || 'Liên kết thất bại');
+                        }
+                    } catch (e) {
+                        alert('Lỗi: ' + (e.message || e));
+                    } finally {
+                        this.datasetLinkLoading = false;
                     }
                 },
 
@@ -1477,10 +1562,20 @@
                 },
 
                 async runTest() {
-                    if (!this.selectedModel || !this.testInput.trim()) return;
-                    const userContent = this.testInput.trim();
+                    const hasText = !!(this.testInput && this.testInput.trim());
+                    const hasImg = !!this.testImageBase64;
+                    if (!this.selectedModel || (!hasText && !hasImg)) return;
+                    
+                    const userContent = hasText ? this.testInput.trim() : "";
+                    const imgContent = this.testImageBase64;
+                    
                     this.testInput = '';
-                    this.testChatMessages.push({ role: 'user', content: userContent });
+                    this.testImageBase64 = null;
+                    
+                    const uiMessage = { role: 'user', content: userContent };
+                    if (imgContent) uiMessage.image = imgContent;
+                    this.testChatMessages.push(uiMessage);
+                    
                     this.isTesting = true;
 
                     // Ép browser vẽ lại (spinner quay, nút đỏ) trước khi gọi API
@@ -1489,7 +1584,18 @@
 
                     try {
                         const temp = typeof this.testTemperature === 'number' ? this.testTemperature : 0.7;
-                        const messages = this.testChatMessages.map(m => ({ role: m.role, content: m.content }));
+                        const messages = this.testChatMessages.map(m => {
+                            if (m.image) {
+                                return {
+                                    role: m.role,
+                                    content: [
+                                        { type: 'text', text: m.content || "Hãy đọc nội dung từ văn bản hay hình ảnh." },
+                                        { type: 'image_url', image_url: { url: m.image } }
+                                    ]
+                                };
+                            }
+                            return { role: m.role, content: m.content || "" };
+                        });
                         
                         const startTime = performance.now();
                         this.abortController = new AbortController();

@@ -29,6 +29,7 @@ HF_MODELS: Dict[str, str] = {
     "tinyllama:1.1b": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "starcoder2:15b": "bigcode/starcoder2-15b",
     "nous-hermes2:10b": "NousResearch/Hermes-2-Pro-Mistral-7B",
+    "dcaybe1.0:8.7m": "dcaybe/dcaybe-1.0-8.7m",
 }
 
 # Tham số (hiển thị web: 0.5B, 1.5B, 7B...)
@@ -39,6 +40,7 @@ HF_MODEL_PARAMS: Dict[str, str] = {
     "codellama:7b": "7B", "deepseek-coder:6.7b": "6.7B", "neural-chat:7b": "7B", "openhermes2.5:7b": "7B",
     "solar:10.7b": "10.7B", "smollm2:360m": "360M", "tinyllama:1.1b": "1.1B", "starcoder2:15b": "15B",
     "nous-hermes2:10b": "7B",
+    "dcaybe1.0:8.7m": "8.7M",
 }
 
 # Số layer (chỉ dùng cho inference / sharding)
@@ -49,6 +51,12 @@ HF_MODEL_LAYERS: Dict[str, int] = {
     "codellama:7b": 32, "deepseek-coder:6.7b": 28, "neural-chat:7b": 32, "openhermes2.5:7b": 32,
     "solar:10.7b": 36, "smollm2:360m": 12, "tinyllama:1.1b": 22, "starcoder2:15b": 40,
     "nous-hermes2:10b": 32,
+    "dcaybe1.0:8.7m": 10,
+}
+
+# Các model chuyên biệt Computer Vision (đầu vào hình ảnh) thay vì LLM (đầu vào text).
+VISION_MODELS = {
+    "dcaybe1.0:8.7m"
 }
 
 
