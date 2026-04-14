@@ -65,7 +65,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self._model = None
         self._model_id: Optional[str] = None
         self._device = "cuda" if self._has_cuda() else "cpu"
-        self._force_cpu_training = False
 
     @staticmethod
     def _has_cuda() -> bool:
@@ -264,37 +263,18 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 return float(loss_val.item())
 
             device = next(self._model.parameters()).device
-            if self._force_cpu_training and device.type != "cpu":
-                if DEBUG >= 1:
-                    print("[PyTorchHF] CPU fallback is enabled; moving model to CPU for training.")
-                self._model = self._model.to("cpu")
-                self._optimizer = None
-                self._device = "cpu"
-                device = next(self._model.parameters()).device
-
             try:
                 return _run_train_step(device), None
             except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as oom:
                 if device.type != "cuda":
                     raise
                 if DEBUG >= 1:
-                    print("[PyTorchHF] CUDA OOM during training. Falling back to CPU training.")
+                    print("[PyTorchHF] CUDA OOM during training. Returning OOM error for adaptive retry.")
                 try:
-                    import gc
-
-                    self._force_cpu_training = True
-                    self._model = self._model.to("cpu")
-                    self._optimizer = None
-                    self._device = "cpu"
                     torch.cuda.empty_cache()
-                    gc.collect()
-                except Exception as switch_err:
-                    raise RuntimeError(f"PyTorchHF train: CUDA OOM and CPU fallback failed: {switch_err}") from oom
-
-                cpu_device = next(self._model.parameters()).device
-                if cpu_device.type != "cpu":
-                    cpu_device = torch.device("cpu")
-                return _run_train_step(cpu_device), None
+                except Exception:
+                    pass
+                raise RuntimeError(f"CUDA_OOM: {oom}") from oom
         except Exception as e:
             if DEBUG >= 1:
                 import traceback
