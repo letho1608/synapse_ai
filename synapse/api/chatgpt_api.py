@@ -1610,8 +1610,25 @@ class ChatGPTAPI:
     model = job.get("model", "")
     dataset_path = (job.get("dataset") or "").strip()
     epochs = int(job.get("epochs", 3))
-    batch_size = int(job.get("batch_size", 4))
-    max_length = min(int(job.get("max_length", 512)), 2048)
+    max_steps = int(job.get("max_steps", 0) or 0)
+    batch_size = int(job.get("batch_size", 1))
+    max_length = min(int(job.get("max_length", 128)), 2048)
+
+    # GPU <= 3GB không phù hợp full fine-tune với batch/seq lớn.
+    # Giảm cấu hình để tránh OOM ngay từ bước đầu.
+    try:
+      import torch
+      if torch.cuda.is_available():
+        total_vram_gb = float(torch.cuda.get_device_properties(0).total_memory) / (1024 ** 3)
+        if total_vram_gb <= 3.0:
+          if batch_size > 1:
+            batch_size = 1
+          if max_length > 128:
+            max_length = 128
+          job["effective_batch_size"] = batch_size
+          job["effective_max_length"] = max_length
+    except Exception:
+      pass
     try:
       path = Path(dataset_path)
       if not path.is_absolute():
@@ -1665,15 +1682,23 @@ class ChatGPTAPI:
         ids = enc["input_ids"][0]
         lab = np.array([x if x != pad_id else -100 for x in ids], dtype=np.int64)
         return ids.astype(np.int64), lab, np.array([ids.shape[0]], dtype=np.int64)
-      total_steps = max(1, (len(texts) + batch_size - 1) // batch_size * epochs)
+      planned_steps = (len(texts) + batch_size - 1) // batch_size * epochs
+      if max_steps > 0:
+        total_steps = max(1, min(planned_steps, max_steps))
+      else:
+        total_steps = max(1, planned_steps)
       step_count = 0
       for epoch in range(epochs):
         if self._training_job is None or self._training_job.get("job_id") != job_id:
           return
+        if max_steps > 0 and step_count >= max_steps:
+          break
         indices = np.random.permutation(len(texts)) if epoch > 0 else np.arange(len(texts))
         for start in range(0, len(indices), batch_size):
           if self._training_job is None or self._training_job.get("job_id") != job_id:
             return
+          if max_steps > 0 and step_count >= max_steps:
+            break
           batch_idx = indices[start : start + batch_size]
           batch_texts = [texts[i] for i in batch_idx]
           batch_ids, batch_labels, batch_lengths = [], [], []
@@ -1700,6 +1725,8 @@ class ChatGPTAPI:
           job["current_step"] = step_count
           job["current_epoch"] = epoch
           job["progress"] = min(100, int(100 * step_count / total_steps))
+          # Nhường event loop để endpoint status vẫn phản hồi được trong lúc train.
+          await asyncio.sleep(0)
       if self._training_job and self._training_job.get("job_id") == job_id:
         job["status"] = "completed"
         job["progress"] = 100
@@ -1734,17 +1761,23 @@ class ChatGPTAPI:
         self._training_job["error"] = str(e)
         self.log_activity("Training Failed", model, "failed")
 
+  async def _run_training_job_deferred(self, job: Dict) -> None:
+    # Cho phép HTTP response /v1/training/start được flush trước khi bắt đầu train nặng.
+    await asyncio.sleep(0.05)
+    await self._run_training_job(job)
+
   async def handle_post_training(self, request):
     try:
       body = await request.json() if request.can_read_body else {}
       model = (body.get("model") or "").strip()
       dataset = (body.get("dataset") or body.get("dataset_path") or "").strip()
       epochs = int(body.get("epochs", 10))
-      batch_size = int(body.get("batch_size", 16))
+      batch_size = max(1, int(body.get("batch_size", 1)))
       learning_rate = (body.get("learning_rate") or "").strip() or None
       save_every = int(body.get("save_every", 5))
       max_steps = int(body.get("max_steps", 0))
       warmup_steps = int(body.get("warmup_steps", 0))
+      max_length = min(int(body.get("max_length", 128)), 2048)
       output_model_name = (body.get("output_model_name") or body.get("output_name") or "").strip() or None
       checkpoint_dir = (body.get("checkpoint_dir") or "").strip() or None
       system_prompt = (body.get("system_prompt") or body.get("system") or "").strip() or None
@@ -1763,6 +1796,7 @@ class ChatGPTAPI:
         "save_every": save_every,
         "max_steps": max_steps,
         "warmup_steps": warmup_steps,
+        "max_length": max_length,
         "output_model_name": output_model_name,
         "checkpoint_dir": checkpoint_dir,
         "system_prompt": system_prompt,
@@ -1776,7 +1810,7 @@ class ChatGPTAPI:
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
       }
       self.log_activity("Training Started", model, "started")
-      asyncio.create_task(self._run_training_job(self._training_job))
+      asyncio.create_task(self._run_training_job_deferred(self._training_job))
       return web.json_response({
         "success": True,
         "status": "started",

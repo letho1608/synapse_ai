@@ -65,6 +65,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self._model = None
         self._model_id: Optional[str] = None
         self._device = "cuda" if self._has_cuda() else "cpu"
+        self._force_cpu_training = False
 
     @staticmethod
     def _has_cuda() -> bool:
@@ -101,7 +102,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                     print(f"[PyTorchHF] Cache miss or incomplete, loading from Hub: {_e}")
                 self.tokenizer = AutoTokenizer.from_pretrained(hf_id, **load_kw)
                 self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw)
-            if self._model.device.type if hasattr(self._model, "device") else "cpu" == "cpu":
+            if (self._model.device.type if hasattr(self._model, "device") else "cpu") == "cpu":
                 self._model = self._model.to(self._device)
             self._model_id = shard.model_id
             self.shard = shard
@@ -230,31 +231,70 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             import torch.nn.functional as F
             if self._model is None:
                 return None, None
+
+            def _run_train_step(device) -> float:
+                ex = example.astype(np.int64) if example.dtype != np.int64 else example
+                tg = target.astype(np.int64) if target.dtype != np.int64 else target
+                input_ids = torch.from_numpy(ex).to(device)
+                labels = torch.from_numpy(tg).to(device)
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                if labels.dim() == 1:
+                    labels = labels.unsqueeze(0)
+
+                self._model.train()
+                if device.type == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        out = self._model(input_ids)
+                else:
+                    out = self._model(input_ids)
+
+                logits = out.logits if hasattr(out, "logits") else out[0]
+                # Causal LM: shift; ignore_index=-100
+                shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+                shift_labels = labels[..., 1:].contiguous().view(-1)
+                loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+
+                opt = self._get_optimizer()
+                if opt is not None:
+                    opt.zero_grad(set_to_none=True)
+                    loss_val.backward()
+                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
+                    opt.step()
+                return float(loss_val.item())
+
             device = next(self._model.parameters()).device
-            if example.dtype != np.int64:
-                example = example.astype(np.int64)
-            if target.dtype != np.int64:
-                target = target.astype(np.int64)
-            input_ids = torch.from_numpy(example).to(device)
-            labels = torch.from_numpy(target).to(device)
-            if input_ids.dim() == 1:
-                input_ids = input_ids.unsqueeze(0)
-            if labels.dim() == 1:
-                labels = labels.unsqueeze(0)
-            self._model.train()
-            out = self._model(input_ids)
-            logits = out.logits if hasattr(out, "logits") else out[0]
-            # Causal LM: shift; ignore_index=-100
-            shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
-            shift_labels = labels[..., 1:].contiguous().view(-1)
-            loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-            opt = self._get_optimizer()
-            if opt is not None:
-                opt.zero_grad()
-                loss_val.backward()
-                torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
-                opt.step()
-            return float(loss_val.item()), None
+            if self._force_cpu_training and device.type != "cpu":
+                if DEBUG >= 1:
+                    print("[PyTorchHF] CPU fallback is enabled; moving model to CPU for training.")
+                self._model = self._model.to("cpu")
+                self._optimizer = None
+                self._device = "cpu"
+                device = next(self._model.parameters()).device
+
+            try:
+                return _run_train_step(device), None
+            except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as oom:
+                if device.type != "cuda":
+                    raise
+                if DEBUG >= 1:
+                    print("[PyTorchHF] CUDA OOM during training. Falling back to CPU training.")
+                try:
+                    import gc
+
+                    self._force_cpu_training = True
+                    self._model = self._model.to("cpu")
+                    self._optimizer = None
+                    self._device = "cpu"
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                except Exception as switch_err:
+                    raise RuntimeError(f"PyTorchHF train: CUDA OOM and CPU fallback failed: {switch_err}") from oom
+
+                cpu_device = next(self._model.parameters()).device
+                if cpu_device.type != "cpu":
+                    cpu_device = torch.device("cpu")
+                return _run_train_step(cpu_device), None
         except Exception as e:
             if DEBUG >= 1:
                 import traceback

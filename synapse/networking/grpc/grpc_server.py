@@ -98,14 +98,25 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     train = request.train
     request_id = request.request_id
 
-    if train and not shard.is_first_layer():
-      loss, grad = await self.node.process_example(shard, example, target, length, train, request_id)
-      tensor_data = grad.tobytes()
-      grad_tensor = node_service_pb2.Tensor(tensor_data=tensor_data, shape=grad.shape, dtype=str(grad.dtype))
-      return node_service_pb2.Loss(loss=loss, grads=grad_tensor)
+    result = await self.node.process_example(shard, example, target, length, train, request_id)
+
+    # process_example có thể trả về:
+    # - loss (float) cho shard đầu/cuối
+    # - (loss, grad) cho shard trung gian khi có backprop phân tán
+    if isinstance(result, tuple):
+      loss, grad = result
     else:
-      loss = await self.node.process_example(shard, example, target, length, train, request_id)
-      return node_service_pb2.Loss(loss=loss, grads=None)
+      loss, grad = result, None
+
+    loss_value = float(loss) if loss is not None else 0.0
+    if grad is not None:
+      grad_tensor = node_service_pb2.Tensor(
+        tensor_data=grad.tobytes(),
+        shape=grad.shape,
+        dtype=str(grad.dtype),
+      )
+      return node_service_pb2.Loss(loss=loss_value, grads=grad_tensor)
+    return node_service_pb2.Loss(loss=loss_value)
 
   async def CollectTopology(self, request, context):
     max_depth = request.max_depth
