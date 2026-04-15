@@ -20,10 +20,22 @@ def resolve_hf_model_id(model_name: str, base_model_id: Optional[str] = None) ->
 
 
 def load_raw_data(path: Path) -> List[Dict[str, Any]]:
-    """Đọc file json/jsonl thành list dict."""
+    """Đọc file json/jsonl HOẶC thư mục hình ảnh thành list dict."""
     path = Path(path).resolve()
+    
+    if path.is_dir():
+        # Hỗ trợ ImageDataset (OCR/Vision)
+        from synapse.data.simple_dataset import ImageDataset
+        try:
+            ds = ImageDataset(str(path))
+            if len(ds.data) > 0:
+                return ds.data
+        except Exception as e:
+            print(f"Lỗi nạp ImageDataset từ {path}: {e}")
+            
     if not path.is_file():
-        raise FileNotFoundError(f"Dataset không tồn tại: {path}")
+        raise FileNotFoundError(f"Dataset không tồn tại hoặc không phải là file hợp lệ: {path}")
+    
     data = []
     if path.suffix == ".jsonl":
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
