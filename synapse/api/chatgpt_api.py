@@ -341,6 +341,7 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_get("/v1/settings", self.handle_get_settings), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/settings", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/settings/save", self.handle_post_settings), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/cluster/resources", self.handle_get_cluster_resources), {"*": cors_options})
     # Static: PHẢI dùng prefix /_static/ (không dùng "/") vì add_static("/") match mọi path và chỉ cho GET/HEAD -> POST sẽ 405
     if "__compiled__" not in globals():
       self.static_dir = Path(__file__).parent.parent/"tinychat"
@@ -2120,6 +2121,170 @@ class ChatGPTAPI:
     if self._training_job is None:
       return web.json_response({"status": "idle", "job": None})
     return web.json_response({"status": self._training_job.get("status", "idle"), "job": self._training_job})
+
+  async def handle_get_cluster_resources(self, request):
+    """
+    Tổng hợp tài nguyên + layer sharding của tất cả node trong cluster.
+    Dùng cho trang Cluster UI để trực quan hóa RingMemoryWeightedPartitioning.
+    Trả về: danh sách node với chip, VRAM/RAM, TFLOPS, layer_start/end, share_pct, cpu_pct, gpu_util.
+    """
+    try:
+      topology = self.node.current_topology
+      partitions = []
+      total_layers = 32  # default
+      if topology and self.node.partitioning_strategy:
+        try:
+          partitions = self.node.partitioning_strategy.partition(topology)
+        except Exception:
+          partitions = []
+
+      # Lấy tailscale nodes để có tên thân thiện và IP
+      try:
+        ts_nodes = await self.node.get_tailscale_nodes()
+      except Exception:
+        ts_nodes = []
+      ts_map = {n.get("device_id", ""): n for n in ts_nodes if n.get("device_id")}
+
+      # Lấy cpu% và gpu util của máy này
+      try:
+        cpu_pct_self = psutil.cpu_percent()
+        ram_self = psutil.virtual_memory()
+        ram_used_self = round(ram_self.used / (1024**3), 2)
+        ram_total_self = round(ram_self.total / (1024**3), 2)
+      except Exception:
+        cpu_pct_self = 0
+        ram_used_self = 0
+        ram_total_self = 0
+      gpu_util_self = self._get_gpu_utilization()
+
+      # Tổng TFLOPS để tính tỷ lệ
+      nodes_raw = list(topology.all_nodes()) if topology else []
+      total_flops = sum(n[1].flops.fp16 for n in nodes_raw) if nodes_raw else 0
+
+      result = []
+      for partition in partitions:
+        node_id = partition.node_id
+        caps = topology.get_node(node_id) if topology else None
+        is_self = (node_id == self.node.id)
+
+        # Tên hiển thị: dùng tailscale name nếu có, else node_id đầu 8 ký tự
+        ts_info = ts_map.get(node_id, {})
+        display_name = ts_info.get("name") or ("Máy này" if is_self else node_id[:12])
+        addresses = ts_info.get("addresses") or []
+        ip = addresses[0] if addresses else ""
+
+        # Hardware từ DeviceCapabilities
+        chip = caps.chip if caps else "Unknown"
+        flops_fp16 = caps.flops.fp16 if caps else 0
+        flops_fp32 = caps.flops.fp32 if caps else 0
+        flops_int8 = caps.flops.int8 if caps else 0
+        vram_gb = round(caps.memory / 1024, 1) if caps and caps.memory else 0
+        ram_gb = round(caps.system_ram_mb / 1024, 1) if caps and caps.system_ram_mb else 0
+        cpu_cores = caps.cpu_cores if caps else 0
+        disk_gb = caps.disk_gb if caps else 0
+        gpu_backend = caps.gpu_backend if caps else "Unknown"
+        has_gpu = vram_gb > 0 and gpu_backend not in ("CPU (x86)", "CPU (ARM)", "Unknown")
+
+        # Layer range từ partition (start/end là 0.0→1.0 tỷ lệ)
+        share_pct = round((partition.end - partition.start) * 100, 1)
+        # Tính flops share thực tế
+        flops_share_pct = round(flops_fp16 / total_flops * 100, 1) if total_flops > 0 else share_pct
+
+        # Real-time metrics chỉ cho máy này (node khác không có)
+        cpu_pct = cpu_pct_self if is_self else None
+        gpu_util = gpu_util_self if is_self else None
+        ram_used = ram_used_self if is_self else None
+
+        result.append({
+          "node_id": node_id,
+          "name": display_name,
+          "ip": ip,
+          "is_self": is_self,
+          "chip": chip,
+          "gpu_backend": gpu_backend,
+          "has_gpu": has_gpu,
+          "vram_gb": vram_gb,
+          "ram_gb": ram_gb,
+          "cpu_cores": cpu_cores,
+          "disk_gb": disk_gb,
+          "flops_fp16": round(flops_fp16, 2),
+          "flops_fp32": round(flops_fp32, 2),
+          "flops_int8": round(flops_int8, 2),
+          "layer_start_pct": round(partition.start * 100, 1),
+          "layer_end_pct": round(partition.end * 100, 1),
+          "share_pct": share_pct,
+          "flops_share_pct": flops_share_pct,
+          # Real-time (chỉ máy này)
+          "cpu_pct": cpu_pct,
+          "gpu_utilization": gpu_util,
+          "ram_used_gb": ram_used,
+          "ram_total_gb": ram_gb if is_self else ram_gb,
+        })
+
+      # Nếu không có partitions (chỉ 1 node, chưa kết nối), tạo entry cho máy này
+      if not result:
+        try:
+          specs_self = self.node.device_capabilities
+          cpu_pct_s = psutil.cpu_percent()
+          ram_s = psutil.virtual_memory()
+          chip_s = specs_self.chip if specs_self else "Unknown"
+          vram_s = round(specs_self.memory / 1024, 1) if specs_self and specs_self.memory else 0
+          ram_s_gb = round(specs_self.system_ram_mb / 1024, 1) if specs_self and specs_self.system_ram_mb else 0
+          flops_s = specs_self.flops.fp16 if specs_self else 0
+          gpu_backend_s = specs_self.gpu_backend if specs_self else "Unknown"
+          has_gpu_s = vram_s > 0 and gpu_backend_s not in ("CPU (x86)", "CPU (ARM)", "Unknown")
+          result.append({
+            "node_id": self.node.id,
+            "name": "Máy này",
+            "ip": "127.0.0.1",
+            "is_self": True,
+            "chip": chip_s,
+            "gpu_backend": gpu_backend_s,
+            "has_gpu": has_gpu_s,
+            "vram_gb": vram_s,
+            "ram_gb": ram_s_gb,
+            "cpu_cores": specs_self.cpu_cores if specs_self else 0,
+            "disk_gb": specs_self.disk_gb if specs_self else 0,
+            "flops_fp16": round(flops_s, 2),
+            "flops_fp32": round(specs_self.flops.fp32, 2) if specs_self else 0,
+            "flops_int8": round(specs_self.flops.int8, 2) if specs_self else 0,
+            "layer_start_pct": 0.0,
+            "layer_end_pct": 100.0,
+            "share_pct": 100.0,
+            "flops_share_pct": 100.0,
+            "cpu_pct": cpu_pct_s,
+            "gpu_utilization": self._get_gpu_utilization(),
+            "ram_used_gb": round(ram_s.used / (1024**3), 2),
+            "ram_total_gb": ram_s_gb,
+          })
+        except Exception:
+          pass
+
+      # Peer graph từ topology
+      peer_graph = {}
+      if topology:
+        try:
+          peer_graph = {
+            nid: [{
+              "from_id": c.from_id,
+              "to_id": c.to_id,
+              "description": c.description,
+            } for c in conns]
+            for nid, conns in topology.peer_graph.items()
+          }
+        except Exception:
+          pass
+
+      return web.json_response({
+        "nodes": result,
+        "total_nodes": len(result),
+        "peer_graph": peer_graph,
+        "training_job": self._training_job,
+      })
+    except Exception as e:
+      if DEBUG >= 1:
+        traceback.print_exc()
+      return web.json_response({"nodes": [], "total_nodes": 0, "peer_graph": {}, "training_job": None}, status=500)
 
   async def handle_tokens(self, request_id: str, tokens: List[int], is_finished: bool):
     token_len = len(tokens) if isinstance(tokens, (list, tuple)) else "?"

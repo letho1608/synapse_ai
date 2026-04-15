@@ -7,8 +7,36 @@
     <title>Synapse AI Server</title>
     <link rel="stylesheet" href="/_static/production.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
     <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
-    <style>[x-cloak]{display:none!important}</style>
+    <style>[x-cloak]{display:none!important}
+    /* === Cluster page styles === */
+    .cluster-node-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:var(--spacing-md) var(--spacing-lg);margin-bottom:var(--spacing-md);transition:box-shadow .2s}
+    .cluster-node-card:hover{box-shadow:var(--shadow-md)}
+    .cluster-node-card.self-node{border-left:4px solid var(--primary);background:linear-gradient(to right,rgba(15,118,110,.04),var(--surface))}
+    .cluster-node-card.peer-node{border-left:4px solid var(--info)}
+    .cluster-node-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:3px 10px;border-radius:20px;background:var(--surface-hover)}
+    .cluster-node-chip.gpu-chip{background:#D1FAE5;color:#059669}
+    .cluster-node-chip.cpu-chip{background:#E0F2FE;color:#0EA5E9}
+    .resource-bar{height:10px;border-radius:6px;background:var(--divider);overflow:hidden;margin-top:4px}
+    .resource-bar-fill{height:100%;border-radius:6px;transition:width .5s ease}
+    .resource-bar-fill.bar-gpu{background:linear-gradient(90deg,#059669,#34D399)}
+    .resource-bar-fill.bar-cpu{background:linear-gradient(90deg,#0EA5E9,#38BDF8)}
+    .resource-bar-fill.bar-ram{background:linear-gradient(90deg,#D97706,#FCD34D)}
+    .resource-bar-fill.bar-layer{background:linear-gradient(90deg,var(--primary),var(--primary-light))}
+    .layer-bar-wrap{background:var(--surface-hover);border-radius:var(--radius-sm);height:28px;position:relative;overflow:hidden;margin:var(--spacing-sm) 0}
+    .layer-bar-segment{position:absolute;top:0;height:100%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:white;transition:left .5s ease,width .5s ease}
+    .chart-container{position:relative;height:260px}
+    .cluster-topo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:var(--spacing-md)}
+    .topo-node-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:var(--spacing-md);text-align:center;transition:box-shadow .2s;cursor:default}
+    .topo-node-card:hover{box-shadow:var(--shadow-md)}
+    .topo-node-icon{width:52px;height:52px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.3rem;margin:0 auto var(--spacing-sm)}
+    .topo-node-icon.topo-self{background:linear-gradient(135deg,var(--primary),var(--primary-light));color:#fff}
+    .topo-node-icon.topo-peer{background:linear-gradient(135deg,#0EA5E9,#38BDF8);color:#fff}
+    .model-family-btn{padding:4px 12px;border-radius:20px;border:1px solid var(--border);background:transparent;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s}
+    .model-family-btn.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+    .model-family-btn:hover:not(.active){background:var(--surface-hover)}
+    </style>
 </head>
 
 <body>
@@ -51,6 +79,11 @@
                     @click="currentPage = 'datasets'; sidebarOpen = false">
                     <i class="fas fa-database"></i>
                     <span>Dataset</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'cluster' }"
+                    @click="currentPage = 'cluster'; sidebarOpen = false; fetchClusterResources()">
+                    <i class="fas fa-network-wired"></i>
+                    <span>Cluster</span>
                 </a>
                 <a href="#" class="nav-item" :class="{ 'active': currentPage === 'monitoring' }"
                     @click="currentPage = 'monitoring'; sidebarOpen = false">
@@ -255,22 +288,42 @@
                     <div class="card">
                         <div class="card-header">
                             <h2 class="card-title">Có thể tải</h2>
-                            <span class="badge" x-text="modelList.available.length + ' model'"></span>
+                            <span class="badge" x-text="filteredAvailableModels().length + '/' + modelList.available.length + ' model'"></span>
+                        </div>
+                        <!-- Family filter + search -->
+                        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;align-items:center">
+                            <input type="text" class="form-input" placeholder="Tìm model..." x-model="modelSearch"
+                                style="max-width:200px;height:34px;padding:4px 12px;font-size:13px">
+                            <button class="model-family-btn" :class="{active: modelFamilyFilter===''}"
+                                @click="modelFamilyFilter=''">Tất cả</button>
+                            <template x-for="fam in ['Qwen','LLaMA','Phi','Mistral','Code']" :key="fam">
+                                <button class="model-family-btn" :class="{active: modelFamilyFilter===fam}"
+                                    @click="modelFamilyFilter===fam ? modelFamilyFilter='' : modelFamilyFilter=fam"
+                                    x-text="fam"></button>
+                            </template>
                         </div>
                         <div class="monitoring-table-wrap">
                             <table class="table monitoring-table">
                                 <thead>
                                     <tr>
                                         <th>Tên model</th>
-                                        <th>Trạng thái</th>
+                                        <th>Tham số</th>
+                                        <th>Family</th>
+                                        <th>HF Repo</th>
                                         <th>Thao tác</th>
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    <template x-for="m in modelList.available" :key="m.name">
+                                    <template x-for="m in filteredAvailableModels()" :key="m.name">
                                         <tr>
-                                            <td x-text="m.name"></td>
-                                            <td><span class="badge badge-muted">Chưa tải</span></td>
+                                            <td>
+                                                <span x-text="m.name"></span>
+                                                <span class="badge badge-sm badge-info" x-show="m.type==='code'" style="margin-left:4px">💻 Code</span>
+                                                <span class="badge badge-sm badge-success" x-show="m.type!=='code'" style="margin-left:4px">💬 Chat</span>
+                                            </td>
+                                            <td><span class="badge badge-muted" x-text="m.params || '-'"></span></td>
+                                            <td><span x-text="m.family || '-'" style="font-size:12px;color:var(--text-secondary)"></span></td>
+                                            <td><span x-text="m.hf_repo || '-'" style="font-size:11px;color:var(--text-muted);font-family:monospace"></span></td>
                                             <td>
                                                 <button type="button" class="btn btn-primary btn-sm"
                                                     :disabled="pullLoading === m.name"
@@ -282,8 +335,8 @@
                                             </td>
                                         </tr>
                                     </template>
-                                    <tr x-show="modelList.available.length === 0">
-                                        <td colspan="3" class="empty-state">Tất cả model gợi ý đã có trên máy.</td>
+                                    <tr x-show="filteredAvailableModels().length === 0">
+                                        <td colspan="5" class="empty-state">Không có model nào phù hợp với bộ lọc.</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -307,6 +360,12 @@
                                     <span class="text-muted">Temp.</span>
                                     <input type="number" class="form-input" min="0" max="2" step="0.1" x-model.number="testTemperature" placeholder="0.7" style="width: 64px;">
                                 </label>
+                                <button type="button" class="btn btn-outline btn-sm"
+                                    @click="testChatMessages = []"
+                                    title="Xóa lịch sử chat"
+                                    :disabled="isTesting">
+                                    <i class="fas fa-trash-alt"></i>
+                                </button>
                                 <button type="button" class="btn btn-outline btn-sm" @click="fetchModelList(); fetchModels();" title="Làm mới danh sách model">
                                     <i class="fas fa-sync-alt"></i>
                                 </button>
@@ -325,10 +384,7 @@
                                         <i class="fas fa-robot"></i>
                                     </div>
                                     <div class="chat-msg-bubble">
-                                        <div x-show="msg.image" style="margin-bottom: 8px;">
-                                            <img :src="msg.image" style="max-width: 100%; max-height: 200px; border-radius: 4px; border: 1px solid var(--border-color);" />
-                                        </div>
-                                        <div class="chat-msg-content" x-text="msg.content" style="white-space: pre-wrap;" x-show="msg.content"></div>
+                                        <div class="chat-msg-content" x-text="msg.content" style="white-space: pre-wrap;"></div>
                                         <div class="chat-msg-usage text-muted" x-show="msg.usage" x-text="msg.usage"></div>
                                     </div>
                                     <div class="chat-msg-avatar chat-msg-avatar-user" x-show="msg.role === 'user'">
@@ -343,25 +399,15 @@
                                 </div>
                             </div>
                         </div>
-                        <div style="padding: 0 16px;">
-                            <div x-show="testImageBase64" style="margin-bottom: 8px; position: relative; display: inline-block;">
-                                <img :src="testImageBase64" style="max-height: 80px; border-radius: 4px; border: 1px solid var(--border-color);" />
-                                <button type="button" class="btn btn-sm btn-danger" style="position: absolute; top: -8px; right: -8px; border-radius: 50%; padding: 2px 6px; font-size: 10px;" @click="testImageBase64 = null"><i class="fas fa-times"></i></button>
-                            </div>
-                        </div>
-                        <div class="chat-input-wrap" style="display: flex; gap: 8px; align-items: flex-end;">
-                            <input type="file" x-ref="chatImageInput" accept="image/*" class="d-none" @change="handleChatImageUpload($event)">
-                            <button type="button" class="btn btn-outline" style="padding: 10px 14px; margin-bottom: 0px; height: 100%;" @click="$refs.chatImageInput.click()" title="Đính kèm ảnh">
-                                <i class="fas fa-image"></i>
-                            </button>
+                        <div class="chat-input-wrap">
                             <textarea class="chat-input" rows="1" placeholder="Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)"
                                 x-model="testInput"
-                                @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); if (isTesting) cancelTest(); else if (selectedModel && (testInput.trim() || testImageBase64)) runTest(); }"
+                                @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); if (isTesting) cancelTest(); else if (selectedModel && testInput.trim()) runTest(); }"
                                 :disabled="isTesting"></textarea>
                             <button type="button" class="btn chat-send-btn" 
                                 :class="isTesting ? 'btn-danger' : 'btn-primary'" 
                                 @click="isTesting ? cancelTest() : runTest()" 
-                                :disabled="!isTesting && (!selectedModel || (!testInput.trim() && !testImageBase64))" 
+                                :disabled="!isTesting && (!selectedModel || !testInput.trim())" 
                                 :title="isTesting ? 'Dừng (Enter)' : 'Gửi (Enter)'">
                                 <i class="fas fa-paper-plane" x-show="!isTesting"></i>
                                 <i class="fas fa-stop" x-show="isTesting"></i>
@@ -369,6 +415,297 @@
                         </div>
                     </div>
                 </div>
+
+                <!-- ===== CLUSTER RESOURCES PAGE ===== -->
+                <div x-show="currentPage === 'cluster'" x-cloak
+                    x-init="$watch('currentPage', v => { if(v==='cluster') { fetchClusterResources(); } })">
+
+                    <!-- Header summary row -->
+                    <div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));margin-bottom:20px">
+                        <div class="stat-card" style="border-left-color:#059669">
+                            <div class="stat-value" x-text="clusterResources.length" style="color:#059669">0</div>
+                            <div class="stat-label">Node kết nối</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.flops_fp16||0),0).toFixed(1) + ' TF'">0 TF</div>
+                            <div class="stat-label">Tổng TFLOPS fp16</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.vram_gb||0),0).toFixed(1) + ' GB'">0 GB</div>
+                            <div class="stat-label">Tổng VRAM</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.ram_gb||0),0).toFixed(1) + ' GB'">0 GB</div>
+                            <div class="stat-label">Tổng RAM hệ thống</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.cpu_cores||0),0)">0</div>
+                            <div class="stat-label">Tổng CPU Cores</div>
+                        </div>
+                    </div>
+
+                    <!-- Layer Sharding Visualization -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-layer-group" style="color:var(--primary);margin-right:8px"></i>Phân chia Layer Model theo Node</h2>
+                            <div style="display:flex;gap:8px;align-items:center">
+                                <span class="badge badge-muted" x-text="clusterResources.length + ' node'"></span>
+                                <button class="btn btn-outline btn-sm" @click="fetchClusterResources()" :disabled="clusterLoading">
+                                    <i class="fas fa-sync-alt" :class="{'fa-spin':clusterLoading}"></i> Làm mới
+                                </button>
+                            </div>
+                        </div>
+                        <p class="text-muted" style="font-size:13px;margin-bottom:16px">
+                            Thuật toán <strong>RingMemoryWeighted</strong>: phân chia layer theo tỷ lệ TFLOPS fp16.
+                            Node có GPU mạnh hơn xử lý nhiều layer hơn — tăng tốc inference &amp; training phân tán.
+                        </p>
+
+                        <!-- Visual layer bar -->
+                        <div class="layer-bar-wrap" x-show="clusterResources.length > 0">
+                            <template x-for="(node, idx) in clusterResources" :key="node.node_id">
+                                <div class="layer-bar-segment"
+                                    :style="`left:${node.layer_start_pct}%;width:${node.layer_end_pct - node.layer_start_pct}%;background:${idx===0?'var(--primary)':idx===1?'#0EA5E9':idx===2?'#D97706':idx===3?'#7C3AED':'#059669'}`">
+                                    <span x-text="node.name.length>8 ? node.name.slice(0,8)+'…' : node.name" style="text-shadow:0 1px 3px rgba(0,0,0,.4)"></span>
+                                </div>
+                            </template>
+                        </div>
+                        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:16px">
+                            <span>Layer 0%</span><span>50%</span><span>100%</span>
+                        </div>
+
+                        <!-- Per-node detail bars -->
+                        <template x-for="(node, idx) in clusterResources" :key="node.node_id">
+                            <div class="cluster-node-card" :class="node.is_self ? 'self-node' : 'peer-node'">
+                                <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+                                    <div style="display:flex;align-items:center;gap:10px">
+                                        <div :style="`width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1rem;color:#fff;background:${node.is_self?'linear-gradient(135deg,var(--primary),var(--primary-light))':'linear-gradient(135deg,#0EA5E9,#38BDF8)'}`">
+                                            <i :class="node.has_gpu ? 'fas fa-microchip' : 'fas fa-server'"></i>
+                                        </div>
+                                        <div>
+                                            <div style="font-weight:700;font-size:15px" x-text="node.name"></div>
+                                            <div style="font-size:12px;color:var(--text-muted)" x-text="node.ip || node.node_id.slice(0,12)"></div>
+                                        </div>
+                                        <span class="cluster-node-chip" :class="node.has_gpu ? 'gpu-chip' : 'cpu-chip'">
+                                            <i :class="node.has_gpu ? 'fas fa-bolt' : 'fas fa-microchip'"></i>
+                                            <span x-text="node.has_gpu ? 'GPU' : 'CPU'"></span>
+                                        </span>
+                                        <span x-show="node.is_self" class="badge badge-success" style="font-size:10px">Máy này</span>
+                                    </div>
+                                    <div style="text-align:right">
+                                        <div style="font-size:22px;font-weight:800;color:var(--primary)" x-text="node.share_pct + '%'"></div>
+                                        <div style="font-size:11px;color:var(--text-muted)">Layer phân chia</div>
+                                    </div>
+                                </div>
+
+                                <!-- Chip info row -->
+                                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px">
+                                    <span><i class="fas fa-microchip" style="color:var(--primary)"></i> <span x-text="node.chip || 'Unknown'"></span></span>
+                                    <span x-show="node.vram_gb > 0"><i class="fas fa-memory" style="color:#059669"></i> VRAM <strong x-text="node.vram_gb + ' GB'"></strong></span>
+                                    <span><i class="fas fa-brain" style="color:#0EA5E9"></i> RAM <strong x-text="node.ram_gb + ' GB'"></strong></span>
+                                    <span x-show="node.flops_fp16 > 0"><i class="fas fa-tachometer-alt" style="color:#D97706"></i> <strong x-text="node.flops_fp16.toFixed(1) + ' TFLOPS'"></strong> fp16</span>
+                                    <span><i class="fas fa-cogs" style="color:var(--text-muted)"></i> <span x-text="node.cpu_cores + ' cores'"></span></span>
+                                    <span x-show="node.gpu_backend && node.gpu_backend !== 'Unknown'"><i class="fas fa-layer-group"></i> <span x-text="node.gpu_backend"></span></span>
+                                </div>
+
+                                <!-- Layer range bar -->
+                                <div style="margin-bottom:10px">
+                                    <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:3px">
+                                        <span>Layer <strong x-text="node.layer_start_pct + '%'"></strong></span>
+                                        <span>→ <strong x-text="node.layer_end_pct + '%'"></strong> (<span x-text="node.share_pct + '% tổng'"></span>)</span>
+                                    </div>
+                                    <div class="resource-bar">
+                                        <div class="resource-bar-fill bar-layer"
+                                            :style="`margin-left:${node.layer_start_pct}%;width:${node.layer_end_pct - node.layer_start_pct}%`"></div>
+                                    </div>
+                                </div>
+
+                                <!-- Real-time metrics (chỉ máy này) -->
+                                <div x-show="node.is_self && node.cpu_pct !== null" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
+                                    <div>
+                                        <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px">
+                                            <span class="text-muted">CPU</span>
+                                            <span x-text="(node.cpu_pct || 0).toFixed(0) + '%'"></span>
+                                        </div>
+                                        <div class="resource-bar">
+                                            <div class="resource-bar-fill bar-cpu" :style="`width:${node.cpu_pct||0}%`"></div>
+                                        </div>
+                                    </div>
+                                    <div x-show="node.ram_total_gb > 0">
+                                        <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px">
+                                            <span class="text-muted">RAM</span>
+                                            <span x-text="(node.ram_used_gb||0).toFixed(1) + '/' + node.ram_total_gb + ' GB'"></span>
+                                        </div>
+                                        <div class="resource-bar">
+                                            <div class="resource-bar-fill bar-ram" :style="`width:${node.ram_total_gb > 0 ? (node.ram_used_gb/node.ram_total_gb*100) : 0}%`"></div>
+                                        </div>
+                                    </div>
+                                    <div x-show="node.gpu_utilization !== null && node.gpu_utilization !== undefined">
+                                        <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px">
+                                            <span class="text-muted">GPU Util</span>
+                                            <span x-text="node.gpu_utilization + '%'"></span>
+                                        </div>
+                                        <div class="resource-bar">
+                                            <div class="resource-bar-fill bar-gpu" :style="`width:${node.gpu_utilization||0}%`"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div x-show="!node.is_self" style="font-size:11px;color:var(--text-muted);margin-top:4px;font-style:italic">
+                                    <i class="fas fa-info-circle"></i> Số liệu CPU/RAM realtime chỉ có cho máy này. Node khác hiển thị capacity phần cứng.
+                                </div>
+                            </div>
+                        </template>
+
+                        <div x-show="clusterResources.length === 0 && !clusterLoading" class="empty-state">
+                            <i class="fas fa-network-wired" style="font-size:2rem;opacity:.3;margin-bottom:8px;display:block"></i>
+                            Chưa có dữ liệu cluster. Kết nối các node qua Tailscale để thấy phân chia tài nguyên.
+                        </div>
+                        <div x-show="clusterLoading" class="empty-state">
+                            <i class="fas fa-spinner fa-spin" style="font-size:1.5rem;margin-bottom:8px;display:block"></i>
+                            Đang tải dữ liệu cluster...
+                        </div>
+                    </div>
+
+                    <!-- Charts row: Layer chart + TFLOPS donut -->
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px" x-show="clusterResources.length > 0">
+                        <div class="card" style="margin-bottom:0">
+                            <div class="card-header"><h2 class="card-title"><i class="fas fa-chart-bar" style="color:var(--primary);margin-right:6px"></i>Phân chia Layer (% tổng)</h2></div>
+                            <div class="chart-container">
+                                <canvas id="layerChart" x-ref="layerChart"></canvas>
+                            </div>
+                        </div>
+                        <div class="card" style="margin-bottom:0">
+                            <div class="card-header"><h2 class="card-title"><i class="fas fa-chart-pie" style="color:#D97706;margin-right:6px"></i>Phân phối TFLOPS fp16</h2></div>
+                            <div class="chart-container">
+                                <canvas id="flopsDonut" x-ref="flopsDonut"></canvas>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Network Topology Cards -->
+                    <div class="card" x-show="clusterResources.length > 0">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-project-diagram" style="color:var(--info);margin-right:8px"></i>Sơ đồ Node trong Cluster</h2>
+                        </div>
+                        <div class="cluster-topo-grid">
+                            <template x-for="node in clusterResources" :key="node.node_id">
+                                <div class="topo-node-card">
+                                    <div class="topo-node-icon" :class="node.is_self ? 'topo-self' : 'topo-peer'">
+                                        <i :class="node.has_gpu ? 'fas fa-microchip' : 'fas fa-server'"></i>
+                                    </div>
+                                    <div style="font-weight:700;margin-bottom:2px" x-text="node.name"></div>
+                                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px" x-text="node.ip"></div>
+                                    <div style="font-size:12px;margin-bottom:4px">
+                                        <span class="badge" :class="node.has_gpu ? 'badge-success' : 'badge-info'" x-text="node.has_gpu ? '⚡ GPU: ' + node.chip : '🔧 CPU: ' + (node.chip||'').slice(0,18)"></span>
+                                    </div>
+                                    <div style="font-size:12px;color:var(--text-secondary)">
+                                        <span x-show="node.vram_gb > 0" x-text="node.vram_gb + ' GB VRAM'"></span>
+                                        <span x-show="node.vram_gb <= 0" x-text="node.ram_gb + ' GB RAM'"></span>
+                                    </div>
+                                    <div style="margin-top:8px">
+                                        <div class="resource-bar">
+                                            <div class="resource-bar-fill bar-layer"
+                                                :style="`margin-left:${node.layer_start_pct}%;width:${node.layer_end_pct-node.layer_start_pct}%`"></div>
+                                        </div>
+                                        <div style="font-size:10px;color:var(--text-muted);margin-top:3px" x-text="node.share_pct + '% layers'"></div>
+                                    </div>
+                                    <div style="margin-top:6px">
+                                        <span class="badge badge-muted" style="font-size:10px" x-text="node.flops_fp16 > 0 ? node.flops_fp16.toFixed(1) + ' TFLOPS' : 'CPU only'"></span>
+                                        <span x-show="node.is_self" class="badge badge-success" style="font-size:10px;margin-left:4px">● Online</span>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+
+                    <!-- Resource Summary Table -->
+                    <div class="card" x-show="clusterResources.length > 0">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-table" style="color:var(--primary);margin-right:8px"></i>Bảng Tài nguyên Chi tiết</h2>
+                        </div>
+                        <div class="monitoring-table-wrap">
+                            <table class="table">
+                                <thead>
+                                    <tr>
+                                        <th>Node</th>
+                                        <th>Chip</th>
+                                        <th>VRAM/RAM</th>
+                                        <th>TFLOPS fp16</th>
+                                        <th>CPU Cores</th>
+                                        <th>Layer %</th>
+                                        <th>CPU Hiện tại</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <template x-for="node in clusterResources" :key="node.node_id">
+                                        <tr :class="node.is_self ? 'row-self' : ''">
+                                            <td>
+                                                <span style="font-weight:600" x-text="node.name"></span>
+                                                <span x-show="node.is_self" class="badge badge-success badge-sm">Máy này</span>
+                                                <div style="font-size:11px;color:var(--text-muted)" x-text="node.ip"></div>
+                                            </td>
+                                            <td>
+                                                <span x-text="node.chip || 'Unknown'" style="font-size:12px"></span>
+                                                <div style="font-size:11px;color:var(--text-muted)" x-text="node.gpu_backend"></div>
+                                            </td>
+                                            <td>
+                                                <span x-show="node.vram_gb > 0" class="badge badge-success" x-text="node.vram_gb + ' GB VRAM'"></span>
+                                                <span x-text="node.ram_gb + ' GB RAM'" style="font-size:12px;display:block;margin-top:2px"></span>
+                                            </td>
+                                            <td>
+                                                <span x-show="node.flops_fp16 > 0" style="font-weight:700;color:var(--primary)" x-text="node.flops_fp16.toFixed(2) + ' TF'"></span>
+                                                <span x-show="node.flops_fp16 <= 0" class="text-muted">CPU only</span>
+                                            </td>
+                                            <td x-text="node.cpu_cores"></td>
+                                            <td>
+                                                <div style="font-weight:700" x-text="node.share_pct + '%'"></div>
+                                                <div style="font-size:11px;color:var(--text-muted)" x-text="node.layer_start_pct + '% → ' + node.layer_end_pct + '%'"></div>
+                                            </td>
+                                            <td>
+                                                <span x-show="node.cpu_pct !== null && node.cpu_pct !== undefined" x-text="node.cpu_pct + '%'"></span>
+                                                <span x-show="node.cpu_pct === null || node.cpu_pct === undefined" class="text-muted">-</span>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Training cluster panel (shown when training is active) -->
+                    <div class="card" x-show="clusterTrainingJob && clusterTrainingJob.status === 'started'"
+                        style="border-left:4px solid var(--warning)">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-graduation-cap" style="color:var(--warning);margin-right:8px"></i>Training Cluster đang chạy</h2>
+                            <span class="badge badge-warning" x-text="clusterTrainingJob ? clusterTrainingJob.status : ''"></span>
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+                            <div>
+                                <span class="text-muted" style="font-size:12px">Model:</span>
+                                <strong x-text="clusterTrainingJob && clusterTrainingJob.model"></strong>
+                            </div>
+                            <div>
+                                <span class="text-muted" style="font-size:12px">Epoch:</span>
+                                <strong x-text="(clusterTrainingJob && clusterTrainingJob.current_epoch || 0) + '/' + (clusterTrainingJob && clusterTrainingJob.epochs)"></strong>
+                            </div>
+                            <div>
+                                <span class="text-muted" style="font-size:12px">Tiến độ:</span>
+                                <strong x-text="(clusterTrainingJob && clusterTrainingJob.progress || 0) + '%'"></strong>
+                            </div>
+                            <div x-show="clusterTrainingJob && clusterTrainingJob.loss !== null">
+                                <span class="text-muted" style="font-size:12px">Loss:</span>
+                                <strong x-text="clusterTrainingJob && clusterTrainingJob.loss"></strong>
+                            </div>
+                        </div>
+                        <div class="progress">
+                            <div class="progress-bar" :style="`width:${clusterTrainingJob && clusterTrainingJob.progress || 0}%`"></div>
+                        </div>
+                        <p class="text-muted" style="font-size:12px;margin-top:8px">
+                            Dữ liệu được phân chia qua <strong x-text="clusterResources.length"></strong> node theo thuật toán RingMemoryWeighted.
+                            Mỗi node xử lý phần layers được phân công ở trên.
+                        </p>
+                    </div>
+                </div>
+                <!-- ===== END CLUSTER PAGE ===== -->
 
                 <!-- Training Page: Training với dataset -->
                 <div x-show="currentPage === 'training'" x-cloak>
@@ -478,9 +815,6 @@
                             <div style="display: flex; gap: 8px; flex-wrap: wrap;">
                                 <button type="button" class="btn btn-outline btn-sm" @click="datasetCreateOpen = true">
                                     <i class="fas fa-plus"></i> Tạo dataset
-                                </button>
-                                <button type="button" class="btn btn-outline btn-sm" @click="datasetLinkOpen = true">
-                                    <i class="fas fa-link"></i> Link Folder Ảnh
                                 </button>
                                 <input type="file" x-ref="datasetUploadInput" accept=".json,.jsonl" class="d-none" @change="uploadDatasetFile($event)">
                                 <button type="button" class="btn btn-primary" :disabled="uploadLoading" @click="$refs.datasetUploadInput && $refs.datasetUploadInput.click()">
@@ -626,30 +960,6 @@
                         </div>
                     </div>
                 </div>
-
-                <!-- Modal Link Image Dataset -->
-                <div class="card" x-show="datasetLinkOpen" x-cloak style="max-width: 500px; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 1000; box-shadow: 0 10px 25px rgba(0,0,0,0.2);">
-                    <div class="card-header">
-                        <h2 class="card-title">Liên kết thư mục dữ liệu</h2>
-                        <button type="button" class="btn btn-outline btn-sm" @click="datasetLinkOpen = false">Đóng</button>
-                    </div>
-                    <div style="padding: 16px;">
-                        <p class="text-muted" style="font-size: 13px; margin-bottom: 12px;">Nhập đường dẫn tuyệt đối đến thư mục chứa ảnh và <strong>transcription.pk</strong> trên máy tính của bạn.</p>
-                        <div class="form-group">
-                            <label class="form-label">Tên hiển thị</label>
-                            <input type="text" class="form-input" x-model="datasetLinkName" placeholder="vd: My OCR Dataset">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Đường dẫn thư mục (Path)</label>
-                            <input type="text" class="form-input" x-model="datasetLinkPath" placeholder="C:\Users\...\data_folder">
-                        </div>
-                        <button type="button" class="btn btn-primary" :disabled="!datasetLinkName.trim() || !datasetLinkPath.trim() || datasetLinkLoading" @click="linkDataset()">
-                            <i class="fas fa-spinner fa-spin" x-show="datasetLinkLoading"></i>
-                            <span x-text="datasetLinkLoading ? 'Đang liên kết...' : 'Liên kết'"></span>
-                        </button>
-                    </div>
-                </div>
-                <div class="modal-backdrop" x-show="datasetLinkOpen" x-cloak @click="datasetLinkOpen = false" style="position: fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:999;"></div>
 
                 <!-- Giám Sát -->
                 <div x-show="currentPage === 'monitoring'" x-cloak>
@@ -1022,7 +1332,7 @@
                 trainingModel: '',
                 trainingDataset: '',
                 trainingEpochs: 10,
-                trainingBatchSize: 1,
+                trainingBatchSize: 16,
                 trainingLearningRate: '1e-5',
                 trainingSaveEvery: 5,
                 trainingMaxSteps: 0,
@@ -1051,25 +1361,18 @@
                 datasetRenameLoading: false,
                 datasetValidateResult: null,
                 validateDatasetLoading: '',
-                datasetLinkOpen: false,
-                datasetLinkName: '',
-                datasetLinkPath: '',
-                datasetLinkLoading: false,
                 settingsForm: { default_model: '', theme: 'light' },
                 settingsLoading: false,
                 terminalLines: [],
-                testImageBase64: null,
-
-                handleChatImageUpload(ev) {
-                    const file = ev.target.files && ev.target.files[0];
-                    if (!file) return;
-                    const reader = new FileReader();
-                    reader.onload = (e) => {
-                        this.testImageBase64 = e.target.result;
-                    };
-                    reader.readAsDataURL(file);
-                    ev.target.value = '';
-                },
+                // === Cluster Resources ===
+                clusterResources: [],
+                clusterLoading: false,
+                clusterTrainingJob: null,
+                _layerChart: null,
+                _flopsChart: null,
+                // === Model filter ===
+                modelSearch: '',
+                modelFamilyFilter: '',
 
                 init() {
                     this.fetchStats();
@@ -1096,6 +1399,7 @@
                         if (this.currentPage === 'datasets') this.fetchDatasets();
                         if (this.currentPage === 'settings') this.fetchSettings();
                         if (this.currentPage === 'test' || this.currentPage === 'models') this.fetchModelList();
+                        if (this.currentPage === 'cluster') this.fetchClusterResources();
                     }, 5000);
                     // Log terminal cập nhật nhanh hơn khi đang xem Dashboard để bám sát output thật
                     setInterval(() => {
@@ -1236,35 +1540,6 @@
                     } finally {
                         this.uploadLoading = false;
                         ev.target.value = '';
-                    }
-                },
-
-                async linkDataset() {
-                    if (!this.datasetLinkName.trim() || !this.datasetLinkPath.trim() || this.datasetLinkLoading) return;
-                    this.datasetLinkLoading = true;
-                    try {
-                        const res = await fetch('/v1/datasets/link', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                name: this.datasetLinkName,
-                                path: this.datasetLinkPath
-                            })
-                        });
-                        const data = await res.json();
-                        if (data.success) {
-                            this.datasetLinkOpen = false;
-                            this.datasetLinkName = '';
-                            this.datasetLinkPath = '';
-                            await this.fetchDatasets();
-                            await this.fetchStats();
-                        } else {
-                            alert(data.message || 'Liên kết thất bại');
-                        }
-                    } catch (e) {
-                        alert('Lỗi: ' + (e.message || e));
-                    } finally {
-                        this.datasetLinkLoading = false;
                     }
                 },
 
@@ -1562,20 +1837,10 @@
                 },
 
                 async runTest() {
-                    const hasText = !!(this.testInput && this.testInput.trim());
-                    const hasImg = !!this.testImageBase64;
-                    if (!this.selectedModel || (!hasText && !hasImg)) return;
-                    
-                    const userContent = hasText ? this.testInput.trim() : "";
-                    const imgContent = this.testImageBase64;
-                    
+                    if (!this.selectedModel || !this.testInput.trim()) return;
+                    const userContent = this.testInput.trim();
                     this.testInput = '';
-                    this.testImageBase64 = null;
-                    
-                    const uiMessage = { role: 'user', content: userContent };
-                    if (imgContent) uiMessage.image = imgContent;
-                    this.testChatMessages.push(uiMessage);
-                    
+                    this.testChatMessages.push({ role: 'user', content: userContent });
                     this.isTesting = true;
 
                     // Ép browser vẽ lại (spinner quay, nút đỏ) trước khi gọi API
@@ -1584,18 +1849,7 @@
 
                     try {
                         const temp = typeof this.testTemperature === 'number' ? this.testTemperature : 0.7;
-                        const messages = this.testChatMessages.map(m => {
-                            if (m.image) {
-                                return {
-                                    role: m.role,
-                                    content: [
-                                        { type: 'text', text: m.content || "Hãy đọc nội dung từ văn bản hay hình ảnh." },
-                                        { type: 'image_url', image_url: { url: m.image } }
-                                    ]
-                                };
-                            }
-                            return { role: m.role, content: m.content || "" };
-                        });
+                        const messages = this.testChatMessages.map(m => ({ role: m.role, content: m.content }));
                         
                         const startTime = performance.now();
                         this.abortController = new AbortController();
@@ -1685,10 +1939,142 @@
                         'datasets': 'Quản Lý Dataset',
                         'monitoring': 'Giám Sát Hệ Thống',
                         'settings': 'Cài Đặt',
+                        'cluster': 'Cluster Resources',
                         'about': 'Giới thiệu'
                     };
                     return titles[this.currentPage] || 'Synapse AI';
-                }
+                },
+
+                // ===== CLUSTER RESOURCES =====
+                async fetchClusterResources() {
+                    this.clusterLoading = true;
+                    try {
+                        const res = await fetch('/v1/cluster/resources');
+                        const data = await res.json();
+                        this.clusterResources = data.nodes || [];
+                        this.clusterTrainingJob = data.training_job || null;
+                        this.$nextTick(() => this.renderClusterCharts());
+                    } catch (e) {
+                        console.error('fetchClusterResources:', e);
+                        this.clusterResources = [];
+                    } finally {
+                        this.clusterLoading = false;
+                    }
+                },
+
+                renderClusterCharts() {
+                    if (typeof Chart === 'undefined') return;
+                    const nodes = this.clusterResources;
+                    if (!nodes || nodes.length === 0) return;
+                    const COLORS = ['#0F766E','#0EA5E9','#D97706','#7C3AED','#059669','#DC2626','#F59E0B'];
+
+                    const layerCanvas = document.getElementById('layerChart');
+                    if (layerCanvas) {
+                        if (this._layerChart) { this._layerChart.destroy(); this._layerChart = null; }
+                        this._layerChart = new Chart(layerCanvas, {
+                            type: 'bar',
+                            data: {
+                                labels: nodes.map(n => n.name),
+                                datasets: [{
+                                    label: 'Layer phân chia (%)',
+                                    data: nodes.map(n => n.share_pct),
+                                    backgroundColor: nodes.map((_, i) => COLORS[i % COLORS.length] + 'CC'),
+                                    borderColor: nodes.map((_, i) => COLORS[i % COLORS.length]),
+                                    borderWidth: 2, borderRadius: 6,
+                                }]
+                            },
+                            options: {
+                                indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+                                plugins: {
+                                    legend: { display: false },
+                                    tooltip: { callbacks: { label: ctx => {
+                                        const n = nodes[ctx.dataIndex];
+                                        return [` Layer: ${n.layer_start_pct}% → ${n.layer_end_pct}%`, ` Tỷ lệ: ${n.share_pct}%`,
+                                            n.flops_fp16 > 0 ? ` TFLOPS: ${n.flops_fp16.toFixed(2)}` : ' CPU only'];
+                                    }}}
+                                },
+                                scales: {
+                                    x: { max: 100, title: { display: true, text: 'Layer (%)' }, grid: { color: 'rgba(0,0,0,0.05)' } },
+                                    y: { grid: { display: false } }
+                                }
+                            }
+                        });
+                    }
+
+                    const flopsCanvas = document.getElementById('flopsDonut');
+                    if (flopsCanvas) {
+                        if (this._flopsChart) { this._flopsChart.destroy(); this._flopsChart = null; }
+                        const totalFlops = nodes.reduce((s, n) => s + (n.flops_fp16 || 0), 0);
+                        const useRam = totalFlops === 0;
+                        const values = useRam ? nodes.map(n => n.ram_gb || 0) : nodes.map(n => n.flops_fp16 || 0);
+                        const totalVal = values.reduce((s,v)=>s+v,0);
+                        this._flopsChart = new Chart(flopsCanvas, {
+                            type: 'doughnut',
+                            data: {
+                                labels: nodes.map(n => n.name),
+                                datasets: [{ data: values,
+                                    backgroundColor: nodes.map((_, i) => COLORS[i % COLORS.length] + 'CC'),
+                                    borderColor: nodes.map((_, i) => COLORS[i % COLORS.length]), borderWidth: 2 }]
+                            },
+                            options: {
+                                responsive: true, maintainAspectRatio: false, cutout: '60%',
+                                plugins: {
+                                    legend: { position: 'bottom', labels: { font: { size: 12 }, padding: 12 } },
+                                    tooltip: { callbacks: { label: ctx => {
+                                        const n = nodes[ctx.dataIndex];
+                                        const val = values[ctx.dataIndex];
+                                        const pct = totalVal > 0 ? (val/totalVal*100).toFixed(1) : 0;
+                                        return useRam ? ` ${n.ram_gb} GB RAM (${pct}%)` : ` ${n.flops_fp16.toFixed(2)} TFLOPS (${pct}%)`;
+                                    }}}
+                                }
+                            }
+                        });
+                    }
+                },
+
+                filteredAvailableModels() {
+                    const META = {
+                        'Qwen/Qwen2.5-0.5B-Instruct':  {params:'0.5B',family:'Qwen', type:'chat'},
+                        'Qwen/Qwen2.5-1.5B-Instruct':  {params:'1.5B',family:'Qwen', type:'chat'},
+                        'Qwen/Qwen2.5-3B-Instruct':    {params:'3B',  family:'Qwen', type:'chat'},
+                        'Qwen/Qwen2.5-7B-Instruct':    {params:'7B',  family:'Qwen', type:'chat'},
+                        'Qwen/Qwen2.5-14B-Instruct':   {params:'14B', family:'Qwen', type:'chat'},
+                        'Qwen/Qwen2.5-Coder-7B-Instruct':  {params:'7B', family:'Code',type:'code'},
+                        'Qwen/Qwen2.5-Coder-14B-Instruct': {params:'14B',family:'Code',type:'code'},
+                        'meta-llama/Llama-3.2-1B-Instruct':{params:'1B', family:'LLaMA',type:'chat'},
+                        'meta-llama/Llama-3.2-3B-Instruct':{params:'3B', family:'LLaMA',type:'chat'},
+                        'meta-llama/Llama-3.1-8B-Instruct':{params:'8B', family:'LLaMA',type:'chat'},
+                        'microsoft/Phi-3.5-mini-instruct': {params:'3.8B',family:'Phi',  type:'chat'},
+                        'microsoft/phi-4':               {params:'14B',family:'Phi',  type:'chat'},
+                        'mistralai/Mistral-7B-Instruct-v0.3':{params:'7B',family:'Mistral',type:'chat'},
+                        'mistralai/Mistral-Nemo-Instruct-2407':{params:'12B',family:'Mistral',type:'chat'},
+                        'deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct':{params:'16B',family:'Code',type:'code'},
+                        'bigcode/starcoder2-3b':  {params:'3B', family:'Code',type:'code'},
+                        'bigcode/starcoder2-7b':  {params:'7B', family:'Code',type:'code'},
+                        'bigcode/starcoder2-15b': {params:'15B',family:'Code',type:'code'},
+                    };
+                    const search = (this.modelSearch || '').toLowerCase();
+                    const fam = this.modelFamilyFilter || '';
+                    return (this.modelList.available || []).map(m => {
+                        const key = m.name || m.hf_id || '';
+                        const meta = META[key] || {};
+                        let family = meta.family || '';
+                        if (!family) {
+                            const n = key.toLowerCase();
+                            if (n.includes('qwen')) family = 'Qwen';
+                            else if (n.includes('llama')) family = 'LLaMA';
+                            else if (n.includes('phi')) family = 'Phi';
+                            else if (n.includes('mistral')) family = 'Mistral';
+                            else if (n.includes('starcoder')||n.includes('deepseek')||n.includes('coder')) family = 'Code';
+                        }
+                        return { ...m, params: meta.params || m.parameter_size || '', family,
+                            type: meta.type || (family==='Code' ? 'code' : 'chat'), hf_repo: key };
+                    }).filter(m => {
+                        const matchSearch = !search || (m.name||'').toLowerCase().includes(search) || (m.family||'').toLowerCase().includes(search);
+                        const matchFam = !fam || m.family===fam || (fam==='Code' && m.type==='code');
+                        return matchSearch && matchFam;
+                    });
+                },
             }
         }
     </script>
