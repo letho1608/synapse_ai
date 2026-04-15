@@ -20,7 +20,7 @@ from synapse.terminal_log import get_lines as get_terminal_log_lines
 from synapse.helpers import PrefixDict, shutdown, get_all_ip_addresses_and_interfaces
 from synapse.networking.tailscale.tailscale_helpers import get_synapse_api_urls_from_node_list, get_self_tailscale_info
 from synapse.orchestration import Node
-from synapse.model_list import HF_MODELS, HF_MODEL_PARAMS, resolve_hf_id  # Danh sách + metadata cho web UI
+from synapse.model_list import HF_MODELS, HF_MODEL_PARAMS, resolve_hf_id, VISION_MODELS  # Danh sách + metadata cho web UI
 from typing import Callable, Optional
 from PIL import Image
 import numpy as np
@@ -263,7 +263,10 @@ class ChatGPTAPI:
     self._training_job: Optional[Dict] = None  # job_id, model, dataset, epochs, batch_size, status, progress, error
     self._data_dir = Path("synapse/data")  # Chỉ dataset (json/jsonl)
     self._settings_path = Path("synapse/config/settings.json")  # Cấu hình (tách khỏi data)
+    self._linked_datasets_path = Path("synapse/config/linked_datasets.json")
+    self.linked_datasets = {} # name -> path
     self._load_settings()
+    self._load_linked_datasets()
 
     # Get the callback system and register our handler
     self.token_callback = node.on_token.register("chatgpt-api-token-handler")
@@ -326,6 +329,7 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/datasets/create", self.handle_post_datasets_create), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/datasets/rename", self.handle_post_datasets_rename), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/datasets/validate", self.handle_get_datasets_validate), {"*": cors_options})
+    cors.add(self.app.router.add_post("/v1/datasets/link", self.handle_post_datasets_link), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/activity", self.handle_get_activity_logs), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/logs/terminal", self.handle_get_terminal_logs), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/training/start", self.handle_post_training), {"*": cors_options})
@@ -369,6 +373,22 @@ class ChatGPTAPI:
           pass
     except Exception:
       pass
+
+  def _load_linked_datasets(self) -> None:
+    try:
+      if self._linked_datasets_path.is_file():
+        with open(self._linked_datasets_path, "r", encoding="utf-8") as f:
+          self.linked_datasets = json.load(f)
+    except Exception:
+      self.linked_datasets = {}
+
+  def _save_linked_datasets(self) -> None:
+    try:
+      self._linked_datasets_path.parent.mkdir(parents=True, exist_ok=True)
+      with open(self._linked_datasets_path, "w", encoding="utf-8") as f:
+        json.dump(self.linked_datasets, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+      if DEBUG >= 1: print(f"[ChatGPTAPI] _save_linked_datasets error: {e}")
 
   def _save_settings(self) -> None:
     """Lưu settings hiện tại ra synapse/config/settings.json."""
@@ -788,6 +808,46 @@ class ChatGPTAPI:
             {"error": {"message": f"Model '{model_id}' không có trong registry PyTorch/HF. Chọn model từ danh sách.", "code": "model_not_found"}},
             status=400,
           )
+        is_vision = model_id in VISION_MODELS
+        if is_vision:
+          base64_image = None
+          for msg in reversed(data.get("messages", [])):
+            if isinstance(msg.get("content"), list):
+              for content in msg["content"]:
+                if content.get("type") == "image_url":
+                  base64_image = content["image_url"].get("url", "")
+                  break
+                elif content.get("type") == "image":
+                  base64_image = content.get("image", "")
+                  break
+            if base64_image:
+              break
+          if not base64_image:
+            return web.json_response({"error": {"message": "Vision model yêu cầu hình ảnh.", "code": "missing_image"}}, status=400)
+          if "," in base64_image:
+            base64_image = base64_image.split(",", 1)[1]
+          try:
+            image_bytes = base64.b64decode(base64_image)
+          except Exception as e:
+            return web.json_response({"error": {"message": f"Base64 decode failed: {e}", "code": "invalid_image"}}, status=400)
+          
+          try:
+            request_id = str(uuid.uuid4())
+            text_result = await self.node.inference_engine.infer_vision(base_shard, image_bytes)
+          except Exception as e:
+            if DEBUG >= 1:
+              traceback.print_exc()
+            return web.json_response({"error": {"message": f"Lỗi Vision Inference: {e}", "code": "vision_error"}}, status=500)
+          
+          completion = {
+            "id": f"chatcmpl-{request_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": data.get("model"),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text_result}, "finish_reason": "stop"}]
+          }
+          return web.json_response(completion)
+
         request_id = str(uuid.uuid4())
         self.token_queues[request_id] = asyncio.Queue()
         try:
@@ -1294,6 +1354,7 @@ class ChatGPTAPI:
     try:
       data_dir = self._data_dir
       datasets = []
+      # 1. Quét file trong synapse/data
       if data_dir.exists():
         for f in data_dir.glob("**/*.json*"):
           if not f.is_file() or f.name in self._DATASET_EXCLUDE_NAMES:
@@ -1306,7 +1367,24 @@ class ChatGPTAPI:
             "size_mb": round(stats.st_size / (1024 * 1024), 2),
             "created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_ctime)),
             "sample_count": sample_count,
+            "type": "file"
           })
+      
+      # 2. Thêm các linked folders
+      for name, path_str in self.linked_datasets.items():
+        p = Path(path_str)
+        if p.exists():
+          stats = p.stat()
+          datasets.append({
+            "name": f"[Linked] {name}",
+            "original_name": name,
+            "path": path_str,
+            "size_mb": 0, # Thư mục không tính size nhanh được
+            "created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_ctime)),
+            "sample_count": None,
+            "type": "link"
+          })
+          
       return web.json_response({"data": datasets})
     except Exception as e:
       return web.json_response({"detail": str(e)}, status=500)
@@ -1348,6 +1426,20 @@ class ChatGPTAPI:
       name = (body.get("name") or body.get("path") or "").strip()
       if not name:
         return web.json_response({"success": False, "message": "Thiếu name hoặc path"}, status=400)
+      
+      # Kiểm tra xem có phải xóa link không
+      found_link = None
+      for lname, lpath in self.linked_datasets.items():
+        if lname == name or lpath == name or f"[Linked] {lname}" == name:
+          found_link = lname
+          break
+      
+      if found_link:
+        del self.linked_datasets[found_link]
+        self._save_linked_datasets()
+        self.log_activity("Link Removed", found_link, "info")
+        return web.json_response({"success": True, "message": f"Đã gỡ liên kết {found_link}"})
+
       path = Path(name)
       if not path.is_absolute():
         path = self._data_dir / path.name
@@ -1366,60 +1458,171 @@ class ChatGPTAPI:
       return web.json_response({"success": False, "message": str(e)}, status=500)
 
   async def handle_get_datasets_preview(self, request):
-    """Trả về vài dòng đầu của dataset (jsonl) hoặc preview json."""
+    """Trả về vài dòng đầu của dataset (jsonl) hoặc preview json hoặc folder nội dung."""
     try:
       path_str = request.query.get("path") or request.query.get("name") or ""
       if not path_str:
         return web.json_response({"success": False, "message": "Thiếu path hoặc name"}, status=400)
-      path = Path(path_str)
-      if not path.is_absolute():
-        path = self._data_dir / path.name
-      path = path.resolve()
-      data_dir = self._data_dir.resolve()
-      if not str(path).startswith(str(data_dir)) or not path.is_file():
-        return web.json_response({"success": False, "message": "File không tồn tại hoặc không được phép"}, status=404)
-      max_lines = min(50, int(request.query.get("lines", 20)))
+      
+      max_lines = int(request.query.get("lines", 50))
+      
+      # Kiểm tra link trước
+      is_link = False
+      path = None
+      for lname, lpath in self.linked_datasets.items():
+        if lname == path_str or lpath == path_str or f"[Linked] {lname}" == path_str:
+          path = Path(lpath)
+          is_link = True
+          break
+      
+      if not is_link:
+        path = self._resolve_dataset_path(path_str, name_only_ok=False)
+      
+      if path is None or not path.exists():
+        return web.json_response({"success": False, "message": "Dataset không tồn tại hoặc không được phép"}, status=404)
+      
       lines = []
-      if path.suffix == ".jsonl":
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-          for i, line in enumerate(f):
-            if i >= max_lines:
-              break
-            if line.strip():
-              lines.append(line.strip())
-      else:
-        with open(path, "r", encoding="utf-8") as f:
-          data = json.load(f)
-        if isinstance(data, list):
-          lines = [json.dumps(x, ensure_ascii=False)[:500] for x in data[:max_lines]]
-        else:
-          lines = [json.dumps(data, ensure_ascii=False)[:1000]]
+      if path.is_file():
+        if path.suffix == ".jsonl":
+          with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+              if i >= max_lines: break
+              if line.strip():
+                lines.append(line.strip()[:1000])
+        elif path.suffix == ".json":
+          with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+          if isinstance(data, list):
+            lines = [json.dumps(x, ensure_ascii=False)[:500] for x in data[:max_lines]]
+          else:
+            lines = [json.dumps(data, ensure_ascii=False)[:1000]]
+      elif path.is_dir():
+          # Preview cho folder (quét file labels/pk)
+          pk_file = path / "transcription.pk"
+          if pk_file.exists():
+              import pickle
+              lines.append(f"--- Thư mục OCR: {path.name} ---")
+              lines.append(f"Tìm thấy: transcription.pk")
+              try:
+                  with open(pk_file, 'rb') as f:
+                      data = pickle.load(f)
+                  lines.append(f"Tổng số mẫu nhãn: {len(data)}")
+                  lines.append("Xem trước 10 nhãn đầu tiên:")
+                  # Dữ liệu pickle của bạn là list of dict [{'path': 'text'}]
+                  for entry in data[:10]:
+                      lines.append(json.dumps(entry, ensure_ascii=False))
+              except:
+                  lines.append("Lỗi đọc file .pk (Pickle format check failed)")
+          else:
+              lines.append(f"--- Thư mục: {path.name} ---")
+              lines.append("Không tìm thấy transcription.pk. Danh sách 10 file đầu tiên:")
+              for f in list(path.iterdir())[:10]:
+                  lines.append(f.name + (" (Folder)" if f.is_dir() else ""))
+
       return web.json_response({"success": True, "preview": lines})
     except Exception as e:
       if DEBUG >= 2:
         traceback.print_exc()
       return web.json_response({"success": False, "message": str(e)}, status=500)
 
+  async def handle_post_datasets_link(self, request):
+    """Liên kết một thư mục cục bộ làm dataset."""
+    try:
+      body = await request.json()
+      name = (body.get("name") or "").strip()
+      path_str = (body.get("path") or "").strip().strip('"').strip("'")
+      # Thay thế \ thành / để tránh lỗi escape chars trong Python (đặc biệt là \f, \U)
+      path_str = path_str.replace('\\', '/')
+      
+      if not name or not path_str:
+        return web.json_response({"success": False, "message": "Thiếu tên hoặc đường dẫn"}, status=400)
+      
+      print(f"[DatasetLink] Thử liên kết đường dẫn: {path_str}")
+      path = Path(path_str).resolve()
+      
+      if not path.exists():
+        # Thử lại với Path gốc nếu resolve() làm sai lệch ở một số môi trường Windows
+        path = Path(path_str)
+        if not path.exists():
+            print(f"[DatasetLink] [LỖI] Đường dẫn không tồn tại: {path_str}")
+            return web.json_response({"success": False, "message": f"Đường dẫn không tồn tại trên hệ thống: {path_str}"}, status=400)
+      
+      self.linked_datasets[name] = str(path.absolute())
+      self._save_linked_datasets()
+      self.log_activity("Dataset Linked", name, "success")
+      return web.json_response({"success": True, "message": f"Đã liên kết thành công: {name}"})
+    except Exception as e:
+      return web.json_response({"success": False, "message": str(e)}, status=500)
+
   def _resolve_dataset_path(self, path_str: str, name_only_ok: bool = True) -> Optional[Path]:
-    """Resolve path/name thành Path trong _data_dir. Trả về None nếu không hợp lệ."""
-    path_str = (path_str or "").strip()
+    """Resolve path/name thành Path. Hỗ trợ chuẩn hóa dấu gạch chéo Windows và Linked Datasets."""
+    path_str = (path_str or "").strip().strip('"').strip("'")
     if not path_str:
       return None
-    path = Path(path_str)
+    
+    # Chuẩn hóa dấu gạch chéo để tránh lỗi escape chars (\f, \U, ...)
+    normalized_str = path_str.replace('\\', '/')
+    path = Path(normalized_str)
+    
+    print(f"[DEBUG] Resolve Path Input: {path_str}")
+    
+    # Chuyển thành đường dẫn tuyệt đối
     if not path.is_absolute():
-      path = self._data_dir / path.name
-    path = path.resolve()
+      path = (self._data_dir / path.name)
+    
+    try:
+      path = path.resolve()
+    except Exception as e:
+      print(f"[DEBUG] Resolve Error: {e}")
+      # Vẫn tiếp tục với path hiện tại nếu resolve thất bại (có thể là file chưa tồn tại)
+    
+    print(f"[DEBUG] Final Resolved Path: {path}")
+
+    # Kiểm tra xem có nằm trong whitelist linked không
+    is_linked = False
+    for lname, lpath_raw in self.linked_datasets.items():
+        try:
+            lpath = Path(lpath_raw).resolve()
+            # Kiểm tra xem 'path' có nằm trong hoặc chính là 'lpath'
+            path.relative_to(lpath)
+            is_linked = True
+            print(f"[DEBUG] Matched Whitelist (Linked): {lname} ({lpath})")
+            break
+        except (ValueError, Exception):
+            continue
+            
+    # Kiểm tra trong data_dir mặc định
     data_dir = self._data_dir.resolve()
-    if not str(path).startswith(str(data_dir)) or path == data_dir:
+    is_in_data = False
+    try:
+        path.relative_to(data_dir)
+        is_in_data = True
+        print(f"[DEBUG] Matched Whitelist (Default Data Dir)")
+    except (ValueError, Exception):
+        pass
+
+    if not is_linked and not is_in_data:
+      print(f"[DEBUG] [LỖI] Truy cập bị từ chối: Đường dẫn không nằm trong Whitelist")
       return None
-    if not path.is_file() and not (name_only_ok and path.parent == data_dir):
-      return None
+
+    if not path.exists():
+      if not (name_only_ok and path.parent == data_dir):
+        print(f"[DEBUG] [LỖI] File/Folder không tồn tại trên ổ đĩa: {path}")
+        return None
+    
     return path
 
   async def handle_get_datasets_download(self, request):
     """Tải file dataset về (attachment). Query: path hoặc name."""
     try:
       path_str = request.query.get("path") or request.query.get("name") or ""
+      
+      # Kiểm tra link trước
+      for lname, lpath in self.linked_datasets.items():
+        if lname == path_str or f"[Linked] {lname}" == path_str:
+          # Không cho phép tải cả folder, chỉ cho phép preview
+          return web.json_response({"success": False, "message": "Không hỗ trợ tải cả thư mục, chỉ có thể xem preview."}, status=400)
+
       path = self._resolve_dataset_path(path_str, name_only_ok=False)
       if path is None or not path.is_file():
         return web.json_response({"success": False, "message": "File không tồn tại hoặc không được phép"}, status=404)
@@ -1650,16 +1853,10 @@ class ChatGPTAPI:
     job["effective_max_length"] = max_length
     job["oom_retries"] = 0
     try:
-      path = Path(dataset_path)
-      if not path.is_absolute():
-        base = self._data_dir
-        if (base / path.name).exists():
-          path = base / path.name
-        elif (base / path).exists():
-          path = base / path
-      if not path.exists():
+      path = self._resolve_dataset_path(dataset_path)
+      if path is None:
         job["status"] = "failed"
-        job["error"] = f"Dataset không tồn tại: {path}"
+        job["error"] = f"Dataset không tồn tại hoặc không hợp lệ: {dataset_path}"
         self.log_activity("Training Failed", model, "failed")
         return
       raw_data = load_raw_data(path)
@@ -1668,6 +1865,20 @@ class ChatGPTAPI:
         job["error"] = "Dataset rỗng"
         self.log_activity("Training Failed", model, "failed")
         return
+        
+      # Kiểm tra nếu là dữ liệu OCR (Hình ảnh)
+      is_ocr = False
+      if isinstance(raw_data, list) and len(raw_data) > 0:
+          if "image_path" in raw_data[0]:
+              is_ocr = True
+              
+      if is_ocr:
+          print(f"[Training] Bắt đầu huấn luyện OCR (CRNN) phân tán cho model: {model}")
+          from synapse.training.ocr_trainer import train_crnn_ocr
+          await train_crnn_ocr(job, raw_data, self.node)
+          return
+
+      # Logic Training LLM cũ (Causal LM)
       base_shard = build_base_shard(model, self.inference_engine_classname)
       if base_shard is None:
         job["status"] = "failed"

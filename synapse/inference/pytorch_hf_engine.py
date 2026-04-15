@@ -10,7 +10,7 @@ from typing import Optional, Tuple, Dict, Any, List
 from synapse.helpers import DEBUG
 from synapse.inference.inference_engine import InferenceEngine
 from synapse.inference.shard import Shard
-from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id
+from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id, VISION_MODELS
 
 
 def register_pytorch_models() -> None:
@@ -83,6 +83,49 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         hf_id = self._get_hf_id(shard.model_id)
         if DEBUG >= 1:
             print(f"[PyTorchHF] Loading {shard.model_id} -> {hf_id}")
+
+        is_vision = shard.model_id in VISION_MODELS
+        if is_vision:
+            try:
+                from huggingface_hub import snapshot_download
+                import sys
+                import torch
+                import json
+                repo_path = snapshot_download(repo_id=hf_id)
+                if repo_path not in sys.path:
+                    sys.path.insert(0, repo_path)
+                import model as crnn_model
+                
+                with open(f"{repo_path}/vocab.json", "r", encoding="utf-8") as f:
+                    vocab = json.load(f)
+                
+                if "idx_to_char" in vocab:
+                    idx_dict = vocab["idx_to_char"]
+                else:
+                    idx_dict = vocab
+                    
+                num_classes = max([int(k) for k in idx_dict.keys()]) + 1
+                
+                self._model = crnn_model.CRNN(vocab_size=num_classes, hidden_size=256)
+                weights_path = f"{repo_path}/vietnamese_crnn_model.pth"
+                checkpoint = torch.load(weights_path, map_location=self._device, weights_only=False)
+                if 'model_state_dict' in checkpoint:
+                    self._model.load_state_dict(checkpoint['model_state_dict'])
+                    if 'img_width' in checkpoint:
+                        self.img_width = checkpoint['img_width']
+                else:
+                    self._model.load_state_dict(checkpoint)
+                self._model = self._model.to(self._device)
+                self._model.eval()
+                
+                self.tokenizer = vocab
+                self._model_id = shard.model_id
+                self.shard = shard
+                if DEBUG >= 1: print(f"[PyTorchHF] Loaded Vision local CRNN: {shard.model_id}")
+                return
+            except Exception as e:
+                raise RuntimeError(f"PyTorchHF load vision {hf_id}: {e}") from e
+
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
             load_kw = {"trust_remote_code": True}
@@ -101,7 +144,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                     print(f"[PyTorchHF] Cache miss or incomplete, loading from Hub: {_e}")
                 self.tokenizer = AutoTokenizer.from_pretrained(hf_id, **load_kw)
                 self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw)
-            if (self._model.device.type if hasattr(self._model, "device") else "cpu") == "cpu":
+            if self._model.device.type if hasattr(self._model, "device") else "cpu" == "cpu":
                 self._model = self._model.to(self._device)
             self._model_id = shard.model_id
             self.shard = shard
@@ -110,6 +153,76 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 import traceback
                 traceback.print_exc()
             raise RuntimeError(f"PyTorchHF load {hf_id}: {e}") from e
+
+    async def infer_vision(self, shard: Shard, image_bytes: bytes) -> str:
+        await self.ensure_shard(shard)
+        try:
+            import torch
+            import cv2
+            import numpy as np
+            import torchvision.transforms as transforms
+            
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img_array = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+            
+            if np.mean(img_array) < 127:
+                img_array = 255 - img_array
+            _, img_array = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            h, w = img_array.shape
+            new_h = 64
+            img_width = getattr(self, 'img_width', 448)
+            new_w = int(w * (new_h / h))
+            if new_w > img_width:
+                new_w = img_width
+                
+            img_resized = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            padded = np.full((new_h, img_width), 255, dtype=np.uint8)
+            padded[:, :new_w] = img_resized
+            
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5,), (0.5,))
+            ])
+            image_tensor = transform(padded.copy()).unsqueeze(0).to(self._device)
+            
+            with torch.no_grad():
+                logits = self._model(image_tensor)
+                
+            vocab = self.tokenizer
+            if "idx_to_char" in vocab:
+                idx_dict = vocab["idx_to_char"]
+            else:
+                idx_dict = vocab
+            idx_to_char = {int(k): v for k, v in idx_dict.items()}
+            
+            beam_width = 10
+            log_probs = logits.squeeze(1).cpu().numpy()
+            seq_len, num_classes = log_probs.shape
+            beams = [(0.0, [], -1)]
+            
+            for t in range(seq_len):
+                new_beams = []
+                for score, seq, last_idx in beams:
+                    for c in range(num_classes):
+                        new_score = score + log_probs[t, c]
+                        if c == 0:
+                            new_beams.append((new_score, seq[:], -1))
+                        elif c == last_idx:
+                            new_beams.append((new_score, seq[:], last_idx))
+                        else:
+                            new_beams.append((new_score, seq + [c], c))
+                new_beams.sort(key=lambda x: x[0], reverse=True)
+                beams = new_beams[:beam_width]
+                
+            best_seq = beams[0][1]
+            text = "".join([idx_to_char.get(i, '') for i in best_seq])
+            return text
+        except Exception as e:
+            if DEBUG >= 1:
+                import traceback
+                traceback.print_exc()
+            raise Exception(f"Vision inference error: {e}")
 
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
         await self.ensure_shard(shard)
@@ -219,67 +332,87 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         backgrad: Optional[np.ndarray] = None,
         loss: str = "forward",
     ) -> Tuple[Optional[float], Optional[np.ndarray]]:
-        """Training chia tải: last layer (hoặc 1 node) chạy full forward + loss + backward + step. Nhiều node (back_gradient) chưa implement."""
+        """
+        Huấn luyện phân tán: 
+        Hỗ trợ cả Causal LLM (CrossEntropy) và Vision/OCR (CTCLoss).
+        """
         await self.ensure_shard(shard)
         if loss == "back_gradient":
             if DEBUG >= 1:
                 print("[PyTorchHF] train(back_gradient) chưa implement cho nhiều node; bỏ qua.")
             return None, None
+            
         try:
             import torch
             import torch.nn.functional as F
+            from torch import nn
+            
             if self._model is None:
                 return None, None
-
-            def _run_train_step(device) -> float:
-                ex = example.astype(np.int64) if example.dtype != np.int64 else example
-                tg = target.astype(np.int64) if target.dtype != np.int64 else target
-                input_ids = torch.from_numpy(ex).to(device)
-                labels = torch.from_numpy(tg).to(device)
+                
+            device = self._device
+            self._model.train()
+            
+            # 1. Kiểm tra nếu là dữ liệu Vision (OCR)
+            # example shape: [B, 1, H, W]
+            is_vision = len(target.shape) > 0 and len(example.shape) == 4
+            
+            if is_vision:
+                # --- OCR TRAINING (CTCLoss) ---
+                imgs = torch.from_numpy(example).to(device)
+                labels = torch.from_numpy(target).to(device)
+                label_lens = torch.from_numpy(length).to(device)
+                
+                # Forward
+                preds = self._model(imgs) # [T, B, C]
+                T = preds.size(0)
+                batch_size = imgs.size(0)
+                input_lens = torch.full(size=(batch_size,), fill_value=T, dtype=torch.int32).to(device)
+                
+                # Log Softmax
+                preds = preds.log_softmax(2)
+                
+                # CTCLoss (blank=0 mặc định trong ocr_trainer)
+                criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True).to(device)
+                loss_val = criterion(preds, labels, input_lens, label_lens)
+            else:
+                # --- LLM TRAINING (CrossEntropy) ---
+                if example.dtype != np.int64:
+                    example = example.astype(np.int64)
+                if target.dtype != np.int64:
+                    target = target.astype(np.int64)
+                    
+                input_ids = torch.from_numpy(example).to(device)
+                labels = torch.from_numpy(target).to(device)
+                
                 if input_ids.dim() == 1:
                     input_ids = input_ids.unsqueeze(0)
                 if labels.dim() == 1:
                     labels = labels.unsqueeze(0)
-
-                self._model.train()
-                if device.type == "cuda":
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        out = self._model(input_ids)
-                else:
-                    out = self._model(input_ids)
-
+                    
+                out = self._model(input_ids)
                 logits = out.logits if hasattr(out, "logits") else out[0]
-                # Causal LM: shift; ignore_index=-100
+                
+                # Causal LM shift
                 shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
                 shift_labels = labels[..., 1:].contiguous().view(-1)
                 loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
 
-                opt = self._get_optimizer()
-                if opt is not None:
-                    opt.zero_grad(set_to_none=True)
-                    loss_val.backward()
-                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
-                    opt.step()
-                return float(loss_val.item())
-
-            device = next(self._model.parameters()).device
-            try:
-                return _run_train_step(device), None
-            except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as oom:
-                if device.type != "cuda":
-                    raise
-                if DEBUG >= 1:
-                    print("[PyTorchHF] CUDA OOM during training. Returning OOM error for adaptive retry.")
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                raise RuntimeError(f"CUDA_OOM: {oom}") from oom
+            # 2. Backward & Step
+            opt = self._get_optimizer()
+            if opt is not None:
+                opt.zero_grad()
+                loss_val.backward()
+                torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
+                opt.step()
+                
+            return float(loss_val.item()), None
+            
         except Exception as e:
             if DEBUG >= 1:
                 import traceback
                 traceback.print_exc()
-            raise RuntimeError(f"PyTorchHF train: {e}") from e
+            raise RuntimeError(f"PyTorchHF train error: {e}") from e
 
     async def evaluate(
         self,
