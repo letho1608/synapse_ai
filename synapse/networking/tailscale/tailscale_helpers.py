@@ -77,10 +77,13 @@ async def update_device_attributes(device_id: str, api_key: str, node_id: str, n
         if response.status == 200:
           if DEBUG_DISCOVERY >= 1: print(f"Updated device posture attribute {attr_name} for device {device_id}")
         elif response.status == 404:
-          # 404 means the feature is likely not enabled or available, suppress the error to avoid spam
-          if DEBUG_DISCOVERY >= 2: print(f"Device posture attribute {attr_name} not found (404). This feature may not be enabled.")
+            # 404 means the feature is likely not enabled or available, suppress the error to avoid spam
+            if DEBUG_DISCOVERY >= 2: print(f"Device posture attribute {attr_name} not found (404). This feature may not be enabled.")
+        elif response.status == 403:
+            # 403 means the feature is not available on current billing plan, suppress the error
+            if DEBUG_DISCOVERY >= 2: print(f"Device posture attribute {attr_name} not available (403). Feature requires paid billing plan.")
         else:
-          print(f"Failed to update device posture attribute {attr_name}: {response.status} {await response.text()}")
+            print(f"Failed to update device posture attribute {attr_name}: {response.status} {await response.text()}")
 
 
 def _safe_float(val: Any, default: float = 0) -> float:
