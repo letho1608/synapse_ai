@@ -16,7 +16,7 @@ from synapse.networking.grpc.grpc_server import GRPCServer
 from synapse.networking.udp.udp_discovery import UDPDiscovery
 from synapse.networking.tailscale.tailscale_discovery import TailscaleDiscovery
 from synapse.networking.grpc.grpc_peer_handle import GRPCPeerHandle
-from synapse.topology.ring_memory_weighted_partitioning_strategy import RingMemoryWeightedPartitioningStrategy
+from synapse.topology.lacp_partitioning import LACPPartitioningStrategy
 from synapse.api import ChatGPTAPI
 # REFACTORED IMPORTS
 from synapse.loading import ShardDownloader, RepoProgressEvent, create_local_model_loader, get_models_dir
@@ -138,16 +138,20 @@ elif args.discovery_module == "manual":
     raise ValueError(f"--discovery-config-path is required when using manual discovery. Please provide a path to a config json file.")
   discovery = ManualDiscovery(args.discovery_config_path, args.node_id, create_peer_handle=lambda peer_id, address, description, device_capabilities: GRPCPeerHandle(peer_id, address, description, device_capabilities))
 topology_viz = TopologyViz(chatgpt_api_endpoints=chatgpt_api_endpoints, web_chat_urls=web_chat_urls) if not args.disable_tui else None
+# Use LACP partitioning strategy
+partitioning_strategy = LACPPartitioningStrategy()
+if DEBUG >= 1: print("Using LACP partitioning strategy")
+
 node = Node(
-  args.node_id,
-  None,
-  inference_engine,
-  discovery,
-  shard_downloader,
-  partitioning_strategy=RingMemoryWeightedPartitioningStrategy(),
-  max_generate_tokens=args.max_generate_tokens,
-  topology_viz=topology_viz,
-  default_sample_temperature=args.default_temp
+    args.node_id,
+    None,
+    inference_engine,
+    discovery,
+    shard_downloader,
+    partitioning_strategy=partitioning_strategy,
+    max_generate_tokens=args.max_generate_tokens,
+    topology_viz=topology_viz,
+    default_sample_temperature=args.default_temp
 )
 server = GRPCServer(node, args.node_host, args.node_port)
 node.server = server

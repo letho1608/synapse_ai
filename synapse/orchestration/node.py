@@ -235,25 +235,28 @@ class Node:
       is_finished = inference_state.get("is_finished", False)
       intermediate_result, inference_state = self.handle_stable_diffusion(inference_state, result)
       forward = result
-    if shard.is_last_layer():
-      # CRITICAL FIX: Always trigger callback, even with empty tokens
-      # This ensures API receives the signal that generation is finished
-      if DEBUG >= 1:
-        print(f"[{request_id}] [LAST_LAYER] Triggering callback: tokens={intermediate_result}, is_finished={is_finished}, buffered_tokens={self.buffered_token_output.get(request_id, 'N/A')}")
-      self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
-      self._schedule_task(self.broadcast_result(request_id, intermediate_result, is_finished), "broadcast_result")
-
-    if is_finished:
-      if shard.model_id != 'stable-diffusion-2-1-base':
-        self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
-      self.outstanding_requests.pop(request_id, None)
-      self._prompt_token_ids.pop(request_id, None)
+    # FIX: For distributed inference, we need to forward tensor to next partition
+    # regardless of is_finished status. The is_finished only affects token generation
+    # at the LAST_LAYER, but tensor should still be forwarded through the pipeline.
+    if not shard.is_last_layer():
+        # Not last layer - always forward tensor to next partition
+        self.outstanding_requests[request_id] = "waiting"
+        self._schedule_task(
+            self.forward_tensor(shard, forward, request_id, self.get_partition_index(offset=1, base_shard=shard), inference_state),
+            "forward_tensor",
+        )
     else:
-      self.outstanding_requests[request_id] = "waiting"
-      self._schedule_task(
-        self.forward_tensor(shard, forward, request_id, self.get_partition_index(offset = 1), inference_state),
-        "forward_tensor",
-      )
+        # Last layer - trigger callbacks for token output
+        if DEBUG >= 1:
+            print(f"[{request_id}] [LAST_LAYER] Triggering callback: tokens={intermediate_result}, is_finished={is_finished}, buffered_tokens={self.buffered_token_output.get(request_id, 'N/A')}")
+        self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
+        self._schedule_task(self.broadcast_result(request_id, intermediate_result, is_finished), "broadcast_result")
+        
+        if is_finished:
+            if shard.model_id != 'stable-diffusion-2-1-base':
+                self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
+            self.outstanding_requests.pop(request_id, None)
+            self._prompt_token_ids.pop(request_id, None)
 
     return  np.array(self.buffered_token_output[request_id][0]) if shard.model_id != 'stable-diffusion-2-1-base' else intermediate_result
 
@@ -337,24 +340,27 @@ class Node:
         raise
 
   async def enqueue_example(
-    self,
-    base_shard: Shard,
-    example: np.ndarray,
-    target: np.ndarray, 
-    length: np.ndarray,
-    request_id: Optional[str] = None,
-    train: bool = False,
+      self,
+      base_shard: Shard,
+      example: np.ndarray,
+      target: np.ndarray,
+      length: np.ndarray,
+      request_id: Optional[str] = None,
+      train: bool = False,
   ):
-    shard = self.get_current_shard(base_shard)
-    if shard.is_first_layer():
-      loss = await self.process_example(shard, example, target, length, train, request_id)
-      return loss
-    else:
-      if request_id is None:
-        request_id = str(uuid.uuid4())
-      self.outstanding_requests[request_id] = "waiting"
-      loss = await self.forward_example(shard, example, target, length, train, request_id, 0) 
-    return loss
+      shard = self.get_current_shard(base_shard)
+      if shard.is_first_layer():
+          loss = await self.process_example(shard, example, target, length, train, request_id)
+          return loss
+      else:
+          if request_id is None:
+              request_id = str(uuid.uuid4())
+          self.outstanding_requests[request_id] = "waiting"
+          # FIX: Use get_partition_index(offset=1) instead of hardcoded 0
+          # This ensures example is forwarded to the next partition in the ring
+          next_partition_index = self.get_partition_index(offset=1, base_shard=base_shard)
+          loss = await self.forward_example(shard, example, target, length, train, request_id, next_partition_index)
+          return loss
 
   async def coordinate_save(
     self,
@@ -530,7 +536,7 @@ class Node:
     target_index: int,
   ) -> None:
     if DEBUG >= 1: print(f"target partition index: {target_index}")
-    target_id = self.partitioning_strategy.partition(self.topology)[target_index].node_id
+    target_id = self.partitioning_strategy.partition(self.topology, base_shard)[target_index].node_id
     target_shard = self.get_current_shard(base_shard, target_index)
     if DEBUG >= 2: print(f"computed target from: {base_shard} {target_index}, {self.topology}. target shard: {target_shard}")
     target_peer = next((p for p in self.peers if p.id() == target_id), None)
@@ -541,25 +547,27 @@ class Node:
     return resp
 
   async def forward_prompt(
-    self,
-    base_shard: Shard,
-    prompt: str,
-    request_id: str,
-    target_index: int,
-    inference_state: Optional[dict] = None,
+      self,
+      base_shard: Shard,
+      prompt: str,
+      request_id: str,
+      target_index: int,
+      inference_state: Optional[dict] = None,
   ) -> None:
-    if DEBUG >= 1: print(f"target partition index: {target_index}")
-    target_id = self.partitioning_strategy.partition(self.topology)[target_index].node_id
-    next_shard = self.get_current_shard(base_shard, target_index)
-    if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. next shard: {next_shard}")
-    if target_id == self.id:
-      await self.process_prompt(next_shard, prompt, request_id, inference_state)
-    else:
-      target_peer = next((p for p in self.peers if p.id() == target_id), None)
-      if not target_peer:
-        raise ValueError(f"Peer for {target_index} not found")
-      if DEBUG >= 1: print(f"Sending prompt to {target_peer.id()}: {prompt}")
-      await target_peer.send_prompt(next_shard, prompt, request_id=request_id, inference_state=inference_state)
+      if DEBUG >= 1: print(f"target partition index: {target_index}")
+      target_id = self.partitioning_strategy.partition(self.topology, base_shard)[target_index].node_id
+      next_shard = self.get_current_shard(base_shard, target_index)
+      if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. next shard: {next_shard}")
+      if target_id == self.id:
+          # FIX: When target is self, call _process_prompt directly to avoid infinite loop
+          # process_prompt -> _process_prompt -> forward_prompt -> process_prompt loop
+          await self._process_prompt(next_shard, prompt, request_id, inference_state)
+      else:
+          target_peer = next((p for p in self.peers if p.id() == target_id), None)
+          if not target_peer:
+              raise ValueError(f"Peer for {target_index} not found")
+          if DEBUG >= 1: print(f"Sending prompt to {target_peer.id()}: {prompt}")
+          await target_peer.send_prompt(next_shard, prompt, request_id=request_id, inference_state=inference_state)
   
   async def forward_tensor(
     self,
@@ -570,7 +578,7 @@ class Node:
     inference_state: Optional[dict] = None,
   ) -> None:
     if DEBUG >= 1: print(f"target partition index: {target_index}")
-    target_id = self.partitioning_strategy.partition(self.topology)[target_index].node_id
+    target_id = self.partitioning_strategy.partition(self.topology, base_shard)[target_index].node_id
     next_shard = self.get_current_shard(base_shard, target_index)
     if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. target shard: {next_shard}")
     if target_id == self.id:
@@ -582,11 +590,11 @@ class Node:
       if DEBUG >= 1: print(f"Sending tensor to {target_peer.id()}: {tensor}")
       await target_peer.send_tensor(next_shard, tensor, request_id=request_id, inference_state=inference_state)
 
-  def get_partition_index(self, offset: int = 0):
+  def get_partition_index(self, offset: int = 0, base_shard: Optional[Shard] = None):
     if not self.partitioning_strategy:
       if DEBUG >= 1: print("No partitioning strategy found. Skipping forward.")
       return None
-    partitions = self.partitioning_strategy.partition(self.topology)
+    partitions = self.partitioning_strategy.partition(self.topology, base_shard)
     current_partition_index = next((i for i, p in enumerate(partitions) if p.node_id == self.id), None)
     if current_partition_index is None:
       raise ValueError(f"No current partition found for node: {self.id}")
@@ -594,8 +602,8 @@ class Node:
 
   def get_current_shard(self, base_shard: Shard, index: Optional[int] = None) -> Shard:
     if index is None:
-      index = self.get_partition_index()
-    partitions = self.partitioning_strategy.partition(self.topology)
+      index = self.get_partition_index(base_shard=base_shard)
+    partitions = self.partitioning_strategy.partition(self.topology, base_shard)
     shards = map_partitions_to_shards(partitions, base_shard.n_layers, base_shard.model_id)
     return shards[index]
 

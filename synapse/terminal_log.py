@@ -20,7 +20,12 @@ class _TeeWriter:
     def write(self, s):
         if s is None:
             return
-        self._stream.write(s)
+        # Handle Unicode encoding errors on Windows (cp1252 doesn't support Vietnamese)
+        try:
+            self._stream.write(s)
+        except UnicodeEncodeError:
+            # Replace unsupported characters with '?'
+            self._stream.write(s.encode('cp1252', errors='replace').decode('cp1252'))
         self._stream.flush()
         self._buf += s
         while "\n" in self._buf:
@@ -29,8 +34,8 @@ class _TeeWriter:
             self._buf = self._buf[idx + 1:]
             with _lock:
                 _lines.append(line)
-                while len(_lines) > MAX_LINES:
-                    _lines.pop(0)
+            while len(_lines) > MAX_LINES:
+                _lines.pop(0)
 
     def flush(self):
         self._stream.flush()
