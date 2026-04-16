@@ -131,13 +131,17 @@ class TailscaleDiscovery(Discovery):
             if DEBUG_DISCOVERY >= 2: print(f"Ignoring peer {peer_id} as it's not in the allowed node IDs list")
             continue
 
+          if peer_id == self.node_id:
+            if DEBUG >= 1: print(f"TailscaleDiscovery: Skipping device {device.name} (ID {peer_id}) because it is THIS machine (same Node ID).")
+            continue
+
           if peer_id not in self.known_peers or self.known_peers[peer_id][0].addr() != f"{peer_host}:{peer_port}":
             new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
             if not await new_peer_handle.health_check():
-              if DEBUG >= 1: print(f"Peer {peer_id} at {peer_host}:{peer_port} is not healthy. Skipping.")
+              if DEBUG >= 1: print(f"TailscaleDiscovery: Peer {peer_id} at {peer_host}:{peer_port} is not healthy (Firewall checked?). Skipping.")
               continue
 
-            if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")
+            if DEBUG >= 1: print(f"TailscaleDiscovery: ADDING peer {peer_id} at {peer_host}:{peer_port}")
             self.known_peers[peer_id] = (
               new_peer_handle,
               current_time,
