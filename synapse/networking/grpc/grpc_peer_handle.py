@@ -12,6 +12,7 @@ from synapse.topology.topology import Topology
 from synapse.topology.device_capabilities import DeviceCapabilities, DeviceFlops
 from synapse.helpers import DEBUG
 import json
+import time
 
 
 class GRPCPeerHandle(PeerHandle):
@@ -197,7 +198,7 @@ class GRPCPeerHandle(PeerHandle):
         end_layer=shard.end_layer,
         n_layers=shard.n_layers,
       ),
-      tensor=node_service_pb2.Tensor(tensor_data=tensor.tobytes(), shape=tensor.shape, dtype=str(tensor.dtype)),
+      tensor=self._serialize_tensor(tensor),
       request_id=request_id,
       inference_state=None if inference_state is None else self.serialize_inference_state(inference_state)
     )
@@ -219,9 +220,9 @@ class GRPCPeerHandle(PeerHandle):
         end_layer=shard.end_layer,
         n_layers=shard.n_layers,
       ),
-      example=node_service_pb2.Tensor(tensor_data=example.tobytes(), shape=example.shape, dtype=str(example.dtype)),
-      target=node_service_pb2.Tensor(tensor_data=target.tobytes(), shape=target.shape, dtype=str(target.dtype)),
-      length=node_service_pb2.Tensor(tensor_data=length.tobytes(), shape=length.shape, dtype=str(length.dtype)),
+      example=self._serialize_tensor(example),
+      target=self._serialize_tensor(target),
+      length=self._serialize_tensor(length),
       train=train,
       request_id=request_id,
     )
@@ -296,6 +297,36 @@ class GRPCPeerHandle(PeerHandle):
       lambda: self.stub.SendResult(request),
     )
 
+  async def setup_ring(self, rank: int, world_size: int, successor_url: str) -> None:
+    request = node_service_pb2.SetupRingRequest(
+      rank=rank,
+      world_size=world_size,
+      successor_url=successor_url
+    )
+    await self._rpc_with_retry(
+      "SetupRing",
+      lambda: self.stub.SetupRing(request),
+    )
+
+  async def transfer_chunk(self, chunk_index: int, tensor: np.ndarray, step_type: str) -> None:
+    s_type = node_service_pb2.RingStepType.REDUCE if step_type.lower() == "reduce" else node_service_pb2.RingStepType.REPLACE
+    request = node_service_pb2.TransferChunkRequest(
+      chunk_index=chunk_index,
+      tensor=self._serialize_tensor(tensor),
+      step_type=s_type
+    )
+    await self._rpc_with_retry(
+      "TransferChunk",
+      lambda: self.stub.TransferChunk(request),
+    )
+
+  async def trigger_ring_allreduce(self, model_id: str) -> None:
+    request = node_service_pb2.TriggerRingAllReduceRequest(model_id=model_id)
+    await self._rpc_with_retry(
+      "TriggerRingAllReduce",
+      lambda: self.stub.TriggerRingAllReduce(request),
+    )
+
   async def send_opaque_status(self, request_id: str, status: str) -> None:
     max_retries = 2
     for attempt in range(max_retries):
@@ -326,6 +357,58 @@ class GRPCPeerHandle(PeerHandle):
           await asyncio.sleep(0.1)
           continue
         raise
+
+  async def sync_weights(self, model_id: str, weights: np.ndarray, step: int) -> np.ndarray:
+    request = node_service_pb2.SyncWeightsRequest(
+      model_id=model_id,
+      weights=node_service_pb2.Tensor(tensor_data=weights.tobytes(), shape=weights.shape, dtype=str(weights.dtype)),
+      step=step
+    )
+    response = await self._rpc_with_retry(
+      "SyncWeights",
+      lambda: self.stub.SyncWeights(request),
+    )
+    return np.frombuffer(response.averaged_weights.tensor_data, dtype=np.dtype(response.averaged_weights.dtype)).reshape(response.averaged_weights.shape)
+
+  async def test_network(self, payload: bytes) -> float:
+    request = node_service_pb2.TestNetworkRequest(payload=payload)
+    import time
+    start = time.perf_counter()
+    await self._rpc_with_retry(
+      "TestNetwork",
+      lambda: self.stub.TestNetwork(request),
+    )
+    duration_ms = (time.perf_counter() - start) * 1000
+    return duration_ms
+
+  async def profile_hardware(self, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, n_iters: int, skip_iters: int) -> Tuple[float, float]:
+    request = node_service_pb2.ProfileHardwareRequest(
+      shard=node_service_pb2.Shard(
+        model_id=shard.model_id,
+        start_layer=shard.start_layer,
+        end_layer=shard.end_layer,
+        n_layers=shard.n_layers,
+      ),
+      example=self._serialize_tensor(example),
+      target=self._serialize_tensor(target),
+      length=self._serialize_tensor(length),
+      n_iters=n_iters,
+      skip_iters=skip_iters,
+    )
+    # Profiling might take a significant amount of time
+    response = await self._rpc_with_retry(
+      "ProfileHardware",
+      lambda: self.stub.ProfileHardware(request),
+      timeout=120.0
+    )
+    return response.samples_per_sec, response.avg_latency_ms
+
+  def _serialize_tensor(self, tensor: np.ndarray) -> node_service_pb2.Tensor:
+    return node_service_pb2.Tensor(
+      tensor_data=tensor.tobytes(),
+      shape=tensor.shape,
+      dtype=str(tensor.dtype)
+    )
 
   def serialize_inference_state(self, inference_state: dict) -> node_service_pb2.InferenceState:
     proto_inference_state = node_service_pb2.InferenceState()

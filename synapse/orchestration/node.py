@@ -34,7 +34,7 @@ class Node:
     self.discovery = discovery
     self.shard_downloader = shard_downloader
     self.partitioning_strategy = partitioning_strategy
-    self.peers: List[PeerHandle] = {}
+    self.peers: List[PeerHandle] = []
     self.topology: Topology = Topology()
     self.device_capabilities = UNKNOWN_DEVICE_CAPABILITIES
     self.buffered_token_output: Dict[str, Tuple[List[int], bool]] = {}
@@ -54,6 +54,16 @@ class Node:
     self.topology_inference_engines_pool: List[List[str]] = []
     self.outstanding_requests = {}
     self._background_tasks: Set[asyncio.Task] = set()
+
+    # === Ring-AllReduce State ===
+    self.ring_rank = -1
+    self.ring_world_size = 0
+    self.ring_successor: Optional[PeerHandle] = None
+    # chunk_index -> Event (triggered when chunk is received)
+    self.received_chunk_events: Dict[int, asyncio.Event] = {}
+    # chunk_index -> np.ndarray (the received data)
+    self.received_chunk_data: Dict[int, np.ndarray] = {}
+    self._ring_lock = asyncio.Lock()
 
   def _log_task_exception(self, task: asyncio.Task, name: str) -> None:
     self._background_tasks.discard(task)
@@ -98,6 +108,129 @@ class Node:
     await self.discovery.stop()
     await self.server.stop()
 
+  # === Ring-AllReduce Handlers ===
+  def setup_ring(self, rank: int, world_size: int, successor_url: str) -> None:
+    self.ring_rank = rank
+    self.ring_world_size = world_size
+    # Find or create peer handle for successor
+    self.ring_successor = next((p for p in self.peers if p.url == successor_url), None)
+    if not self.ring_successor and successor_url:
+      # If not found in current peers, we might need a dynamic PeerHandle
+      # In this system, GRPCPeerHandle is the implementation
+      from synapse.networking.grpc.grpc_peer_handle import GRPCPeerHandle
+      self.ring_successor = GRPCPeerHandle(successor_url)
+    
+    if DEBUG >= 1:
+      print(f"Node {self.id} Ring Setup: Rank {rank}/{world_size}, Successor: {successor_url}")
+
+  async def handle_incoming_chunk(self, chunk_index: int, data: np.ndarray, step_type: str) -> None:
+    """Called by GRPCServer when a chunk arrives from the predecessor."""
+    async with self._ring_lock:
+      if chunk_index not in self.received_chunk_events:
+        self.received_chunk_events[chunk_index] = asyncio.Event()
+      
+      self.received_chunk_data[chunk_index] = data
+      # Note: In a real implementation we might want to store step_type too 
+      # but the order is guaranteed by the algorithm steps.
+      self.received_chunk_events[chunk_index].set()
+
+  async def execute_ring_allreduce(self, model_id: str) -> None:
+    """
+    Performs the 2-phase Ring-AllReduce: Scatter-Reduce followed by All-Gather.
+    Operates on the gradients currently stored in the inference engine.
+    """
+    if self.ring_world_size <= 1:
+      return # Single node, nothing to reduce
+
+    if not self.ring_successor:
+      if DEBUG >= 1: print("Ring-AllReduce Error: Successor not configured!")
+      return
+
+    # 1. Flatten all gradients into a single 1D buffer
+    grads_dict = self.inference_engine.get_gradients(model_id)
+    if not grads_dict:
+      return
+
+    param_names = sorted(grads_dict.keys())
+    flat_grads = np.concatenate([grads_dict[name].flatten() for name in param_names])
+    total_size = flat_grads.size
+    
+    # 2. Split into N chunks
+    # Note: Using standard equal splitting. If not divisible, the last chunk is padded or smaller.
+    # For research stability, we assume divisible or slightly uneven is handled by array_split.
+    chunks = np.array_split(flat_grads, self.ring_world_size)
+    N = self.ring_world_size
+    
+    if DEBUG >= 2: print(f"Ring-AllReduce Starting: {N} nodes, Total params: {total_size}")
+
+    # Clear previous events
+    self.received_chunk_events.clear()
+    self.received_chunk_data.clear()
+
+    # --- Phase 1: Scatter-Reduce ($N-1$ steps) ---
+    # In each step, send chunk[rank - step] to successor and receive chunk from predecessor
+    for step in range(N - 1):
+      # Index of chunk we currently hold that we want to SEND
+      send_idx = (self.ring_rank - step) % N
+      # Index of chunk we expect to RECEIVE from predecessor
+      recv_idx = (self.ring_rank - step - 1) % N
+      
+      # Ensure event for receiver exists
+      if recv_idx not in self.received_chunk_events:
+        self.received_chunk_events[recv_idx] = asyncio.Event()
+      
+      # Step A: Send our current version of chunk[send_idx] to successor
+      if DEBUG >= 3: print(f"Scatter-Reduce Step {step}: Node {self.ring_rank} sending chunk {send_idx} to successor")
+      await self.ring_successor.transfer_chunk(send_idx, chunks[send_idx], "reduce")
+      
+      # Step B: Wait for chunk from predecessor
+      await self.received_chunk_events[recv_idx].wait()
+      
+      # Step C: Reduce (Sum) received data into our local chunk
+      async with self._ring_lock:
+        received_data = self.received_chunk_data[recv_idx]
+        chunks[recv_idx] += received_data # Operation: REDUCE
+        self.received_chunk_events[recv_idx].clear() # Reset for next phase if needed
+        del self.received_chunk_data[recv_idx]
+
+    if DEBUG >= 2: print(f"Scatter-Reduce Finished. Node {self.ring_rank} now has complete sum for chunk {(self.ring_rank+1)%N}")
+
+    # --- Phase 2: All-Gather ($N-1$ steps) ---
+    # At this point, Node i has the full sum for chunk (i+1)%N
+    for step in range(N - 1):
+      # Index of the fully reduced chunk we want to BROADCAST
+      send_idx = (self.ring_rank - step + 1) % N
+      recv_idx = (self.ring_rank - step) % N
+      
+      if recv_idx not in self.received_chunk_events:
+        self.received_chunk_events[recv_idx] = asyncio.Event()
+
+      # Step A: Send fully summed chunk to successor
+      await self.ring_successor.transfer_chunk(send_idx, chunks[send_idx], "replace")
+      
+      # Step B: Wait for finished chunk from predecessor
+      await self.received_chunk_events[recv_idx].wait()
+      
+      # Step C: Replace local chunk with the fully reduced one received
+      async with self._ring_lock:
+        chunks[recv_idx] = self.received_chunk_data[recv_idx] # Operation: REPLACE
+        self.received_chunk_events[recv_idx].clear()
+        del self.received_chunk_data[recv_idx]
+
+    if DEBUG >= 2: print("All-Gather Finished. All nodes now have synced gradients.")
+
+    # 3. Unflatten chunks back into the inference engine
+    synced_flat_grads = np.concatenate(chunks)
+    offset = 0
+    for name in param_names:
+      shape = grads_dict[name].shape
+      size = grads_dict[name].size
+      new_grad = synced_flat_grads[offset:offset+size].reshape(shape)
+      grads_dict[name] = new_grad
+      offset += size
+    
+    self.inference_engine.set_gradients(model_id, grads_dict)
+
   async def get_tailscale_nodes(self) -> List[Dict]:
     """Danh sách node Tailscale cho Web UI giám sát (chỉ có khi discovery là TailscaleDiscovery)."""
     if hasattr(self.discovery, "get_devices_for_ui"):
@@ -140,6 +273,49 @@ class Node:
 
   def get_topology_inference_engines(self) -> List[List[str]]:
     return self.topology_inference_engines_pool
+
+  async def process_sync_weights(self, model_id: str, weights: np.ndarray, step: int) -> np.ndarray:
+    """Xử lý đồng bộ trọng số (giai đoạn sau: Ring-AllReduce). Hiện tại trả về trực tiếp."""
+    if DEBUG >= 1: print(f"Node: Received SyncWeights for {model_id} at step {step}")
+    # TODO: Implement Ring-AllReduce logic here
+    return weights
+
+  async def process_hardware_profile(self, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, n_iters: int, skip_iters: int) -> Tuple[float, float]:
+    """Đo đạc throughput thực tế trên phần cứng cục bộ sử dụng chiến lược Drop-First (Real Data Cache)."""
+    if DEBUG >= 1:
+      print(f"Node profiling started: model={shard.model_id}, iters={n_iters}, skip={skip_iters}, batch_size={example.shape[0]}")
+    
+    times = []
+    # Đảm bảo Shard (model layers) đã được load vào GPU/RAM
+    await self.inference_engine.ensure_shard(shard)
+    
+    for i in range(n_iters):
+      start_t = time.perf_counter()
+      # Chạy 1 batch training (forward + backward) cục bộ
+      await self.inference_engine.process_example(shard, example, target, length, train=True)
+      end_t = time.perf_counter()
+      
+      duration = end_t - start_t
+      if i >= skip_iters:
+        times.append(duration)
+        if DEBUG >= 2:
+          print(f"  Iteration {i+1}/{n_iters}: {duration:.4f}s")
+      else:
+        if DEBUG >= 2:
+          print(f"  Warmup Iteration {i+1}/{n_iters}: {duration:.4f}s (dropped)")
+    
+    if not times:
+      return 0.0, 0.0
+    
+    avg_time = sum(times) / len(times)
+    batch_size = example.shape[0]
+    samples_per_sec = batch_size / avg_time
+    avg_latency_ms = avg_time * 1000
+    
+    if DEBUG >= 1:
+      print(f"Node profiling completed: {samples_per_sec=:.2f} samples/s, avg_latency={avg_latency_ms:.2f}ms")
+    
+    return samples_per_sec, avg_latency_ms
   
   token_count = 0
   first_token_time = 0
@@ -472,6 +648,57 @@ class Node:
       print(f"Error processing example for shard {shard}: {e}")
       traceback.print_exc()
       raise
+
+  async def process_hardware_profile(
+    self,
+    base_shard: Shard,
+    example: np.ndarray,
+    target: np.ndarray,
+    length: np.ndarray,
+    n_iters: int = 5,
+    skip_iters: int = 2
+  ) -> Tuple[float, float]:
+    """Measures local training performance (samples/sec and latency)."""
+    # Tối ưu cho CPU: nếu không có CUDA, giảm số lần chạy thử xuống tối thiểu
+    try:
+      import torch
+      if not torch.cuda.is_available():
+        n_iters = min(n_iters, 2)
+        skip_iters = min(skip_iters, 1)
+        if DEBUG >= 1: print("[HardwareProfile] CPU detected. Optimization: Reducing iterations to prevent hang.")
+    except Exception:
+      pass
+
+    if DEBUG >= 1: print(f"[HardwareProfile] Profiling shard {base_shard.model_id} for {n_iters} iterations...")
+    
+    shard = self.get_current_shard(base_shard)
+    latencies = []
+    
+    # Warmup
+    for _ in range(skip_iters):
+        try:
+            # Sử dụng request_id giả lập để không trùng với job thật
+            await self.inference_engine.train(f"warmup-{uuid.uuid4()}", shard, example, target, length)
+        except Exception:
+            pass
+            
+    # Measure
+    for i in range(n_iters):
+        start = time.perf_counter()
+        request_id = f"profile-{i}-{uuid.uuid4()}"
+        try:
+            await self.inference_engine.train(request_id, shard, example, target, length)
+            latencies.append(time.perf_counter() - start)
+        except Exception as e:
+            if DEBUG >= 1: print(f"[HardwareProfile] Step {i} failed: {e}")
+            
+    if not latencies:
+        return 0.1, 1000.0 # Fallback
+        
+    avg_latency = sum(latencies) / len(latencies)
+    throughput = 1.0 / avg_latency if avg_latency > 0 else 0.1 # samples/sec
+    
+    return throughput, avg_latency * 1000.0 # throughput, latency_ms
         
   async def process_tensor(
     self,
@@ -625,12 +852,33 @@ class Node:
         traceback.print_exc()
         return False
 
-    async def connect_with_timeout(peer, timeout=5):
+    async def connect_with_timeout(peer, timeout=15):
       try:
         await asyncio.wait_for(peer.connect(), timeout)
+        
+        # --- Network Profiling on Join ---
+        if peer.id() != self.id:
+          if DEBUG >= 1: print(f"Profiling network for new peer: {peer.id()}...")
+          # Sửa dụng 2MB để test nhanh khi join
+          test_payload = b"0" * (2 * 1024 * 1024)
+          start_time = time.perf_counter()
+          latency_ms = await peer.test_network(test_payload)
+          end_time = time.perf_counter()
+          
+          # Thực tế RTT (Round Trip Time)
+          rtt_ms = (end_time - start_time) * 1000
+          # Băng thông: (2MB * 2 / RTT_s) để tính cả upload/download mô phỏng, 
+          # hoặc đơn giản (2MB / latency_ms_reported)
+          bandwidth_mbps = (2.0 * 8) / (rtt_ms / 1000.0)
+          
+          caps = peer.device_capabilities()
+          caps.latency_ms = round(rtt_ms / 2, 2) #Ước lượng chiều đi
+          caps.bandwidth_mbps = round(bandwidth_mbps, 2)
+          if DEBUG >= 1: print(f"Peer {peer.id()} profiled: {caps.bandwidth_mbps} Mbps, {caps.latency_ms} ms")
+        
         return True
       except Exception as e:
-        print(f"Error connecting peer {peer.id()}@{peer.addr()}: {e}")
+        print(f"Error connecting/profiling peer {peer.id()}@{peer.addr()}: {e}")
         traceback.print_exc()
         return False
 

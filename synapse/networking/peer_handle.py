@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Set
 import numpy as np
 from synapse.inference.shard import Shard
 from synapse.topology.device_capabilities import DeviceCapabilities
@@ -52,5 +52,33 @@ class PeerHandle(ABC):
     pass
 
   @abstractmethod
-  async def collect_topology(self, visited: set[str], max_depth: int) -> Topology:
+  async def collect_topology(self, visited: Set[str], max_depth: int) -> Topology:
+    pass
+
+  @abstractmethod
+  async def send_example(self, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, train: bool, request_id: Optional[str] = None) -> Optional[np.array]:
+    pass
+
+  @abstractmethod
+  async def sync_weights(self, model_id: str, weights: np.ndarray, step: int) -> np.ndarray:
+    pass
+
+  @abstractmethod
+  async def test_network(self, payload: bytes) -> float:
+    pass
+
+  @abstractmethod
+  async def profile_hardware(self, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, n_iters: int, skip_iters: int) -> Tuple[float, float]:
+    pass
+
+  @abstractmethod
+  async def setup_ring(self, rank: int, world_size: int, successor_url: str) -> None:
+    pass
+
+  @abstractmethod
+  async def transfer_chunk(self, chunk_index: int, tensor: np.ndarray, step_type: str) -> None:
+    pass
+
+  @abstractmethod
+  async def trigger_ring_allreduce(self, model_id: str) -> None:
     pass

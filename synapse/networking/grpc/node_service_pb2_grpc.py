@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from . import node_service_pb2 as node__service__pb2
+from synapse.networking.grpc import node_service_pb2 as synapse_dot_networking_dot_grpc_dot_node__service__pb2
 
-GRPC_GENERATED_VERSION = '1.67.0'
+GRPC_GENERATED_VERSION = '1.69.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in node_service_pb2_grpc.py depends on'
+        + f' but the generated code in synapse/networking/grpc/node_service_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -36,38 +36,68 @@ class NodeServiceStub(object):
         """
         self.SendPrompt = channel.unary_unary(
                 '/node_service.NodeService/SendPrompt',
-                request_serializer=node__service__pb2.PromptRequest.SerializeToString,
-                response_deserializer=node__service__pb2.Tensor.FromString,
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.PromptRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Tensor.FromString,
                 _registered_method=True)
         self.SendTensor = channel.unary_unary(
                 '/node_service.NodeService/SendTensor',
-                request_serializer=node__service__pb2.TensorRequest.SerializeToString,
-                response_deserializer=node__service__pb2.Tensor.FromString,
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TensorRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Tensor.FromString,
                 _registered_method=True)
         self.SendExample = channel.unary_unary(
                 '/node_service.NodeService/SendExample',
-                request_serializer=node__service__pb2.ExampleRequest.SerializeToString,
-                response_deserializer=node__service__pb2.Loss.FromString,
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.ExampleRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Loss.FromString,
                 _registered_method=True)
         self.CollectTopology = channel.unary_unary(
                 '/node_service.NodeService/CollectTopology',
-                request_serializer=node__service__pb2.CollectTopologyRequest.SerializeToString,
-                response_deserializer=node__service__pb2.Topology.FromString,
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.CollectTopologyRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Topology.FromString,
                 _registered_method=True)
         self.SendResult = channel.unary_unary(
                 '/node_service.NodeService/SendResult',
-                request_serializer=node__service__pb2.SendResultRequest.SerializeToString,
-                response_deserializer=node__service__pb2.Empty.FromString,
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SendResultRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
                 _registered_method=True)
         self.SendOpaqueStatus = channel.unary_unary(
                 '/node_service.NodeService/SendOpaqueStatus',
-                request_serializer=node__service__pb2.SendOpaqueStatusRequest.SerializeToString,
-                response_deserializer=node__service__pb2.Empty.FromString,
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SendOpaqueStatusRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
                 _registered_method=True)
         self.HealthCheck = channel.unary_unary(
                 '/node_service.NodeService/HealthCheck',
-                request_serializer=node__service__pb2.HealthCheckRequest.SerializeToString,
-                response_deserializer=node__service__pb2.HealthCheckResponse.FromString,
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.HealthCheckRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.HealthCheckResponse.FromString,
+                _registered_method=True)
+        self.SyncWeights = channel.unary_unary(
+                '/node_service.NodeService/SyncWeights',
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SyncWeightsRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SyncWeightsResponse.FromString,
+                _registered_method=True)
+        self.TestNetwork = channel.unary_unary(
+                '/node_service.NodeService/TestNetwork',
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TestNetworkRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TestNetworkResponse.FromString,
+                _registered_method=True)
+        self.ProfileHardware = channel.unary_unary(
+                '/node_service.NodeService/ProfileHardware',
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.ProfileHardwareRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.ProfileHardwareResponse.FromString,
+                _registered_method=True)
+        self.SetupRing = channel.unary_unary(
+                '/node_service.NodeService/SetupRing',
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SetupRingRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
+                _registered_method=True)
+        self.TransferChunk = channel.unary_unary(
+                '/node_service.NodeService/TransferChunk',
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TransferChunkRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
+                _registered_method=True)
+        self.TriggerRingAllReduce = channel.unary_unary(
+                '/node_service.NodeService/TriggerRingAllReduce',
+                request_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TriggerRingAllReduceRequest.SerializeToString,
+                response_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
                 _registered_method=True)
 
 
@@ -116,43 +146,109 @@ class NodeServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SyncWeights(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TestNetwork(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ProfileHardware(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SetupRing(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TransferChunk(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TriggerRingAllReduce(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NodeServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'SendPrompt': grpc.unary_unary_rpc_method_handler(
                     servicer.SendPrompt,
-                    request_deserializer=node__service__pb2.PromptRequest.FromString,
-                    response_serializer=node__service__pb2.Tensor.SerializeToString,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.PromptRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Tensor.SerializeToString,
             ),
             'SendTensor': grpc.unary_unary_rpc_method_handler(
                     servicer.SendTensor,
-                    request_deserializer=node__service__pb2.TensorRequest.FromString,
-                    response_serializer=node__service__pb2.Tensor.SerializeToString,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TensorRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Tensor.SerializeToString,
             ),
             'SendExample': grpc.unary_unary_rpc_method_handler(
                     servicer.SendExample,
-                    request_deserializer=node__service__pb2.ExampleRequest.FromString,
-                    response_serializer=node__service__pb2.Loss.SerializeToString,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.ExampleRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Loss.SerializeToString,
             ),
             'CollectTopology': grpc.unary_unary_rpc_method_handler(
                     servicer.CollectTopology,
-                    request_deserializer=node__service__pb2.CollectTopologyRequest.FromString,
-                    response_serializer=node__service__pb2.Topology.SerializeToString,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.CollectTopologyRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Topology.SerializeToString,
             ),
             'SendResult': grpc.unary_unary_rpc_method_handler(
                     servicer.SendResult,
-                    request_deserializer=node__service__pb2.SendResultRequest.FromString,
-                    response_serializer=node__service__pb2.Empty.SerializeToString,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SendResultRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.SerializeToString,
             ),
             'SendOpaqueStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.SendOpaqueStatus,
-                    request_deserializer=node__service__pb2.SendOpaqueStatusRequest.FromString,
-                    response_serializer=node__service__pb2.Empty.SerializeToString,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SendOpaqueStatusRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.SerializeToString,
             ),
             'HealthCheck': grpc.unary_unary_rpc_method_handler(
                     servicer.HealthCheck,
-                    request_deserializer=node__service__pb2.HealthCheckRequest.FromString,
-                    response_serializer=node__service__pb2.HealthCheckResponse.SerializeToString,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.HealthCheckRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.HealthCheckResponse.SerializeToString,
+            ),
+            'SyncWeights': grpc.unary_unary_rpc_method_handler(
+                    servicer.SyncWeights,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SyncWeightsRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SyncWeightsResponse.SerializeToString,
+            ),
+            'TestNetwork': grpc.unary_unary_rpc_method_handler(
+                    servicer.TestNetwork,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TestNetworkRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TestNetworkResponse.SerializeToString,
+            ),
+            'ProfileHardware': grpc.unary_unary_rpc_method_handler(
+                    servicer.ProfileHardware,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.ProfileHardwareRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.ProfileHardwareResponse.SerializeToString,
+            ),
+            'SetupRing': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetupRing,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.SetupRingRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.SerializeToString,
+            ),
+            'TransferChunk': grpc.unary_unary_rpc_method_handler(
+                    servicer.TransferChunk,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TransferChunkRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.SerializeToString,
+            ),
+            'TriggerRingAllReduce': grpc.unary_unary_rpc_method_handler(
+                    servicer.TriggerRingAllReduce,
+                    request_deserializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.TriggerRingAllReduceRequest.FromString,
+                    response_serializer=synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -180,8 +276,8 @@ class NodeService(object):
             request,
             target,
             '/node_service.NodeService/SendPrompt',
-            node__service__pb2.PromptRequest.SerializeToString,
-            node__service__pb2.Tensor.FromString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.PromptRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Tensor.FromString,
             options,
             channel_credentials,
             insecure,
@@ -207,8 +303,8 @@ class NodeService(object):
             request,
             target,
             '/node_service.NodeService/SendTensor',
-            node__service__pb2.TensorRequest.SerializeToString,
-            node__service__pb2.Tensor.FromString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.TensorRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Tensor.FromString,
             options,
             channel_credentials,
             insecure,
@@ -234,8 +330,8 @@ class NodeService(object):
             request,
             target,
             '/node_service.NodeService/SendExample',
-            node__service__pb2.ExampleRequest.SerializeToString,
-            node__service__pb2.Loss.FromString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.ExampleRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Loss.FromString,
             options,
             channel_credentials,
             insecure,
@@ -261,8 +357,8 @@ class NodeService(object):
             request,
             target,
             '/node_service.NodeService/CollectTopology',
-            node__service__pb2.CollectTopologyRequest.SerializeToString,
-            node__service__pb2.Topology.FromString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.CollectTopologyRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Topology.FromString,
             options,
             channel_credentials,
             insecure,
@@ -288,8 +384,8 @@ class NodeService(object):
             request,
             target,
             '/node_service.NodeService/SendResult',
-            node__service__pb2.SendResultRequest.SerializeToString,
-            node__service__pb2.Empty.FromString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.SendResultRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
@@ -315,8 +411,8 @@ class NodeService(object):
             request,
             target,
             '/node_service.NodeService/SendOpaqueStatus',
-            node__service__pb2.SendOpaqueStatusRequest.SerializeToString,
-            node__service__pb2.Empty.FromString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.SendOpaqueStatusRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
@@ -342,8 +438,170 @@ class NodeService(object):
             request,
             target,
             '/node_service.NodeService/HealthCheck',
-            node__service__pb2.HealthCheckRequest.SerializeToString,
-            node__service__pb2.HealthCheckResponse.FromString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.HealthCheckRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.HealthCheckResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SyncWeights(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/node_service.NodeService/SyncWeights',
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.SyncWeightsRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.SyncWeightsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TestNetwork(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/node_service.NodeService/TestNetwork',
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.TestNetworkRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.TestNetworkResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ProfileHardware(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/node_service.NodeService/ProfileHardware',
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.ProfileHardwareRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.ProfileHardwareResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetupRing(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/node_service.NodeService/SetupRing',
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.SetupRingRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TransferChunk(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/node_service.NodeService/TransferChunk',
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.TransferChunkRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TriggerRingAllReduce(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/node_service.NodeService/TriggerRingAllReduce',
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.TriggerRingAllReduceRequest.SerializeToString,
+            synapse_dot_networking_dot_grpc_dot_node__service__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,

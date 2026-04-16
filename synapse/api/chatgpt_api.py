@@ -27,6 +27,8 @@ import numpy as np
 import base64
 from io import BytesIO
 from synapse.loading import RepoProgressEvent
+from synapse.inference.shard import Shard
+from synapse.topology.partitioning_strategy import Partition
 import tempfile
 from synapse.apputil import create_animation_mp4
 from collections import defaultdict
@@ -1817,6 +1819,7 @@ class ChatGPTAPI:
     max_steps = int(job.get("max_steps", 0) or 0)
     batch_size = int(job.get("batch_size", 1))
     max_length = min(int(job.get("max_length", 128)), 2048)
+    sync_every_n = int(job.get("sync_every_n_steps", 1))
     min_max_length = 64
 
     def _is_cuda_oom_error(exc: Exception) -> bool:
@@ -1936,6 +1939,20 @@ class ChatGPTAPI:
         total_steps = max(1, planned_steps)
       step_count = 0
       effective_max_length = max_length
+
+      # === Giai đoạn 2: Warmup Profiling (Dynamic Load Balancing) ===
+      if job.get("use_dynamic_profiling", True):
+        await self._perform_warmup_profiling(job, texts, effective_max_length, base_shard, tokenize_batch)
+
+      # === Giai đoạn 3: Ring-AllReduce Setup ===
+      # Lấy danh sách entry nodes (DP nodes)
+      partitions = self.node.partitioning_strategy.partition(self.node.topology)
+      entry_node_ids = sorted(list(set(p.node_id for p in partitions if p.start == 0.0)))
+      sync_strategy = job.get("sync_strategy", "ring") # ring hoặc averaging
+      
+      if sync_strategy == "ring" and len(entry_node_ids) > 1:
+        await self._setup_ring_topology(job, entry_node_ids)
+
       for epoch in range(epochs):
         if self._training_job is None or self._training_job.get("job_id") != job_id:
           return
@@ -1948,34 +1965,109 @@ class ChatGPTAPI:
           if max_steps > 0 and step_count >= max_steps:
             break
           batch_idx = indices[start : start + batch_size]
-          pending_batches = [[texts[i] for i in batch_idx]]
+          current_batch_texts = [texts[idx] for idx in batch_idx]
+          pending_batches = [current_batch_texts]
+          
           while pending_batches:
-            if max_steps > 0 and step_count >= max_steps:
-              break
-            current_batch_texts = pending_batches.pop(0)
-            if not current_batch_texts:
-              continue
-
+            if self._training_job is None or self._training_job.get("job_id") != job_id:
+              return
+            
+            sub_batch = pending_batches.pop(0)
+            
+            # 1. Identify Data Parallel Groups for the first stage (start=0.0)
+            partitions = self.node.partitioning_strategy.partition(self.node.topology)
+            entry_partitions = [p for p in partitions if p.start == 0.0]
+            
+            if not entry_partitions:
+              entry_partitions = [Partition(self.node.id, 0.0, 1.0, 1.0)]
+            
+            # 2. Phân bổ sub-batches dựa trên trọng số (Manual Weighting / FLOPS)
+            total_entry_weight = sum(p.weight for p in entry_partitions)
+            sub_batch_results = []
+            current_sub_start = 0
+            
             try:
-              example_np, target_np, length_np = tokenize_batch(current_batch_texts, effective_max_length)
-              loss = await self.node.enqueue_example(
-                base_shard,
-                example_np,
-                target_np,
-                length_np,
-                request_id=str(uuid.uuid4()),
-                train=True,
-              )
-              if loss is None:
-                raise RuntimeError("Training step trả về loss=None")
-              if isinstance(loss, (int, float)):
-                job["loss"] = round(float(loss), 4)
+              for i, p in enumerate(entry_partitions):
+                share = p.weight / total_entry_weight
+                n_samples = int(len(sub_batch) * share)
+                if i == len(entry_partitions) - 1:
+                  node_sub_samples = sub_batch[current_sub_start:]
+                else:
+                  node_sub_samples = sub_batch[current_sub_start : current_sub_start + n_samples]
+                
+                current_sub_start += n_samples
+                if not node_sub_samples:
+                  continue
+                
+                # Tokenize cho node này
+                job["current_activity"] = f"Tokenizing sub-batch for {p.node_id}..."
+                example_np, target_np, length_np = tokenize_batch(node_sub_samples, effective_max_length)
+                request_id = str(uuid.uuid4())
+                
+                # 3. Thực thi song song (Data Parallelism)
+                if p.node_id == self.node.id:
+                  job["current_activity"] = f"Processing locally (Node: {p.node_id})..."
+                  task = self.node.enqueue_example(
+                    base_shard, example_np, target_np, length_np,
+                    train=True, request_id=request_id
+                  )
+                  sub_batch_results.append(task)
+                else:
+                  peer = next((peer for peer in self.node.peers if peer.id() == p.node_id), None)
+                  if peer:
+                    job["current_activity"] = f"Sending to remote Node: {p.node_id}..."
+                    task = peer.send_example(
+                      base_shard, example_np, target_np, length_np,
+                      train=True, request_id=request_id
+                    )
+                    sub_batch_results.append(task)
+              
+              if not sub_batch_results:
+                continue
+
+              # Chờ tất cả các sub-batches hoàn thành (Synchronous DP) với timeout 45s
+              losses = await asyncio.wait_for(asyncio.gather(*sub_batch_results), timeout=45.0)
+              
+              # Lọc bỏ các kết quả None/Error
+              valid_losses = []
+              for l in losses:
+                if isinstance(l, (int, float)):
+                  valid_losses.append(l)
+                elif isinstance(l, tuple) and len(l) > 0 and isinstance(l[0], (int, float)):
+                  valid_losses.append(l[0])
+              
+              if not valid_losses:
+                raise RuntimeError("Tất cả các sub-batches đều thất bại (loss=None)")
+              
+              # Tính trung bình Loss của Batch
+              loss = sum(valid_losses) / len(valid_losses)
+              job["loss"] = round(float(loss), 4)
               step_count += 1
+              
+              # === Gradient Synchronization Section ===
+              if step_count % sync_every_n == 0:
+                if sync_strategy == "ring" and len(entry_node_ids) > 1:
+                  if DEBUG >= 1: print(f"[Sync] Bước {step_count}: Kích hoạt Ring-AllReduce P2P...")
+                  sync_tasks = []
+                  for node_id in entry_node_ids:
+                    if node_id == self.node.id:
+                      sync_tasks.append(self.node.execute_ring_allreduce(model))
+                    else:
+                      peer = next((p for p in self.node.peers if p.id() == node_id), None)
+                      if peer:
+                        sync_tasks.append(peer.trigger_ring_allreduce(model))
+                  
+                  if sync_tasks:
+                    await asyncio.gather(*sync_tasks)
+                else:
+                  if DEBUG >= 1: print(f"[Sync] Bước {step_count}: Sử dụng Weighted Averaging (Default)...")
+              
               job["current_step"] = step_count
               job["current_epoch"] = epoch
               job["progress"] = min(100, int(100 * step_count / total_steps))
-              # Nhường event loop để endpoint status vẫn phản hồi được trong lúc train.
+              job["current_activity"] = f"Step {step_count}/{total_steps} (Epoch {epoch}) finished."
               await asyncio.sleep(0)
+
             except Exception as e:
               if not _is_cuda_oom_error(e):
                 if DEBUG >= 1:
@@ -1992,36 +2084,56 @@ class ChatGPTAPI:
                 prev_len = effective_max_length
                 effective_max_length = max(min_max_length, effective_max_length // 2)
                 job["effective_max_length"] = effective_max_length
-                pending_batches.insert(0, current_batch_texts)
+                pending_batches.insert(0, sub_batch)
                 if DEBUG >= 1:
-                  print(
-                    f"[training:{job_id}] CUDA OOM -> giảm max_length {prev_len} -> {effective_max_length} và retry"
-                  )
+                  print(f"[training:{job_id}] CUDA OOM -> giảm max_length {prev_len} -> {effective_max_length} và retry")
                 continue
 
-              if len(current_batch_texts) > 1:
-                mid = max(1, len(current_batch_texts) // 2)
-                left = current_batch_texts[:mid]
-                right = current_batch_texts[mid:]
-                if right:
-                  pending_batches.insert(0, right)
-                if left:
-                  pending_batches.insert(0, left)
+              if len(sub_batch) > 1:
+                mid = max(1, len(sub_batch) // 2)
+                left = sub_batch[:mid]
+                right = sub_batch[mid:]
+                if right: pending_batches.insert(0, right)
+                if left: pending_batches.insert(0, left)
                 if DEBUG >= 1:
-                  print(
-                    f"[training:{job_id}] CUDA OOM ở max_length={effective_max_length} -> tách batch {len(current_batch_texts)} thành {len(left)} + {len(right)}"
-                  )
+                  print(f"[training:{job_id}] CUDA OOM ở max_length={effective_max_length} -> tách batch {len(sub_batch)} thành {len(left)} + {len(right)}")
                 continue
 
-              if DEBUG >= 1:
-                traceback.print_exc()
+              if DEBUG >= 1: traceback.print_exc()
               job["status"] = "failed"
-              job["error"] = (
-                "CUDA OOM dù đã giảm max_length và batch tối thiểu. "
-                "Hãy chọn model nhỏ hơn hoặc giảm max_length trong Training settings."
-              )
+              job["error"] = "CUDA OOM dù đã giảm tối đa. Hãy dùng model nhỏ hơn."
               self.log_activity("Training Failed", model, "failed")
               return
+
+              prev_len = effective_max_length
+              effective_max_length = max(min_max_length, effective_max_length // 2)
+              job["effective_max_length"] = effective_max_length
+              pending_batches.insert(0, current_batch_texts)
+              if DEBUG >= 1:
+                print(f"[training:{job_id}] CUDA OOM -> giảm max_length {prev_len} -> {effective_max_length} và retry")
+              continue
+
+            if len(current_batch_texts) > 1:
+              mid = max(1, len(current_batch_texts) // 2)
+              left = current_batch_texts[:mid]
+              right = current_batch_texts[mid:]
+              if right:
+                pending_batches.insert(0, right)
+              if left:
+                pending_batches.insert(0, left)
+              if DEBUG >= 1:
+                print(f"[training:{job_id}] CUDA OOM ở max_length={effective_max_length} -> tách batch {len(current_batch_texts)} thành {len(left)} + {len(right)}")
+              continue
+
+            if DEBUG >= 1:
+              traceback.print_exc()
+            job["status"] = "failed"
+            job["error"] = (
+              "CUDA OOM dù đã giảm max_length và batch tối thiểu. "
+              "Hãy chọn model nhỏ hơn hoặc giảm max_length trong Training settings."
+            )
+            self.log_activity("Training Failed", model, "failed")
+            return
       if self._training_job and self._training_job.get("job_id") == job_id:
         job["status"] = "completed"
         job["progress"] = 100
@@ -2039,6 +2151,120 @@ class ChatGPTAPI:
         self.log_activity("Training Failed", model, "failed")
       if DEBUG >= 2:
         traceback.print_exc()
+
+  async def _setup_ring_topology(self, job: Dict, node_ids: List[str]):
+    """Sắp xếp các Node thành một vòng tròn logic dựa trên Latency và cấu hình SetupRing."""
+    if len(node_ids) <= 1: return
+    
+    topology = self.node.topology
+    # 1. Sắp xếp node_ids dựa trên latency (latency_ms) đo được từ Giai đoạn 2
+    # Chúng ta muốn các máy "gần nhau" đứng cạnh nhau trong vòng tròn
+    node_latency = {}
+    for nid in node_ids:
+      node_caps = topology.get_node(nid)
+      node_latency[nid] = getattr(node_caps, "latency_ms", 999.0) if node_caps else 1000.0
+    
+    sorted_nodes = sorted(node_ids, key=lambda nid: node_latency[nid])
+    world_size = len(sorted_nodes)
+    
+    if DEBUG >= 1: print(f"[Ring-AllReduce] Thiết lập vòng tròn cho {world_size} nodes: {sorted_nodes}")
+    
+    # 2. Gửi SetupRing tới từng Node
+    setup_tasks = []
+    for rank, node_id in enumerate(sorted_nodes):
+      successor_rank = (rank + 1) % world_size
+      successor_id = sorted_nodes[successor_rank]
+      
+      # Lấy URL của successor. Node cần URL này để tạo GRPCPeerHandle
+      succ_caps = topology.get_node(successor_id)
+      # Giả định port là 52415 hoặc lấy từ topology nếu có
+      # Trong hệ thống này, ta thường dùng IP đo được từ discovery
+      successor_url = ""
+      # Tìm IP từ tailscale hoặc discovery
+      peer = next((p for p in self.node.peers if p.id() == successor_id), None)
+      if peer:
+        successor_url = peer.addr() # e.g. "100.x.y.z:52415"
+      elif successor_id == self.node.id:
+        successor_url = f"127.0.0.1:{self.node.server.port}"
+      
+      if node_id == self.node.id:
+        # Local setup
+        self.node.setup_ring(rank, world_size, successor_url)
+      else:
+        peer = next((p for p in self.node.peers if p.id() == node_id), None)
+        if peer:
+          setup_tasks.append(peer.setup_ring(rank, world_size, successor_url))
+          
+    if setup_tasks:
+      await asyncio.gather(*setup_tasks)
+
+  async def _perform_warmup_profiling(self, job: Dict, texts: List[str], max_len: int, base_shard: Shard, tokenize_fn):
+    """Điều phối đo đạc hiệu suất thực tế trên toàn bộ cụm máy."""
+    job["status"] = "profiling"
+    if DEBUG >= 1: print(f"[Profiling] Bắt đầu Warmup Profiling cho Job {job.get('job_id')}")
+    
+    # 1. Chuẩn bị batch mẫu (Sử dụng Real Data từ tập huấn luyện)
+    batch_size = job.get("batch_size", 1)
+    sample_texts = texts[:batch_size]
+    example_np, target_np, length_np = tokenize_fn(sample_texts, max_len)
+    
+    # 2. Xác định danh sách các Node đầu chuỗi (Entry Nodes) tham gia DP
+    topology = self.node.topology
+    partitions = self.node.partitioning_strategy.partition(topology)
+    entry_node_ids = list(set(p.node_id for p in partitions if p.start == 0.0))
+    
+    if not entry_node_ids:
+      if DEBUG >= 1: print("[Profiling] Không tìm thấy node DP hợp lệ, bỏ qua profiling.")
+      job["status"] = "started"
+      return
+
+    # 3. Kích hoạt Profiling đồng thời trên tất cả các Node (Barrier Sync)
+    profiling_tasks = []
+    for node_id in entry_node_ids:
+      if node_id == self.node.id:
+        # Local profiling
+        task = self.node.process_hardware_profile(base_shard, example_np, target_np, length_np, n_iters=8, skip_iters=3)
+        profiling_tasks.append((node_id, task))
+      else:
+        # Remote profiling qua gRPC
+        peer = next((p for p in self.node.peers if p.id() == node_id), None)
+        if peer:
+          task = peer.profile_hardware(base_shard, example_np, target_np, length_np, n_iters=8, skip_iters=3)
+          profiling_tasks.append((node_id, task))
+    
+    if not profiling_tasks:
+      job["status"] = "started"
+      return
+      
+    if DEBUG >= 1: print(f"[Profiling] Đang đợi {len(profiling_tasks)} nodes phản hồi (Barrier)...")
+    
+    # Đợi tất cả hoàn thành (Barrier Synchronization) với timeout 60s
+    try:
+      results = await asyncio.wait_for(
+        asyncio.gather(*(t[1] for t in profiling_tasks), return_exceptions=True),
+        timeout=60.0
+      )
+    except asyncio.TimeoutError:
+      if DEBUG >= 1: print("[Profiling] Timeout chờ phản hồi từ các nodes. Bỏ qua profiling cho các nodes chậm.")
+      results = [Exception("Timeout")] * len(profiling_tasks)
+    
+    # 4. Cập nhật kết quả vào Topology
+    for (node_id, _), res in zip(profiling_tasks, results):
+      if isinstance(res, Exception):
+        if DEBUG >= 1: print(f"[Profiling] Node {node_id} gặp lỗi: {res}")
+        continue
+      
+      samples_per_sec, avg_latency_ms = res
+      node_caps = topology.get_node(node_id)
+      if node_caps:
+        node_caps.warmup_throughput = samples_per_sec
+        if DEBUG >= 1: print(f"[Profiling] Node {node_id} -> {samples_per_sec:.2f} samples/s ({avg_latency_ms:.2f}ms)")
+    
+    # Trigger re-partitioning để áp dụng tỷ lệ mới ngay lập tức
+    self.node.partitioning_strategy.partition(topology)
+    
+    job["status"] = "started"
+    if DEBUG >= 1: print("[Profiling] Warmup hoàn tất. Hệ thống đã được cân bằng tải động.")
 
   async def _run_training_job(self, job: Dict) -> None:
     """Training chia tải (pipeline Node). Không còn LoRA 1 node."""
@@ -2076,6 +2302,11 @@ class ChatGPTAPI:
       output_model_name = (body.get("output_model_name") or body.get("output_name") or "").strip() or None
       checkpoint_dir = (body.get("checkpoint_dir") or "").strip() or None
       system_prompt = (body.get("system_prompt") or body.get("system") or "").strip() or None
+      use_dynamic_profiling = bool(body.get("use_dynamic_profiling", True))
+      sync_every_n_steps = int(body.get("sync_every_n_steps", 1))
+      sync_strategy = (body.get("sync_strategy") or "ring").strip()
+      node_weights = body.get("node_weights", {})
+      
       if not model:
         return web.json_response({"success": False, "message": "Thiếu model"}, status=400)
       if not dataset:
@@ -2095,6 +2326,10 @@ class ChatGPTAPI:
         "output_model_name": output_model_name,
         "checkpoint_dir": checkpoint_dir,
         "system_prompt": system_prompt,
+        "use_dynamic_profiling": use_dynamic_profiling,
+        "sync_every_n_steps": sync_every_n_steps,
+        "sync_strategy": sync_strategy,
+        "node_weights": node_weights,
         "base_model_id": model,
         "status": "started",
         "progress": 0,

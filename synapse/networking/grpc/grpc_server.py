@@ -118,6 +118,29 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
       return node_service_pb2.Loss(loss=loss_value, grads=grad_tensor)
     return node_service_pb2.Loss(loss=loss_value)
 
+  async def ProfileHardware(self, request, context):
+    shard = Shard(
+      model_id=request.shard.model_id,
+      start_layer=request.shard.start_layer,
+      end_layer=request.shard.end_layer,
+      n_layers=request.shard.n_layers,
+    )
+    example = np.frombuffer(request.example.tensor_data, dtype=np.dtype(request.example.dtype)).reshape(request.example.shape)
+    target = np.frombuffer(request.target.tensor_data, dtype=np.dtype(request.target.dtype)).reshape(request.target.shape)
+    length = np.frombuffer(request.length.tensor_data, dtype=np.dtype(request.length.dtype)).reshape(request.length.shape)
+    
+    n_iters = request.n_iters
+    skip_iters = request.skip_iters
+    
+    samples_per_sec, avg_latency = await self.node.process_hardware_profile(
+      shard, example, target, length, n_iters, skip_iters
+    )
+    
+    return node_service_pb2.ProfileHardwareResponse(
+      samples_per_sec=samples_per_sec,
+      avg_latency_ms=avg_latency
+    )
+
   async def CollectTopology(self, request, context):
     max_depth = request.max_depth
     visited = set(request.visited)
@@ -138,6 +161,25 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     }
     if DEBUG >= 5: print(f"CollectTopology {max_depth=} {visited=} {nodes=} {peer_graph=}")
     return node_service_pb2.Topology(nodes=nodes, peer_graph=peer_graph)
+
+  async def SetupRing(self, request, context):
+    if DEBUG >= 1: print(f"Received SetupRing: Rank {request.rank}/{request.world_size}, Succ: {request.successor_url}")
+    self.node.setup_ring(request.rank, request.world_size, request.successor_url)
+    return node_service_pb2.Empty()
+
+  async def TransferChunk(self, request, context):
+    tensor = np.frombuffer(request.tensor.tensor_data, dtype=np.dtype(request.tensor.dtype)).reshape(request.tensor.shape)
+    step_type = "reduce" if request.step_type == node_service_pb2.RingStepType.REDUCE else "replace"
+    if DEBUG >= 2: print(f"Received TransferChunk: Index {request.chunk_index}, Type {step_type}")
+    await self.node.handle_incoming_chunk(request.chunk_index, tensor, step_type)
+    return node_service_pb2.Empty()
+
+  async def TriggerRingAllReduce(self, request, context):
+    if DEBUG >= 1: print(f"Received TriggerRingAllReduce for model {request.model_id}")
+    # Trình kích hoạt này thường được gọi bởi Master.
+    # Chúng ta cho nó chạy trong background để không block RPC stream.
+    self.node._schedule_task(self.node.execute_ring_allreduce(request.model_id), "execute_ring_allreduce")
+    return node_service_pb2.Empty()
 
   async def SendResult(self, request, context):
     request_id = request.request_id
@@ -160,6 +202,29 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
 
   async def HealthCheck(self, request, context):
     return node_service_pb2.HealthCheckResponse(is_healthy=True)
+
+  async def SyncWeights(self, request, context):
+    model_id = request.model_id
+    weights_msg = request.weights
+    weights = np.frombuffer(weights_msg.tensor_data, dtype=np.dtype(weights_msg.dtype)).reshape(weights_msg.shape)
+    step = request.step
+    
+    result = await self.node.process_sync_weights(model_id, weights, step)
+    
+    return node_service_pb2.SyncWeightsResponse(
+      averaged_weights=node_service_pb2.Tensor(
+        tensor_data=result.tobytes(),
+        shape=result.shape,
+        dtype=str(result.dtype)
+      )
+    )
+
+  async def TestNetwork(self, request, context):
+    # Simply echo back the payload for bandwidth/latency testing
+    return node_service_pb2.TestNetworkResponse(
+      payload=request.payload,
+      duration_ms=0.0 # Master node will calculate the round-trip time
+    )
 
   def deserialize_inference_state(self, inference_state_proto: node_service_pb2.InferenceState) -> dict:
     inference_state = {}

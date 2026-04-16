@@ -10,6 +10,12 @@ service NodeService {
   rpc SendResult (SendResultRequest) returns (Empty) {}
   rpc SendOpaqueStatus (SendOpaqueStatusRequest) returns (Empty) {}
   rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse) {}
+  rpc SyncWeights (SyncWeightsRequest) returns (SyncWeightsResponse) {}
+  rpc TestNetwork (TestNetworkRequest) returns (TestNetworkResponse) {}
+  rpc ProfileHardware (ProfileHardwareRequest) returns (ProfileHardwareResponse) {}
+  rpc SetupRing (SetupRingRequest) returns (Empty) {}
+  rpc TransferChunk (TransferChunkRequest) returns (Empty) {}
+  rpc TriggerRingAllReduce (TriggerRingAllReduceRequest) returns (Empty) {}
 }
 
 message Shard {
@@ -113,4 +119,58 @@ message HealthCheckResponse {
   bool is_healthy = 1;
 }
 
+message SyncWeightsRequest {
+  string model_id = 1;
+  Tensor weights = 2;
+  int32 step = 3;
+}
+
+message SyncWeightsResponse {
+  Tensor averaged_weights = 1;
+}
+
+message TestNetworkRequest {
+  bytes payload = 1;
+}
+
+message TestNetworkResponse {
+  bytes payload = 1;
+  double duration_ms = 2;
+}
+
+message ProfileHardwareRequest {
+  Shard shard = 1;
+  Tensor example = 2;
+  Tensor target = 3;
+  Tensor length = 4;
+  int32 n_iters = 5;
+  int32 skip_iters = 6;
+}
+
+message ProfileHardwareResponse {
+  double samples_per_sec = 1;
+  double avg_latency_ms = 2;
+}
+
 message Empty {}
+
+message SetupRingRequest {
+  int32 rank = 1;
+  int32 world_size = 2;
+  string successor_url = 3;
+}
+
+enum RingStepType {
+  REDUCE = 0;
+  REPLACE = 1;
+}
+
+message TransferChunkRequest {
+  int32 chunk_index = 1;
+  Tensor tensor = 2;
+  RingStepType step_type = 3;
+}
+
+message TriggerRingAllReduceRequest {
+  string model_id = 1;
+}

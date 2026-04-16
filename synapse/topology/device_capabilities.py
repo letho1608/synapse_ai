@@ -70,13 +70,19 @@ class DeviceCapabilities(BaseModel):
     unified_memory: bool = False
     gpu_count: int = 0
     total_gpu_vram_mb: int = 0
+    # Network fields
+    bandwidth_mbps: float = 0.0
+    latency_ms: float = 0.0
+    warmup_throughput: float = 0.0
 
     def __str__(self):
         return (
             f"Model: {self.model}. Chip: {self.chip}. "
             f"Memory: {self.memory}MB. System RAM: {self.system_ram_mb}MB. "
             f"Flops: {self.flops}. CPU: {self.cpu_cores} cores. "
-            f"Disk: {self.disk_gb} GB. Backend: {self.gpu_backend}"
+            f"Disk: {self.disk_gb} GB. Backend: {self.gpu_backend}. "
+            f"Net: {self.bandwidth_mbps} Mbps / {self.latency_ms} ms. "
+            f"Warmup: {self.warmup_throughput:.2f} samples/s"
         )
 
     def model_post_init(self, __context: Any) -> None:
@@ -96,6 +102,9 @@ class DeviceCapabilities(BaseModel):
             "unified_memory": self.unified_memory,
             "gpu_count": self.gpu_count,
             "total_gpu_vram_mb": self.total_gpu_vram_mb,
+            "bandwidth_mbps": self.bandwidth_mbps,
+            "latency_ms": self.latency_ms,
+            "warmup_throughput": self.warmup_throughput,
         }
 
 
@@ -107,6 +116,9 @@ UNKNOWN_DEVICE_CAPABILITIES = DeviceCapabilities(
     cpu_cores=0,
     disk_gb=0,
     system_ram_mb=0,
+    bandwidth_mbps=0.0,
+    latency_ms=0.0,
+    warmup_throughput=0.0,
 )
 
 
