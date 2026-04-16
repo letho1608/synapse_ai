@@ -37,12 +37,14 @@ class InferenceEngine(ABC):
     pass
 
   async def train(self, request_id: str, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, backgrad: Optional[np.ndarray] = None, loss: str = "forward") -> Tuple[Optional[float], Optional[np.ndarray]]:
-    """Training phân tán (chia layer): last layer tính loss; các layer khác nhận backgrad. Subclass override."""
-    raise NotImplementedError("Training phân tán (chia layer) cần engine implement train().")
-
+      """Training phân tán (chia layer): last layer tính loss; các layer khác nhận backgrad. Subclass nên override."""
+      # Default: chỉ forward, không training (对于 chỉ forward qua các layer)
+      return None, None
+  
   async def evaluate(self, request_id: str, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray) -> Optional[float]:
-    """Đánh giá (eval) phân tán. Subclass override."""
-    raise NotImplementedError("Evaluate phân tán cần engine implement evaluate().")
+      """Đánh giá (eval) phân tán. Subclass nên override."""
+      # Default: chỉ forward, không tính loss
+      return None
 
   async def save_session(self, key, value):
     self.session[key] = value

@@ -24,7 +24,7 @@ def test_imports():
     from synapse.inference.inference_engine import get_inference_engine, InferenceEngine
     from synapse.inference.shard import Shard
     from synapse.models import build_base_shard, get_repo
-    assert len(HF_MODELS) == 22
+    assert len(HF_MODELS) == 23
     assert resolve_hf_id("qwen2.5:1.5b") == "Qwen/Qwen2.5-1.5B-Instruct"
     print("  [OK] test_imports")
 
@@ -32,8 +32,8 @@ def test_imports():
 def test_model_list():
     """Model list: resolve_hf_id, so luong, layers."""
     from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id
-    assert len(HF_MODELS) == 22
-    assert len(HF_MODEL_LAYERS) == 22
+    assert len(HF_MODELS) == 23
+    assert len(HF_MODEL_LAYERS) == 23
     assert resolve_hf_id("qwen2.5:1.5b") == "Qwen/Qwen2.5-1.5B-Instruct"
     assert resolve_hf_id("llama3.2:3b") == "meta-llama/Llama-3.2-3B-Instruct"
     assert resolve_hf_id("phi3:mini") == "microsoft/Phi-3-mini-4k-instruct"

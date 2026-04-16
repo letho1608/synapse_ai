@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict
+from typing import List, Dict, Optional
 from dataclasses import dataclass
 from .topology import Topology
 from synapse.inference.shard import Shard
@@ -17,7 +17,7 @@ class Partition:
 
 class PartitioningStrategy(ABC):
   @abstractmethod
-  def partition(self, topology: Topology) -> List[Partition]:
+  def partition(self, topology: Topology, base_shard: Optional[Shard] = None) -> List[Partition]:
     pass
 
 

@@ -40,13 +40,15 @@ class Topology:
     self.peer_graph[from_id].add(conn)
 
   def merge(self, peer_node_id: str, other: "Topology"):
-    for node_id, capabilities in other.nodes.items():
-      if node_id != peer_node_id: continue
-      self.update_node(node_id, capabilities)
-    for node_id, connections in other.peer_graph.items():
-      for conn in connections:
-        if conn.from_id != peer_node_id: continue
-        self.add_edge(conn.from_id, conn.to_id, conn.description)
+      # Merge all nodes from other topology (not just peer_node_id)
+      for node_id, capabilities in other.nodes.items():
+          self.update_node(node_id, capabilities)
+      # Merge edges - only add edges that originate from peer_node_id
+      # to avoid adding edges from nodes not belonging to this peer
+      for node_id, connections in other.peer_graph.items():
+          for conn in connections:
+              if conn.from_id == peer_node_id:
+                  self.add_edge(conn.from_id, conn.to_id, conn.description)
 
   def __str__(self):
     nodes_str = ", ".join(f"{node_id}: {cap}" for node_id, cap in self.nodes.items())

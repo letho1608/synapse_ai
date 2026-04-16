@@ -5,6 +5,7 @@ import time
 import asyncio
 import json
 import os
+import platform
 import psutil
 from pathlib import Path
 from transformers import AutoTokenizer
@@ -320,6 +321,8 @@ class ChatGPTAPI:
     # New endpoints for Dashboard
     cors.add(self.app.router.add_get("/v1/system/stats", self.handle_get_system_stats), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/system/info", self.handle_get_system_info), {"*": cors_options})
+    cors.add(self.app.router.add_post("/v1/model/check", self.handle_check_model_fit), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/models/compatibility", self.handle_get_models_compatibility), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/tailscale/nodes", self.handle_get_tailscale_nodes), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/datasets", self.handle_get_datasets), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/datasets/upload", self.handle_post_datasets_upload), {"*": cors_options})
@@ -1278,26 +1281,239 @@ class ChatGPTAPI:
       return web.json_response({"detail": str(e)}, status=500)
 
   async def handle_get_system_info(self, request):
-    """Thông tin dự án / phiên bản cho trang About."""
-    try:
-      from synapse.topology.device_capabilities import SystemSpecs
-      specs = SystemSpecs.detect()
-      hw = {
-        "cpu": specs.cpu_name,
-        "cpu_cores": specs.total_cpu_cores,
-        "ram_total_gb": round(specs.total_ram_gb, 1),
-        "ram_available_gb": round(specs.available_ram_gb, 1),
-        "gpu": specs.gpu_name if specs.has_gpu else None,
-        "gpu_vram_gb": round(specs.gpu_vram_gb, 1) if specs.has_gpu and specs.gpu_vram_gb else None,
-        "unified_memory": bool(specs.unified_memory),
-      }
-    except Exception:
-      hw = {}
-    return web.json_response({
-      "project": "Synapse AI",
-      "version": VERSION,
-      "hardware": hw,
-    })
+      """Thông tin dự án / phiên bản cho trang About."""
+      try:
+          from synapse.topology.device_capabilities import SystemSpecs
+          specs = SystemSpecs.detect()
+          hw = {
+              "cpu": specs.cpu_name,
+              "cpu_cores": specs.total_cpu_cores,
+              "ram_total_gb": round(specs.total_ram_gb, 1),
+              "ram_available_gb": round(specs.available_ram_gb, 1),
+              "gpu": specs.gpu_name if specs.has_gpu else None,
+              "gpu_vram_gb": round(specs.gpu_vram_gb, 1) if specs.has_gpu and specs.gpu_vram_gb else None,
+              "unified_memory": bool(specs.unified_memory),
+              "gpu_count": specs.gpu_count,
+              "backend": specs.backend.value if specs.backend else "Unknown",
+              "os": platform.system() + " " + platform.release(),
+          }
+      except Exception:
+          hw = {}
+      return web.json_response({
+          "project": "Synapse AI",
+          "version": VERSION,
+          "hardware": hw,
+      })
+  
+  async def handle_check_model_fit(self, request):
+      """
+      Kiểm tra tương thích phần cứng cho một model cụ thể.
+      POST /api/v1/model/check
+      Body: { "model_name": "meta-llama/Llama-3.1-8B-Instruct", "quantization": "Q4_K_M" }
+      """
+      try:
+          body = await request.json()
+          model_name = body.get("model_name", "")
+          quantization = body.get("quantization", "Q4_K_M")
+          
+          if not model_name:
+              return web.json_response({"error": "model_name is required"}, status=400)
+          
+          # Import helpers for model analysis
+          from synapse.helpers import (
+              _estimate_model_memory_gb, _score_fit, _fit_emoji,
+              _load_model_db, _fuzzy_find_model, _QUANT_SPEED
+          )
+          from synapse.topology.device_capabilities import SystemSpecs
+          
+          # Detect hardware
+          specs = SystemSpecs.detect()
+          
+          # Find model in database
+          db = _load_model_db()
+          entry = _fuzzy_find_model(model_name, db)
+          
+          if entry:
+              params_b = entry.get("parameters_raw", 0) / 1e9 if entry.get("parameters_raw") else 7.0
+              ctx = entry.get("context_length", 4096)
+              default_quant = entry.get("quantization", quantization)
+              quant_to_use = quantization if quantization else default_quant
+          else:
+              # Try to parse from model name
+              import re
+              param_match = re.search(r"(\d+\.?\d*)\s*b", model_name.lower())
+              params_b = float(param_match.group(1)) if param_match else 7.0
+              ctx = 4096
+              quant_to_use = quantization
+          
+          # Determine available memory budget
+          if specs.has_gpu and specs.gpu_vram_gb and specs.gpu_vram_gb > 0:
+              budget_gb = specs.gpu_vram_gb
+              memory_label = f"GPU VRAM: {budget_gb:.1f}GB"
+              run_mode = "GPU"
+          elif specs.unified_memory and specs.gpu_vram_gb:
+              budget_gb = specs.gpu_vram_gb
+              memory_label = f"Unified Memory: {budget_gb:.1f}GB"
+              run_mode = "Unified"
+          else:
+              budget_gb = specs.available_ram_gb
+              memory_label = f"System RAM: {budget_gb:.1f}GB available"
+              run_mode = "CPU"
+          
+          # Calculate memory needed
+          mem_required = _estimate_model_memory_gb(params_b, quant_to_use, ctx)
+          fit = _score_fit(mem_required, budget_gb)
+          fit_emoji = _fit_emoji(fit)
+          
+          # Estimate speed (tokens/s) - base speed varies by backend
+          base_speed = 40.0  # Default base speed
+          if specs.backend and specs.backend.value == "CUDA":
+              base_speed = 50.0
+          elif specs.backend and specs.backend.value == "Metal":
+              base_speed = 45.0
+          
+          quant_speed = _QUANT_SPEED.get(quant_to_use, 1.0)
+          estimated_speed = round(base_speed * quant_speed, 1)
+          
+          # Generate notes
+          notes = []
+          if fit == "Too Tight":
+              notes.append("Model requires more memory than available. Consider using lower quantization or fewer context tokens.")
+          elif fit == "Marginal":
+              notes.append("Memory usage is high. May experience slowdowns with large contexts.")
+          elif fit == "Good":
+              notes.append("Model should run well with this configuration.")
+          else:
+              notes.append("Model fits comfortably in memory.")
+          
+          return web.json_response({
+              "model": model_name,
+              "parameters": f"{params_b:.1f}B",
+              "parameters_raw": params_b,
+              "quantization": quant_to_use,
+              "context_length": ctx,
+              "memory_needed_gb": round(mem_required, 2),
+              "memory_available_gb": round(budget_gb, 1),
+              "fit": fit,
+              "fit_emoji": fit_emoji,
+              "estimated_speed": estimated_speed,
+              "run_mode": run_mode,
+              "memory_label": memory_label,
+              "notes": " ".join(notes),
+          })
+      except Exception as e:
+          import traceback
+          if DEBUG >= 2:
+              traceback.print_exc()
+          return web.json_response({"error": str(e)}, status=500)
+  
+  async def handle_get_models_compatibility(self, request):
+      """
+      Lấy danh sách model với thông tin tương thích phần cứng.
+      GET /api/v1/models/compatibility?filter=Perfect&sort=memory&page=1&limit=20
+      """
+      try:
+          # Parse query params
+          filter_fit = request.query.get("filter", None)  # Perfect, Good, Marginal, Too Tight
+          sort_by = request.query.get("sort", "memory")  # memory, params, fit_score
+          page = int(request.query.get("page", 1))
+          limit = min(int(request.query.get("limit", 20)), 100)
+          
+          from synapse.helpers import (
+              _estimate_model_memory_gb, _score_fit, _fit_emoji,
+              _load_model_db, _QUANT_SPEED
+          )
+          from synapse.topology.device_capabilities import SystemSpecs
+          
+          # Detect hardware
+          specs = SystemSpecs.detect()
+          
+          # Determine available memory budget
+          if specs.has_gpu and specs.gpu_vram_gb and specs.gpu_vram_gb > 0:
+              budget_gb = specs.gpu_vram_gb
+          elif specs.unified_memory and specs.gpu_vram_gb:
+              budget_gb = specs.gpu_vram_gb
+          else:
+              budget_gb = specs.available_ram_gb
+          
+          # Load model database
+          db = _load_model_db()
+          
+          # Calculate compatibility for each model
+          results = []
+          for entry in db:
+              model_name = entry.get("name", "")
+              params_b = entry.get("parameters_raw", 0) / 1e9 if entry.get("parameters_raw") else 7.0
+              ctx = entry.get("context_length", 4096)
+              quant = entry.get("quantization", "Q4_K_M")
+              
+              mem_required = _estimate_model_memory_gb(params_b, quant, ctx)
+              fit = _score_fit(mem_required, budget_gb)
+              fit_emoji = _fit_emoji(fit)
+              
+              # Calculate fit score for sorting (lower is better)
+              if mem_required > budget_gb:
+                  fit_score = 1000 + (mem_required - budget_gb)
+              else:
+                  fit_score = (mem_required / budget_gb) * 100
+              
+              quant_speed = _QUANT_SPEED.get(quant, 1.0)
+              base_speed = 45.0 if specs.backend and specs.backend.value == "CUDA" else 35.0
+              estimated_speed = round(base_speed * quant_speed, 1)
+              
+              results.append({
+                  "name": model_name,
+                  "parameters": f"{params_b:.1f}B",
+                  "parameters_raw": params_b,
+                  "quantization": quant,
+                  "context_length": ctx,
+                  "memory_needed_gb": round(mem_required, 2),
+                  "fit": fit,
+                  "fit_emoji": fit_emoji,
+                  "fit_score": round(fit_score, 2),
+                  "estimated_speed": estimated_speed,
+              })
+          
+          # Apply filter
+          if filter_fit:
+              results = [r for r in results if r["fit"] == filter_fit]
+          
+          # Sort results
+          if sort_by == "params":
+              results.sort(key=lambda x: x["parameters_raw"], reverse=True)
+          elif sort_by == "fit_score":
+              results.sort(key=lambda x: x["fit_score"])
+          else:  # sort by memory
+              results.sort(key=lambda x: x["memory_needed_gb"])
+          
+          # Paginate
+          total = len(results)
+          start = (page - 1) * limit
+          end = start + limit
+          paginated = results[start:end]
+          
+          return web.json_response({
+              "total": total,
+              "page": page,
+              "limit": limit,
+              "total_pages": (total + limit - 1) // limit,
+              "budget_gb": round(budget_gb, 1),
+              "hardware": {
+                  "cpu": specs.cpu_name,
+                  "cpu_cores": specs.total_cpu_cores,
+                  "ram_total_gb": round(specs.total_ram_gb, 1),
+                  "ram_available_gb": round(specs.available_ram_gb, 1),
+                  "gpu": specs.gpu_name if specs.has_gpu else None,
+                  "gpu_vram_gb": round(specs.gpu_vram_gb, 1) if specs.has_gpu and specs.gpu_vram_gb else None,
+                  "unified_memory": bool(specs.unified_memory),
+              },
+              "models": paginated,
+          })
+      except Exception as e:
+          import traceback
+          if DEBUG >= 2:
+              traceback.print_exc()
+          return web.json_response({"error": str(e)}, status=500)
 
 
   async def handle_get_settings(self, request):
