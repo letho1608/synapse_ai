@@ -173,6 +173,19 @@ class GRPCPeerHandle(PeerHandle):
         traceback.print_exc()
       return False
 
+  async def probe(self) -> Tuple[str, DeviceCapabilities]:
+    """Tự nhận diện Node ID và cấu hình của Peer bằng cách gọi CollectTopology."""
+    try:
+      await self._ensure_connected()
+      topo = await self.collect_topology(visited=set(), max_depth=0)
+      # Tìm node ID của chính nó trong topology (là node duy nhất nếu max_depth=0)
+      for node_id, caps in topo.all_nodes():
+        return node_id, caps
+      raise RuntimeError("Peer returned empty topology during probe")
+    except Exception as e:
+      if DEBUG >= 1: print(f"Probe failed for {self.address}: {e}")
+      raise
+
   async def send_prompt(self, shard: Shard, prompt: str, inference_state: Optional[dict] = None, request_id: Optional[str] = None) -> Optional[np.array]:
     request = node_service_pb2.PromptRequest(
       prompt=prompt,

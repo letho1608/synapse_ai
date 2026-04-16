@@ -8,7 +8,7 @@ from synapse.networking.discovery import Discovery
 from synapse.networking.peer_handle import PeerHandle
 from synapse.topology.device_capabilities import DeviceCapabilities, device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.helpers import DEBUG, DEBUG_DISCOVERY
-from .tailscale_helpers import get_device_id, get_self_tailscale_info, update_device_attributes, get_device_attributes, get_tailscale_devices, Device
+from .tailscale_helpers import get_device_id, get_self_tailscale_info, update_device_attributes, get_device_attributes, get_tailscale_devices, Device, first_ip_from_addresses
 
 
 def _get_all_local_ips() -> Set[str]:
@@ -121,8 +121,26 @@ class TailscaleDiscovery(Discovery):
             peer_id, peer_port, device_capabilities = await get_device_attributes(device.device_id, self.tailscale_api_key)
           except (asyncio.TimeoutError, OSError, aiohttp.ClientError) as e:
             if DEBUG_DISCOVERY >= 1:
-              print(f"Discover peers: skip device {device.device_id} ({device.name}) after timeout/error: {e}")
-            continue
+              peer_id, peer_port, device_capabilities = await get_device_attributes(device.device_id, self.tailscale_api_key)
+
+          # Fallback: Nếu không lấy được ID qua API (do giới hạn gói Free), 
+          # hãy thử "dò" trực tiếp qua IP trên cổng mặc định (node_port của chính mình)
+          if not peer_id:
+            peer_host = first_ip_from_addresses(device.addresses)
+            if peer_host:
+              fallback_port = self.node_port 
+              if DEBUG >= 1: print(f"TailscaleDiscovery: Attributes missing for {device.name}, probing direct {peer_host}:{fallback_port}...")
+              
+              try:
+                # Tạo một handle tạm thời để probe
+                probe_handle = self.create_peer_handle("probe", f"{peer_host}:{fallback_port}", "Probe", UNKNOWN_DEVICE_CAPABILITIES)
+                peer_id, device_capabilities = await asyncio.wait_for(probe_handle.probe(), timeout=5.0)
+                peer_port = fallback_port
+                if DEBUG >= 1: print(f"TailscaleDiscovery: Probe SUCCESS for {device.name} -> Node ID: {peer_id}")
+              except Exception:
+                # Nếu probe thất bại, bỏ qua
+                pass
+
           if not peer_id:
             if DEBUG_DISCOVERY >= 4: print(f"{device.device_id} does not have synapse node attributes. skipping.")
             continue
