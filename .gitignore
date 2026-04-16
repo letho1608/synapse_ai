@@ -1,3 +1,20 @@
 # Môi trường ảo (Virtual Environments)
 .venv/
+venv/
+env/
+bin/
+lib/
+share/
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

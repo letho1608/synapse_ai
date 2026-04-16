@@ -99,7 +99,14 @@ message DeviceCapabilities {
   string chip = 2;
   int32 memory = 3;
   DeviceFlops flops = 4;
+  string gpu_backend = 5;
+  int32 cpu_cores = 6;
+  int32 system_ram_mb = 7;
+  int32 gpu_count = 8;
+  int32 disk_gb = 9;
+  double warmup_throughput = 10;
 }
+
 
 message SendResultRequest {
   string request_id = 1;

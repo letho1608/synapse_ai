@@ -283,7 +283,16 @@ class GRPCPeerHandle(PeerHandle):
       topology = Topology()
       for node_id, capabilities in response.nodes.items():
         device_capabilities = DeviceCapabilities(
-          model=capabilities.model, chip=capabilities.chip, memory=capabilities.memory, flops=DeviceFlops(fp16=capabilities.flops.fp16, fp32=capabilities.flops.fp32, int8=capabilities.flops.int8)
+          model=capabilities.model,
+          chip=capabilities.chip,
+          memory=capabilities.memory,
+          flops=DeviceFlops(fp16=capabilities.flops.fp16, fp32=capabilities.flops.fp32, int8=capabilities.flops.int8),
+          gpu_backend=capabilities.gpu_backend,
+          cpu_cores=capabilities.cpu_cores,
+          system_ram_mb=capabilities.system_ram_mb,
+          gpu_count=capabilities.gpu_count,
+          disk_gb=capabilities.disk_gb,
+          warmup_throughput=capabilities.warmup_throughput,
         )
         topology.update_node(node_id, device_capabilities)
       for node_id, peer_connections in response.peer_graph.items():

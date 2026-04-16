@@ -1145,9 +1145,9 @@
                             <span x-text="trainingLoading ? 'Đang gửi...' : 'Bắt đầu Training'"></span>
                         </button>
 
-                        <p class="text-muted" style="margin-top: 16px;" x-show="distributedStatus.partitions_count > 1">
-                            <strong>Phân tán:</strong> request chat có thể chạy qua nhiều node (layer sharding).
-                            Training chạy trên 1 máy (LoRA).
+                        <p class="text-muted" style="margin-top: 16px;" x-show="distributedStatus.partitions_count > 1 || clusterResources.length > 1">
+                            <strong>Phân tán:</strong> Chat sử dụng Layer Sharding. 
+                            Training sử dụng Data Parallelism (Phân bổ theo trọng số Cluster).
                         </p>
                     </div>
                 </div>

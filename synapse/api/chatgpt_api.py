@@ -2417,12 +2417,23 @@ class ChatGPTAPI:
         flops_fp16 = caps.flops.fp16 if caps else 0
         flops_fp32 = caps.flops.fp32 if caps else 0
         flops_int8 = caps.flops.int8 if caps else 0
-        vram_gb = round(caps.memory / 1024, 1) if caps and caps.memory else 0
-        ram_gb = round(caps.system_ram_mb / 1024, 1) if caps and caps.system_ram_mb else 0
+
+        gpu_count = caps.gpu_count if caps else 0
+        gpu_backend = caps.gpu_backend if caps else "Unknown"
+        
+        # Logic xác định GPU thực sự (không nhầm lẫn RAM hệ thống với VRAM)
+        has_gpu = gpu_count > 0 and gpu_backend not in ("CPU (x86)", "CPU (ARM)", "Unknown")
+        
+        if has_gpu:
+          vram_gb = round(caps.memory / 1024, 1) if caps and caps.memory else 0
+          ram_gb = round(caps.system_ram_mb / 1024, 1) if caps and caps.system_ram_mb else 0
+        else:
+          vram_gb = 0
+          # Nếu không phải GPU, lấy memory (đang chứa RAM hệ thống) hoặc system_ram_mb
+          ram_gb = round((caps.system_ram_mb or (caps.memory if caps else 0)) / 1024, 1)
+        
         cpu_cores = caps.cpu_cores if caps else 0
         disk_gb = caps.disk_gb if caps else 0
-        gpu_backend = caps.gpu_backend if caps else "Unknown"
-        has_gpu = vram_gb > 0 and gpu_backend not in ("CPU (x86)", "CPU (ARM)", "Unknown")
 
         # Layer range từ partition (start/end là 0.0→1.0 tỷ lệ)
         share_pct = round((partition.end - partition.start) * 100, 1)
@@ -2467,11 +2478,20 @@ class ChatGPTAPI:
           cpu_pct_s = psutil.cpu_percent()
           ram_s = psutil.virtual_memory()
           chip_s = specs_self.chip if specs_self else "Unknown"
-          vram_s = round(specs_self.memory / 1024, 1) if specs_self and specs_self.memory else 0
-          ram_s_gb = round(specs_self.system_ram_mb / 1024, 1) if specs_self and specs_self.system_ram_mb else 0
           flops_s = specs_self.flops.fp16 if specs_self else 0
+          gpu_count_s = specs_self.gpu_count if specs_self else 0
+
           gpu_backend_s = specs_self.gpu_backend if specs_self else "Unknown"
-          has_gpu_s = vram_s > 0 and gpu_backend_s not in ("CPU (x86)", "CPU (ARM)", "Unknown")
+          
+          has_gpu_s = gpu_count_s > 0 and gpu_backend_s not in ("CPU (x86)", "CPU (ARM)", "Unknown")
+          
+          if has_gpu_s:
+            vram_s = round(specs_self.memory / 1024, 1) if specs_self and specs_self.memory else 0
+            ram_s_gb = round(specs_self.system_ram_mb / 1024, 1) if specs_self and specs_self.system_ram_mb else 0
+          else:
+            vram_s = 0
+            ram_s_gb = round((specs_self.system_ram_mb or (specs_self.memory if specs_self else 0)) / 1024, 1)
+
           result.append({
             "node_id": self.node.id,
             "name": "Máy này",
