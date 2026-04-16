@@ -1932,12 +1932,15 @@ class ChatGPTAPI:
         lengths = np.maximum(attention_mask.sum(axis=1), 1).astype(np.int64)
         return input_ids, labels, lengths
 
-      planned_steps = (len(texts) + batch_size - 1) // batch_size * epochs
+      planned_steps = max(1, (len(texts) + batch_size - 1) // batch_size) * epochs
       if max_steps > 0:
         total_steps = max(1, min(planned_steps, max_steps))
       else:
         total_steps = max(1, planned_steps)
       step_count = 0
+      job["total_steps"] = total_steps
+      job["current_step"] = 0
+      job["progress"] = 0
       effective_max_length = max_length
 
       # === Giai đoạn 2: Warmup Profiling (Dynamic Load Balancing) ===
@@ -2025,8 +2028,9 @@ class ChatGPTAPI:
               if not sub_batch_results:
                 continue
 
-              # Chờ tất cả các sub-batches hoàn thành (Synchronous DP) với timeout 45s
-              losses = await asyncio.wait_for(asyncio.gather(*sub_batch_results), timeout=45.0)
+              # Chờ tất cả các sub-batches hoàn thành (Synchronous DP) với timeout 300s (cho CPU)
+              losses = await asyncio.wait_for(asyncio.gather(*sub_batch_results), timeout=300.0)
+              await asyncio.sleep(0.1) # Quan trọng: Nhường nhịp cho Web UI
               
               # Lọc bỏ các kết quả None/Error
               valid_losses = []
@@ -2064,9 +2068,9 @@ class ChatGPTAPI:
               
               job["current_step"] = step_count
               job["current_epoch"] = epoch
-              job["progress"] = min(100, int(100 * step_count / total_steps))
+              job["progress"] = min(100, int(100 * step_count / max(1, total_steps)))
               job["current_activity"] = f"Step {step_count}/{total_steps} (Epoch {epoch}) finished."
-              await asyncio.sleep(0)
+              await asyncio.sleep(0.05) # Giảm starvation
 
             except Exception as e:
               if not _is_cuda_oom_error(e):

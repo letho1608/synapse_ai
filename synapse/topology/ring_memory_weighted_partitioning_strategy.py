@@ -8,10 +8,13 @@ class RingMemoryWeightedPartitioningStrategy(PartitioningStrategy):
   def partition(self, topology: Topology) -> List[Partition]:
     nodes = list(topology.all_nodes())
     
-    # Try to partition by Warmup Throughput (Real Performance) first
+    # Only use throughput if ALL nodes have a valid, non-zero measurement.
+    # If any node has 0, it means it's newly joined or hasn't profiled yet, 
+    # so we should fall back to hardware-based weighting for fairness.
+    all_have_tp = all(node[1].warmup_throughput > 0 for node in nodes)
     total_throughput = sum(node[1].warmup_throughput for node in nodes)
     
-    if total_throughput > 0:
+    if all_have_tp and total_throughput > 0:
       # Sort by throughput descending
       nodes.sort(key=lambda x: (x[1].warmup_throughput, x[0]), reverse=True)
       partitions = []
