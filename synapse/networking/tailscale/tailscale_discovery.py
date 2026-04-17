@@ -56,6 +56,9 @@ class TailscaleDiscovery(Discovery):
     self.device_capabilities = device_capabilities
     self.known_peers: Dict[str, Tuple[PeerHandle, float, float]] = {}
     self.peer_fail_counts: Dict[str, int] = {} # Mới: Theo dõi số lần Health Check thất bại liên tiếp
+    self.probe_failure_cache: Dict[str, float] = {} # Mới: Cache các IP bị lỗi (IP -> timestamp) để tránh spam
+    self._tailscale_devices_cache: Dict[str, Device] = {} # Mới: Cache danh sách thiết bị
+    self._tailscale_cache_timestamp: float = 0 # Mới: Timestamp của cache
     self.discovery_task = None
     self.cleanup_task = None
     self.tailscale_api_key = tailscale_api_key
@@ -132,18 +135,34 @@ class TailscaleDiscovery(Discovery):
             if peer_host:
               fallback_port = self.node_port 
               if DEBUG >= 1: print(f"TailscaleDiscovery: Attributes missing for {device.name}, probing direct {peer_host}:{fallback_port}...")
-              
-              try:
-                # Tạo một handle tạm thời để probe
-                probe_handle = self.create_peer_handle("probe", f"{peer_host}:{fallback_port}", "Probe", UNKNOWN_DEVICE_CAPABILITIES)
-                # Tăng timeout dò máy lên 30 giây để bù đắp độ trễ mạng Tailscale và máy bận
-                peer_id, device_capabilities = await asyncio.wait_for(probe_handle.probe(), timeout=30.0)
-                peer_port = fallback_port
-                if DEBUG >= 1: print(f"TailscaleDiscovery: Probe SUCCESS for {device.name} -> Node ID: {peer_id}")
-              except Exception as e:
-                # Dùng repr(e) để không bị chuỗi rỗng (ví dụ: TimeoutError)
-                print(f"[WARNING] TailscaleDiscovery: Probe FAILED for {device.name} at {peer_host}:{fallback_port}. Reason: {repr(e)}")
-                pass
+            # Kiểm tra xem IP này có đang bị "cấm" do lỗi không (cooldown 60s)
+          if peer_host in self.probe_failure_cache:
+            if current_time - self.probe_failure_cache[peer_host] < 60:
+              continue
+            else:
+              del self.probe_failure_cache[peer_host]
+
+          if not peer_id:
+            probe_handle = None
+            try:
+              # Tạo một handle tạm thời để probe
+              probe_handle = self.create_peer_handle("probe", f"{peer_host}:{fallback_port}", "Probe", UNKNOWN_DEVICE_CAPABILITIES)
+              # Tăng timeout dò máy lên 30 giây để bù đắp độ trễ mạng Tailscale và máy bận
+              peer_id, device_capabilities = await asyncio.wait_for(probe_handle.probe(), timeout=30.0)
+              peer_port = fallback_port
+              if DEBUG >= 1: print(f"TailscaleDiscovery: Probe SUCCESS for {device.name} -> Node ID: {peer_id}")
+            except Exception as e:
+              # Dùng repr(e) để không bị chuỗi rỗng (ví dụ: TimeoutError)
+              print(f"[WARNING] TailscaleDiscovery: Probe FAILED for {device.name} at {peer_host}:{fallback_port}. Reason: {repr(e)}")
+              # Lưu lỗi vào cache để không thử lại ngay lập tức (tránh spam/nghẽn mạng)
+              self.probe_failure_cache[peer_host] = current_time
+            finally:
+              # QUAN TRỌNG: Phải đóng handle probe dù thành công hay thất bại để tránh rò rỉ channel gRPC
+              if probe_handle:
+                try:
+                  await probe_handle.disconnect()
+                except Exception:
+                  pass
 
           if not peer_id:
             if DEBUG_DISCOVERY >= 4: print(f"{device.device_id} does not have synapse node attributes. skipping.")
@@ -279,7 +298,14 @@ class TailscaleDiscovery(Discovery):
       our_device_id, our_tailscale_ips = await get_self_tailscale_info()
       our_ips_for_match = list(our_tailscale_ips) if our_tailscale_ips else list(_get_all_local_ips())
       hostname = (socket.gethostname() or "").strip().lower()
-      devices: Dict[str, Device] = await get_tailscale_devices(self.tailscale_api_key, self.tailnet)
+      # Dùng cache nếu còn hiệu lực (30s)
+      current_time = time.time()
+      if current_time - self._tailscale_cache_timestamp > 30:
+        devices = await get_tailscale_devices(self.tailscale_api_key, self.tailnet)
+        self._tailscale_devices_cache = devices
+        self._tailscale_cache_timestamp = current_time
+      else:
+        devices = self._tailscale_devices_cache
       current_time = time.time()
       result = []
       for name, device in devices.items():
