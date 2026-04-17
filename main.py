@@ -33,16 +33,23 @@ def _ensure_firewall_rules() -> None:
             )
             if "No rules match" not in check.stdout and check.returncode == 0:
                 continue  # Đã có rule rồi, bỏ qua
-            # Thêm rule mới
-            subprocess.run(
+            # Thêm rule mới cho ALL PROFILES (vì Tailscale thường bị nhận là Public)
+            res = subprocess.run(
                 [
                     "netsh", "advfirewall", "firewall", "add", "rule",
                     f"name={name}", "dir=in", "action=allow",
-                    "protocol=TCP", f"localport={port}"
+                    "protocol=TCP", f"localport={port}", "profile=any", "edge=yes"
                 ],
                 capture_output=True, text=True, timeout=5
             )
-            print(f"[INFO] Firewall: opened port {port} (TCP) for '{name}'")
+            if res.returncode == 0:
+                print(f"[INFO] Firewall: opened port {port} (TCP) for '{name}' (All Profiles)")
+            else:
+                # Nếu lỗi (thường do không có quyền Admin)
+                if "Run as administrator" in res.stdout or "requires elevation" in res.stdout.lower():
+                    print(f"[WARNING] Firewall: Could not open port {port}. Please run terminal AS ADMINISTRATOR.")
+                else:
+                    print(f"[WARNING] Firewall error for port {port}: {res.stdout.strip()}")
         except Exception:
             pass  # Thiếu quyền admin hoặc không phải Windows -> bỏ qua
 
