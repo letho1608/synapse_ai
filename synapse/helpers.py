@@ -368,7 +368,17 @@ def is_valid_uuid(val):
 
 
 def get_or_create_node_id():
-  NODE_ID_FILE = Path(tempfile.gettempdir())/".synapse_node_id"
+  """
+  Tạo hoặc lấy Node ID.
+  Đảm bảo ID là duy nhất bằng cách kết hợp: Hostname + CWD (hash) + UUID (nếu chưa có).
+  """
+  import hashlib
+  hostname = socket.gethostname()
+  cwd_hash = hashlib.md5(os.getcwd().encode()).hexdigest()[:8]
+  
+  # File lưu ID gốc (nếu có)
+  NODE_ID_FILE = Path(tempfile.gettempdir())/f".synapse_node_id_{hostname}_{cwd_hash}"
+  
   try:
     if NODE_ID_FILE.is_file():
       with open(NODE_ID_FILE, "r") as f:
@@ -376,15 +386,15 @@ def get_or_create_node_id():
       if is_valid_uuid(stored_id):
         if DEBUG >= 1: print(f"  [NODE] Node ID: {stored_id}")
         return stored_id
-      else:
-        if DEBUG >= 2: print("Stored ID is not a valid UUID. Generating a new one.")
 
-    new_id = str(uuid.uuid4())
+    # Tạo UUID mới nhưng gắn tag máy để dễ debug
+    new_uuid = str(uuid.uuid4())
+    # Lưu lại để dùng lâu dài
     with open(NODE_ID_FILE, "w") as f:
-      f.write(new_id)
+      f.write(new_uuid)
 
-    if DEBUG >= 1: print(f"  [NODE] Node ID: {new_id} (Generated new)")
-    return new_id
+    if DEBUG >= 1: print(f"  [NODE] Node ID: {new_uuid} (Generated unique ID for {hostname} at {cwd_hash})")
+    return new_uuid
   except IOError as e:
     if DEBUG >= 2: print(f"IO error creating node_id: {e}")
     return str(uuid.uuid4())

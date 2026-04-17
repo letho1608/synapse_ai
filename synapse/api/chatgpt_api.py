@@ -273,7 +273,10 @@ class ChatGPTAPI:
     # Cache cho cluster resources
     self._cluster_resources_cache = None
     self._cluster_resources_time = 0
-
+    
+    # Mới: Cache cho terminal logs để tránh spam
+    self._terminal_logs_cache = None
+    self._terminal_logs_time = 0
     # Get the callback system and register our handler
     self.token_callback = node.on_token.register("chatgpt-api-token-handler")
     def safe_handle_tokens(_request_id, tokens, is_finished):
@@ -1813,10 +1816,20 @@ class ChatGPTAPI:
   async def handle_get_terminal_logs(self, request):
     """Log thật từ stdout/stderr (như terminal)."""
     try:
+      current_time = time.time()
+      # Cache logic (2 giây)
+      if self._terminal_logs_cache and (current_time - self._terminal_logs_time < 2.0):
+        return web.json_response({"data": self._terminal_logs_cache})
+
       from synapse.terminal_log import get_lines
       all_lines = get_lines()
       # Chỉ trả về 200 dòng cuối cùng để tiết kiệm băng thông và CPU
       lines = all_lines[-200:] if all_lines else []
+      
+      # Lưu vào cache
+      self._terminal_logs_cache = lines
+      self._terminal_logs_time = current_time
+      
       return web.json_response({"data": lines})
     except Exception as e:
       return web.json_response({"data": [], "detail": str(e)})
