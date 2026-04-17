@@ -1863,7 +1863,10 @@ class ChatGPTAPI:
         job["error"] = f"Dataset không tồn tại hoặc không hợp lệ: {dataset_path}"
         self.log_activity("Training Failed", model, "failed")
         return
+      print(f"[Training] Đang nạp dataset từ: {path}")
+      job["current_activity"] = "Loading dataset into memory..."
       raw_data = load_raw_data(path)
+      print(f"[Training] Đã nạp xong {len(raw_data) if isinstance(raw_data, list) else 'N/A'} mẫu.")
       if not raw_data:
         job["status"] = "failed"
         job["error"] = "Dataset rỗng"
@@ -1889,7 +1892,10 @@ class ChatGPTAPI:
         job["error"] = f"Model không hỗ trợ: {model}"
         self.log_activity("Training Failed", model, "failed")
         return
+      print(f"[Training] Kiểm tra model: {model}")
+      job["current_activity"] = f"Ensuring model availability: {model}..."
       await self.node.inference_engine.ensure_shard(base_shard)
+      print(f"[Training] Model đã sẵn sàng.")
       tokenizer = getattr(self.node.inference_engine, "tokenizer", None)
       if tokenizer is None:
         job["status"] = "failed"
@@ -2384,18 +2390,6 @@ class ChatGPTAPI:
         ts_nodes = []
       ts_map = {n.get("device_id", ""): n for n in ts_nodes if n.get("device_id")}
 
-      # Lấy cpu% và gpu util của máy này
-      try:
-        cpu_pct_self = psutil.cpu_percent()
-        ram_self = psutil.virtual_memory()
-        ram_used_self = round(ram_self.used / (1024**3), 2)
-        ram_total_self = round(ram_self.total / (1024**3), 2)
-      except Exception:
-        cpu_pct_self = 0
-        ram_used_self = 0
-        ram_total_self = 0
-      gpu_util_self = self._get_gpu_utilization()
-
       # Tổng TFLOPS để tính tỷ lệ
       nodes_raw = list(topology.all_nodes()) if topology else []
       total_flops = sum(n[1].flops.fp16 for n in nodes_raw) if nodes_raw else 0
@@ -2440,10 +2434,11 @@ class ChatGPTAPI:
         # Tính flops share thực tế
         flops_share_pct = round(flops_fp16 / total_flops * 100, 1) if total_flops > 0 else share_pct
 
-        # Real-time metrics chỉ cho máy này (node khác không có)
-        cpu_pct = cpu_pct_self if is_self else None
-        gpu_util = gpu_util_self if is_self else None
-        ram_used = ram_used_self if is_self else None
+        # Real-time metrics
+        cpu_pct = caps.cpu_usage_pct if caps else 0
+        gpu_util = caps.gpu_usage_pct if caps else 0
+        ram_used_gb = round(caps.ram_used_mb / 1024, 2) if caps else 0
+        gpu_mem_used_gb = round(caps.gpu_memory_used_mb / 1024, 2) if caps else 0
 
         result.append({
           "node_id": node_id,
@@ -2464,11 +2459,12 @@ class ChatGPTAPI:
           "layer_end_pct": round(partition.end * 100, 1),
           "share_pct": share_pct,
           "flops_share_pct": flops_share_pct,
-          # Real-time (chỉ máy này)
+          # Real-time
           "cpu_pct": cpu_pct,
           "gpu_utilization": gpu_util,
-          "ram_used_gb": ram_used,
-          "ram_total_gb": ram_gb if is_self else ram_gb,
+          "ram_used_gb": ram_used_gb,
+          "gpu_mem_used_gb": gpu_mem_used_gb,
+          "ram_total_gb": ram_gb,
         })
 
       # Nếu không có partitions (chỉ 1 node, chưa kết nối), tạo entry cho máy này
@@ -2511,9 +2507,10 @@ class ChatGPTAPI:
             "layer_end_pct": 100.0,
             "share_pct": 100.0,
             "flops_share_pct": 100.0,
-            "cpu_pct": cpu_pct_s,
-            "gpu_utilization": self._get_gpu_utilization(),
-            "ram_used_gb": round(ram_s.used / (1024**3), 2),
+            "cpu_pct": specs_self.cpu_usage_pct if specs_self else 0,
+            "gpu_utilization": specs_self.gpu_usage_pct if specs_self else 0,
+            "ram_used_gb": round((specs_self.ram_used_mb if specs_self else 0) / 1024, 2),
+            "gpu_mem_used_gb": round((specs_self.gpu_memory_used_mb if specs_self else 0) / 1024, 2),
             "ram_total_gb": ram_s_gb,
           })
         except Exception:

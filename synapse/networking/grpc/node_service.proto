@@ -105,6 +105,10 @@ message DeviceCapabilities {
   int32 gpu_count = 8;
   int32 disk_gb = 9;
   double warmup_throughput = 10;
+  double cpu_usage_pct = 11;
+  double gpu_usage_pct = 12;
+  int32 ram_used_mb = 13;
+  int32 gpu_memory_used_mb = 14;
 }
 
 

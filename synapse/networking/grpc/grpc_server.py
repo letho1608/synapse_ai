@@ -158,6 +158,10 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
           gpu_count=cap.gpu_count,
           disk_gb=cap.disk_gb,
           warmup_throughput=cap.warmup_throughput,
+          cpu_usage_pct=cap.cpu_usage_pct,
+          gpu_usage_pct=cap.gpu_usage_pct,
+          ram_used_mb=cap.ram_used_mb,
+          gpu_memory_used_mb=cap.gpu_memory_used_mb,
         )
       for node_id, cap in topology.nodes.items()
     }

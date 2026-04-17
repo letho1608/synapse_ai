@@ -74,6 +74,11 @@ class DeviceCapabilities(BaseModel):
     bandwidth_mbps: float = 0.0
     latency_ms: float = 0.0
     warmup_throughput: float = 0.0
+    # Real-time metrics
+    cpu_usage_pct: float = 0.0
+    gpu_usage_pct: float = 0.0
+    ram_used_mb: int = 0
+    gpu_memory_used_mb: int = 0
 
     def __str__(self):
         return (
@@ -105,6 +110,10 @@ class DeviceCapabilities(BaseModel):
             "bandwidth_mbps": self.bandwidth_mbps,
             "latency_ms": self.latency_ms,
             "warmup_throughput": self.warmup_throughput,
+            "cpu_usage_pct": self.cpu_usage_pct,
+            "gpu_usage_pct": self.gpu_usage_pct,
+            "ram_used_mb": self.ram_used_mb,
+            "gpu_memory_used_mb": self.gpu_memory_used_mb,
         }
 
 
