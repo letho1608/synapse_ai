@@ -55,6 +55,7 @@ class TailscaleDiscovery(Discovery):
     self.update_interval = update_interval
     self.device_capabilities = device_capabilities
     self.known_peers: Dict[str, Tuple[PeerHandle, float, float]] = {}
+    self.peer_fail_counts: Dict[str, int] = {} # Mới: Theo dõi số lần Health Check thất bại liên tiếp
     self.discovery_task = None
     self.cleanup_task = None
     self.tailscale_api_key = tailscale_api_key
@@ -135,11 +136,13 @@ class TailscaleDiscovery(Discovery):
               try:
                 # Tạo một handle tạm thời để probe
                 probe_handle = self.create_peer_handle("probe", f"{peer_host}:{fallback_port}", "Probe", UNKNOWN_DEVICE_CAPABILITIES)
-                peer_id, device_capabilities = await asyncio.wait_for(probe_handle.probe(), timeout=5.0)
+                # Tăng timeout dò máy lên 15 giây để bù đắp độ trễ mạng Tailscale
+                peer_id, device_capabilities = await asyncio.wait_for(probe_handle.probe(), timeout=15.0)
                 peer_port = fallback_port
                 if DEBUG >= 1: print(f"TailscaleDiscovery: Probe SUCCESS for {device.name} -> Node ID: {peer_id}")
               except Exception as e:
-                print(f"[WARNING] TailscaleDiscovery: Probe FAILED for {device.name} at {peer_host}:{fallback_port}. Reason: {e}")
+                # Dùng repr(e) để không bị chuỗi rỗng (ví dụ: TimeoutError)
+                print(f"[WARNING] TailscaleDiscovery: Probe FAILED for {device.name} at {peer_host}:{fallback_port}. Reason: {repr(e)}")
                 pass
 
           if not peer_id:
@@ -160,6 +163,8 @@ class TailscaleDiscovery(Discovery):
               if not await new_peer_handle.health_check():
                 print(f"[WARNING] TailscaleDiscovery: Peer {peer_id} at {peer_host}:{peer_port} health_check FAILED. Port {peer_port} likely blocked by firewall.")
                 continue
+              # Thành công thì reset đếm lỗi
+              self.peer_fail_counts[peer_id] = 0
             except Exception as e:
               print(f"[WARNING] TailscaleDiscovery: Peer {peer_id} health_check ERROR: {e}")
               continue
@@ -171,11 +176,30 @@ class TailscaleDiscovery(Discovery):
               current_time,
             )
           else:
-            if not await self.known_peers[peer_id][0].health_check():
-              if DEBUG >= 1: print(f"Peer {peer_id} at {peer_host}:{peer_port} is not healthy. Removing.")
-              if peer_id in self.known_peers: del self.known_peers[peer_id]
-              continue
-            self.known_peers[peer_id] = (self.known_peers[peer_id][0], self.known_peers[peer_id][1], current_time)
+            # Máy đã biết, kiểm tra sức khỏe và áp dụng Grace Period
+            peer_handle = self.known_peers[peer_id][0]
+            is_healthy = False
+            try:
+              is_healthy = await peer_handle.health_check()
+            except Exception:
+              is_healthy = False
+
+            if is_healthy:
+              self.peer_fail_counts[peer_id] = 0
+              self.known_peers[peer_id] = (peer_handle, self.known_peers[peer_id][1], current_time)
+            else:
+              # Thất bại: Tăng biến đếm lỗi thay vì xóa ngay
+              count = self.peer_fail_counts.get(peer_id, 0) + 1
+              self.peer_fail_counts[peer_id] = count
+              
+              if count >= 3: # Cho phép lỗi tối đa 3 lần liên tiếp (Grace Period)
+                print(f"[WARNING] Peer {peer_id} at {peer_host}:{peer_port} is not healthy after {count} attempts. Removing from cluster.")
+                if peer_id in self.known_peers: del self.known_peers[peer_id]
+                del self.peer_fail_counts[peer_id]
+              else:
+                print(f"[INFO] Peer {peer_id} missed health check ({count}/3). Keeping in list for recovery...")
+                # Vẫn cập nhật last_seen để không bị cleanup_task xóa nhầm
+                self.known_peers[peer_id] = (peer_handle, self.known_peers[peer_id][1], current_time)
 
       except (asyncio.TimeoutError, aiohttp.ClientError) as e:
         if DEBUG_DISCOVERY >= 1:
