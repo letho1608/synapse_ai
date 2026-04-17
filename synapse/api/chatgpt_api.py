@@ -269,6 +269,10 @@ class ChatGPTAPI:
     self.linked_datasets = {} # name -> path
     self._load_settings()
     self._load_linked_datasets()
+    
+    # Cache cho cluster resources
+    self._cluster_resources_cache = None
+    self._cluster_resources_time = 0
 
     # Get the callback system and register our handler
     self.token_callback = node.on_token.register("chatgpt-api-token-handler")
@@ -2430,6 +2434,11 @@ class ChatGPTAPI:
     Trả về: danh sách node với chip, VRAM/RAM, TFLOPS, layer_start/end, share_pct, cpu_pct, gpu_util.
     """
     try:
+      # Cache logic: Nếu vừa gọi trong vòng 2 giây thì trả về kết quả cũ
+      current_time = time.time()
+      if self._cluster_resources_cache and (current_time - self._cluster_resources_time < 2.0):
+        return web.json_response(self._cluster_resources_cache)
+
       topology = self.node.current_topology
       partitions = []
       total_layers = 32  # default
