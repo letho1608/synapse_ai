@@ -211,12 +211,12 @@ class TailscaleDiscovery(Discovery):
               count = self.peer_fail_counts.get(peer_id, 0) + 1
               self.peer_fail_counts[peer_id] = count
               
-              if count >= 5: # Cho phép lỗi tối đa 5 lần liên tiếp (Grace Period ~ 60s)
+              if count >= 10: # Cho phép lỗi tối đa 10 lần liên tiếp (Grace Period ~ 120s+)
                 print(f"[WARNING] Peer {peer_id} at {peer_host}:{peer_port} is not healthy after {count} attempts. Removing from cluster.")
                 if peer_id in self.known_peers: del self.known_peers[peer_id]
                 del self.peer_fail_counts[peer_id]
               else:
-                print(f"[INFO] Peer {peer_id} missed health check ({count}/5). Keeping in list for recovery...")
+                print(f"[INFO] Peer {peer_id} missed health check ({count}/10). Keeping in list for recovery...")
                 # Vẫn cập nhật last_seen để không bị cleanup_task xóa nhầm
                 self.known_peers[peer_id] = (peer_handle, self.known_peers[peer_id][1], current_time)
 

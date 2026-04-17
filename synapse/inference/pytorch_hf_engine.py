@@ -65,6 +65,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self._model = None
         self._model_id: Optional[str] = None
         self._device = "cuda" if self._has_cuda() else "cpu"
+        self._is_lora_prepared = False
 
     @staticmethod
     def _has_cuda() -> bool:
@@ -285,7 +286,11 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             if input_ids.dim() == 1:
                 input_ids = input_ids.unsqueeze(0)
             with torch.no_grad():
+                # Nhường nhịp cho event loop trước khi vào compute nặng
+                await asyncio.sleep(0.01)
                 out = self._model(input_ids)
+                # Nhường nhịp sau compute
+                await asyncio.sleep(0.01)
             logits = out.logits if hasattr(out, "logits") else out[0]
             logits_np = logits.float().cpu().numpy()
             return logits_np, inference_state
@@ -308,12 +313,19 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                     print(f"[PyTorchHF] save_checkpoint: {e}")
 
     def _get_optimizer(self, lr: float = 2e-5):
-        """Lazy tạo optimizer cho training (1 node hoặc last layer)."""
+        """Lazy tạo optimizer cho training. CHỈ tối ưu các tham số requires_grad=True (quan trọng cho LoRA)."""
         if getattr(self, "_optimizer", None) is None and self._model is not None:
             try:
                 import torch
+                # CHỈ lấy các tham số trainable (cho LoRA/PEFT)
+                trainable_params = [p for p in self._model.parameters() if p.requires_grad]
+                
+                if not trainable_params:
+                    if DEBUG >= 1: print("[PyTorchHF] [WARNING] No trainable parameters found! Is LoRA enabled?")
+                    trainable_params = list(self._model.parameters())
+                    
                 self._optimizer = torch.optim.AdamW(
-                    list(self._model.parameters()),
+                    trainable_params,
                     lr=lr,
                     weight_decay=0.01,
                 )
@@ -321,6 +333,51 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 if DEBUG >= 1:
                     print(f"[PyTorchHF] _get_optimizer: {e}")
         return getattr(self, "_optimizer", None)
+
+    def _prepare_model_for_training(self):
+        """Ốp LoRA (PEFT) và Gradient Checkpointing để tiết kiệm VRAM."""
+        if self._is_lora_prepared or self._model is None:
+            return
+        
+        try:
+            import torch
+            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+            
+            if DEBUG >= 1: print("[PyTorchHF] Preparing model for training with LoRA...")
+            
+            # 1. Gradient Checkpointing: Tiết kiệm VRAM cực lớn (đánh đổi bằng tốc độ)
+            try:
+                self._model.gradient_checkpointing_enable()
+            except Exception:
+                pass
+            
+            # 2. Cấu hình LoRA (Low-Rank Adaptation)
+            # target_modules thường là q_proj, v_proj cho Llama/Qwen
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+            
+            config = LoraConfig(
+                r=8,
+                lora_alpha=32,
+                target_modules=target_modules,
+                lora_dropout=0.1,
+                bias="none",
+                task_type="CAUSAL_LM"
+            )
+            
+            self._model = get_peft_model(self._model, config)
+            self._model.print_trainable_parameters()
+            
+            self._is_lora_prepared = True
+            # Reset optimizer để nó bắt được các tham số LoRA mới
+            self._optimizer = None
+            
+        except ImportError:
+            if DEBUG >= 1: print("[PyTorchHF] [WARNING] peft not installed. Falling back to FULL fine-tuning (HIGH VRAM USAGE).")
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"[PyTorchHF] LoRA preparation error: {e}")
+                import traceback
+                traceback.print_exc()
 
     async def train(
         self,
@@ -337,6 +394,10 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         Hỗ trợ cả Causal LLM (CrossEntropy) và Vision/OCR (CTCLoss).
         """
         await self.ensure_shard(shard)
+        if self._model is not None and not self._is_lora_prepared and len(target.shape) > 0 and len(example.shape) < 4:
+            # Chỉ ốp LoRA cho LLM (vison/ocr có kiến trúc riêng thường đã nhỏ)
+            self._prepare_model_for_training()
+
         if loss == "back_gradient":
             if DEBUG >= 1:
                 print("[PyTorchHF] train(back_gradient) chưa implement cho nhiều node; bỏ qua.")
@@ -390,7 +451,10 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 if labels.dim() == 1:
                     labels = labels.unsqueeze(0)
                     
+                # Nhường nhịp trước compute nặng
+                await asyncio.sleep(0.01)
                 out = self._model(input_ids)
+                await asyncio.sleep(0.01)
                 logits = out.logits if hasattr(out, "logits") else out[0]
                 
                 # Causal LM shift
@@ -402,7 +466,10 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             opt = self._get_optimizer()
             if opt is not None:
                 opt.zero_grad()
+                # Nhường nhịp trước backward
+                await asyncio.sleep(0.01)
                 loss_val.backward()
+                await asyncio.sleep(0.01)
                 torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
                 opt.step()
                 

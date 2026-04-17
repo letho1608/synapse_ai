@@ -162,8 +162,8 @@ class GRPCPeerHandle(PeerHandle):
       if self.stub is None:
         return False
       request = node_service_pb2.HealthCheckRequest()
-      # Tăng timeout lên 15 giây để kiên nhẫn hơn khi máy bận
-      response = await asyncio.wait_for(self.stub.HealthCheck(request), timeout=15)
+      # 30s timeout cho phép các máy CPU-heavy có cơ hội phản hồi
+      response = await asyncio.wait_for(self.stub.HealthCheck(request), timeout=30.0)
       return response.is_healthy
     except asyncio.TimeoutError:
       if DEBUG >= 1: print(f"Health check TIMEOUT for {self._id}@{self.address}")

@@ -2116,6 +2116,8 @@ class ChatGPTAPI:
               # Tính trung bình Loss của Batch
               loss = sum(valid_losses) / len(valid_losses)
               job["loss"] = round(float(loss), 4)
+              
+              # [FIX] Chỉ tăng step_count 1 lần sau khi xử lý XONG cả batch (kể cả khi bị chia nhỏ do OOM)
               step_count += 1
               
               # === Gradient Synchronization Section ===
@@ -2180,7 +2182,7 @@ class ChatGPTAPI:
 
               if DEBUG >= 1: traceback.print_exc()
               job["status"] = "failed"
-              job["error"] = "CUDA OOM dù đã giảm tối đa. Hãy dùng model nhỏ hơn."
+              job["error"] = "CUDA OOM dù đã giảm tham số và sử dụng LoRA. GPU của bạn có thể quá nhỏ cho model này (Yêu cầu ~6GB VRAM sau tối ưu)."
               self.log_activity("Training Failed", model, "failed")
               return
 
@@ -2483,7 +2485,15 @@ class ChatGPTAPI:
 
         # Tên hiển thị: dùng tailscale name nếu có, else node_id đầu 8 ký tự
         ts_info = ts_map.get(node_id, {})
-        display_name = ts_info.get("name") or ("Máy này" if is_self else node_id[:12])
+        # [FIX] Tránh trùng tên "Máy này" - máy kia dù có tự đặt là "Máy này" thì ở đây vẫn hiện ID/Hostname
+        raw_name = ts_info.get("name")
+        if is_self:
+          display_name = "Máy này"
+        elif raw_name and raw_name != "Máy này" and raw_name != "localhost":
+          display_name = raw_name
+        else:
+          display_name = f"Node-{node_id[:8]}"
+          
         addresses = ts_info.get("addresses") or []
         ip = addresses[0] if addresses else ""
 
@@ -2548,6 +2558,7 @@ class ChatGPTAPI:
           "ram_total_gb": ram_gb,
           "warmup_throughput": caps.warmup_throughput if caps else 0,
           "current_activity": caps.current_activity if caps else "",
+          "last_seen_secs": round(time.time() - caps.last_updated, 1) if caps and hasattr(caps, "last_updated") else None,
         })
 
       # Nếu không có partitions (chỉ 1 node, chưa kết nối), tạo entry cho máy này
