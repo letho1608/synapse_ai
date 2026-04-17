@@ -1813,7 +1813,10 @@ class ChatGPTAPI:
   async def handle_get_terminal_logs(self, request):
     """Log thật từ stdout/stderr (như terminal)."""
     try:
-      lines = get_terminal_log_lines()
+      from synapse.terminal_log import get_lines
+      all_lines = get_lines()
+      # Chỉ trả về 200 dòng cuối cùng để tiết kiệm băng thông và CPU
+      lines = all_lines[-200:] if all_lines else []
       return web.json_response({"data": lines})
     except Exception as e:
       return web.json_response({"data": [], "detail": str(e)})

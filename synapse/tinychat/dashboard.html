@@ -2051,11 +2051,11 @@
                         if (this.currentPage === 'settings') this.fetchSettings();
                         if (this.currentPage === 'test' || this.currentPage === 'models') this.fetchModelList();
                         if (this.currentPage === 'cluster') this.fetchClusterResources();
-                    }, 5000);
-                    // Log terminal cập nhật nhanh hơn khi đang xem Dashboard để bám sát output thật
+                    }, 10000); // 10 giây thay vì 5 giây
+                    // Log terminal cập nhật 3 giây một lần thay vì 0.8 giây để tránh nghẽn Loop của máy yếu
                     setInterval(() => {
                         if (this.currentPage === 'dashboard') this.fetchTerminalLogs();
-                    }, 800);
+                    }, 3000);
                 },
                 applyTheme(theme) {
                     if (!theme) return;
