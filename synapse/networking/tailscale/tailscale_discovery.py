@@ -40,7 +40,7 @@ class TailscaleDiscovery(Discovery):
     node_port: int,
     create_peer_handle: Callable[[str, str, str, DeviceCapabilities], PeerHandle],
     discovery_interval: int = 5,
-    discovery_timeout: int = 30,
+    discovery_timeout: int = 120,
     update_interval: int = 15,
     device_capabilities: DeviceCapabilities = UNKNOWN_DEVICE_CAPABILITIES,
     tailscale_api_key: str = None,

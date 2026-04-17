@@ -134,7 +134,7 @@ class GRPCPeerHandle(PeerHandle):
   async def _ensure_connected(self):
     if not (await self.is_connected()):
       try:
-        await asyncio.wait_for(self.connect(), timeout=10.0)
+        await asyncio.wait_for(self.connect(), timeout=20.0)
         # Đảm bảo stub đã được tạo sau khi connect thành công
         if self.stub is None:
           raise ConnectionError(f"Stub is None after successful connection for {self._id}@{self.address}")

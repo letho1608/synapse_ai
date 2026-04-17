@@ -79,6 +79,7 @@ class DeviceCapabilities(BaseModel):
     gpu_usage_pct: float = 0.0
     ram_used_mb: int = 0
     gpu_memory_used_mb: int = 0
+    current_activity: str = ""
 
     def __str__(self):
         return (
@@ -114,6 +115,7 @@ class DeviceCapabilities(BaseModel):
             "gpu_usage_pct": self.gpu_usage_pct,
             "ram_used_mb": self.ram_used_mb,
             "gpu_memory_used_mb": self.gpu_memory_used_mb,
+            "current_activity": self.current_activity,
         }
 
 

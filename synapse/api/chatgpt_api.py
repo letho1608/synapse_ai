@@ -1810,6 +1810,12 @@ class ChatGPTAPI:
     if len(self.activity_logs) > 100:
       self.activity_logs.pop(0)
 
+  def _set_activity(self, job: Dict, message: str):
+    """Cập nhật activity cho cả job và node capabilities để đồng bộ Dashboard."""
+    job["current_activity"] = message
+    if self.node and self.node.device_capabilities:
+      self.node.device_capabilities.current_activity = message
+
   async def _run_training_job_distributed(self, job: Dict) -> None:
     """Training chia tải (mặc định): dùng pipeline Node (enqueue_example), 1 node hoặc nhiều node."""
     job_id = job.get("job_id", "")
@@ -1857,6 +1863,11 @@ class ChatGPTAPI:
     job["effective_max_length"] = max_length
     job["oom_retries"] = 0
     try:
+      self._set_activity(job, "Đang kiểm tra node trong cụm...")
+      topology = self.node.topology
+      if not topology or len(list(topology.all_nodes())) <= 1:
+        print("[Training] Cảnh báo: Chỉ tìm thấy 1 node. Chế độ Single-Node training.")
+      
       path = self._resolve_dataset_path(dataset_path)
       if path is None:
         job["status"] = "failed"
@@ -1864,7 +1875,7 @@ class ChatGPTAPI:
         self.log_activity("Training Failed", model, "failed")
         return
       print(f"[Training] Đang nạp dataset từ: {path}")
-      job["current_activity"] = "Loading dataset into memory..."
+      self._set_activity(job, "Đang nạp dataset vào bộ nhớ...")
       raw_data = load_raw_data(path)
       print(f"[Training] Đã nạp xong {len(raw_data) if isinstance(raw_data, list) else 'N/A'} mẫu.")
       if not raw_data:
@@ -1893,9 +1904,10 @@ class ChatGPTAPI:
         self.log_activity("Training Failed", model, "failed")
         return
       print(f"[Training] Kiểm tra model: {model}")
-      job["current_activity"] = f"Ensuring model availability: {model}..."
+      self._set_activity(job, f"Đang kiểm tra/tải model (có thể mất vài phút): {model}...")
       await self.node.inference_engine.ensure_shard(base_shard)
       print(f"[Training] Model đã sẵn sàng.")
+      self._set_activity(job, "Đang chuẩn bị Tokenizer...")
       tokenizer = getattr(self.node.inference_engine, "tokenizer", None)
       if tokenizer is None:
         job["status"] = "failed"
@@ -1951,9 +1963,11 @@ class ChatGPTAPI:
 
       # === Giai đoạn 2: Warmup Profiling (Dynamic Load Balancing) ===
       if job.get("use_dynamic_profiling", True):
+        self._set_activity(job, "Đang đo đạc hiệu năng Cluster (Warmup Profiling)...")
         await self._perform_warmup_profiling(job, texts, effective_max_length, base_shard, tokenize_batch)
 
       # === Giai đoạn 3: Ring-AllReduce Setup ===
+      self._set_activity(job, "Thiết lập truyền tải dữ liệu (Ring-AllReduce)...")
       # Lấy danh sách entry nodes (DP nodes)
       partitions = self.node.partitioning_strategy.partition(self.node.topology)
       entry_node_ids = sorted(list(set(p.node_id for p in partitions if p.start == 0.0)))
@@ -2206,7 +2220,12 @@ class ChatGPTAPI:
           setup_tasks.append(peer.setup_ring(rank, world_size, successor_url))
           
     if setup_tasks:
-      await asyncio.gather(*setup_tasks)
+      try:
+        await asyncio.wait_for(asyncio.gather(*setup_tasks), timeout=30.0)
+      except asyncio.TimeoutError:
+        print("[Ring-AllReduce] Cảnh báo: Timeout khi thiết lập vòng AllReduce. Một số node có thể không đồng bộ được.")
+      except Exception as e:
+        print(f"[Ring-AllReduce] Lỗi thiết lập: {e}")
 
   async def _perform_warmup_profiling(self, job: Dict, texts: List[str], max_len: int, base_shard: Shard, tokenize_fn):
     """Điều phối đo đạc hiệu suất thực tế trên toàn bộ cụm máy."""
@@ -2465,6 +2484,8 @@ class ChatGPTAPI:
           "ram_used_gb": ram_used_gb,
           "gpu_mem_used_gb": gpu_mem_used_gb,
           "ram_total_gb": ram_gb,
+          "warmup_throughput": caps.warmup_throughput if caps else 0,
+          "current_activity": caps.current_activity if caps else "",
         })
 
       # Nếu không có partitions (chỉ 1 node, chưa kết nối), tạo entry cho máy này
