@@ -153,7 +153,25 @@ class LACPPartitioningStrategy(PartitioningStrategy):
                 num_layers = base_shard.n_layers
                 memory_per_layer_mb = 1000.0  # Fallback an toàn nếu không tìm thấy key model
 
-            if model_key and model_key in HF_MODEL_LAYERS:
+            # Sử dụng Local DB nếu có discovery
+            from synapse.helpers import _load_model_db
+            db = _load_model_db()
+            db_entry = None
+            for entry in db:
+                if entry.get("name") == model_key:
+                    db_entry = entry
+                    break
+                    
+            if db_entry:
+                if db_entry.get("num_hidden_layers"):
+                    num_layers = db_entry["num_hidden_layers"]
+                
+                # Estimate total mem from recommended_ram_gb
+                mem_gb = db_entry.get("recommended_ram_gb", 14.0)
+                total_mem_mb = mem_gb * 1024
+                memory_per_layer_mb = (total_mem_mb / num_layers) + 300.0
+                
+            elif model_key and model_key in HF_MODEL_LAYERS:
                 num_layers = HF_MODEL_LAYERS[model_key]
                 param_str = HF_MODEL_PARAMS.get(model_key, "7B")
                 

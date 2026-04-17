@@ -278,7 +278,7 @@ class ChatGPTAPI:
           await self.handle_tokens(_request_id, tokens, is_finished)
         except Exception as e:
           if DEBUG >= 1:
-            print(f"[ChatGPTAPI] Error in handle_tokens for {_request_id}: {e}")
+            print(f"Error in handle_tokens for {_request_id}: {e}")
             import traceback
             traceback.print_exc()
       # Create task and ensure it runs
@@ -392,7 +392,7 @@ class ChatGPTAPI:
       with open(self._linked_datasets_path, "w", encoding="utf-8") as f:
         json.dump(self.linked_datasets, f, ensure_ascii=False, indent=2)
     except Exception as e:
-      if DEBUG >= 1: print(f"[ChatGPTAPI] _save_linked_datasets error: {e}")
+      if DEBUG >= 1: print(f"_save_linked_datasets error: {e}")
 
   def _save_settings(self) -> None:
     """Lưu settings hiện tại ra synapse/config/settings.json."""
@@ -403,7 +403,7 @@ class ChatGPTAPI:
         json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
       if DEBUG >= 1:
-        print(f"[ChatGPTAPI] _save_settings error: {e}")
+        print(f"_save_settings error: {e}")
 
   def _get_model_cards(self) -> Dict[str, Dict]:
     """Danh sách model hợp lệ: từ HF_MODELS (download + web UI)."""
@@ -425,11 +425,11 @@ class ChatGPTAPI:
         return await asyncio.wait_for(handler(request), timeout=self.response_timeout)
       except HTTPNotFound:
         if DEBUG >= 1:
-          print(f"[ChatGPTAPI] [WARN] Not Found: {request.method} {request.path}")
+          print(f"[WARN] Not Found: {request.method} {request.path}")
         return web.json_response({"detail": "Not Found", "path": request.path}, status=404)
       except HTTPMethodNotAllowed:
         if DEBUG >= 1:
-          print(f"[ChatGPTAPI] [WARN] Method Not Allowed: {request.method} {request.path}")
+          print(f"[WARN] Method Not Allowed: {request.method} {request.path}")
         return web.json_response({"detail": f"Method Not Allowed: dùng {request.path} với method khác (GET/POST)."}, status=405)
       except asyncio.TimeoutError:
         return web.json_response({"detail": "Request timed out"}, status=408)
@@ -454,30 +454,30 @@ class ChatGPTAPI:
       )
       
       if request.method == "POST" and "/chat/completions" in request.path:
-        print(f"[ChatGPTAPI] [INFO] POST request received: {request.method} {request.path} from {request.remote}")
-        print(f"[ChatGPTAPI] [INFO] Request headers: {dict(request.headers)}")
-        print(f"[ChatGPTAPI] [INFO] Request URL: {request.url}")
-        print(f"[ChatGPTAPI] [INFO] Request can_read_body: {request.can_read_body}")
+        print(f"[INFO] POST request received: {request.method} {request.path} from {request.remote}")
+        print(f"[INFO] Request headers: {dict(request.headers)}")
+        print(f"[INFO] Request URL: {request.url}")
+        print(f"[INFO] Request can_read_body: {request.can_read_body}")
       elif DEBUG >= 3 and not is_polling_request:
         print(f"Received request: {request.method} {request.path}")
       try:
         # Only log handler call for non-polling requests or POST requests
         if not is_polling_request or (request.method == "POST" and "/chat/completions" in request.path):
-          print(f"[ChatGPTAPI] [INFO] Calling handler for {request.method} {request.path}...")
+          print(f"[INFO] Calling handler for {request.method} {request.path}...")
         response = await handler(request)
         if request.method == "POST" and "/chat/completions" in request.path:
-          print(f"[ChatGPTAPI] [INFO] POST request handled successfully, response status: {response.status if hasattr(response, 'status') else 'N/A'}")
+          print(f"[INFO] POST request handled successfully, response status: {response.status if hasattr(response, 'status') else 'N/A'}")
         return response
       except HTTPNotFound:
         if DEBUG >= 1:
-          print(f"[ChatGPTAPI] [WARN] Not Found: {request.method} {request.path}")
+          print(f"[WARN] Not Found: {request.method} {request.path}")
         return web.json_response({"detail": "Not Found", "path": request.path}, status=404)
       except HTTPMethodNotAllowed:
         if DEBUG >= 1:
-          print(f"[ChatGPTAPI] [WARN] Method Not Allowed: {request.method} {request.path}")
+          print(f"[WARN] Method Not Allowed: {request.method} {request.path}")
         return web.json_response({"detail": f"Method Not Allowed: dùng {request.path} với method khác (GET/POST)."}, status=405)
       except Exception as e:
-        print(f"[ChatGPTAPI] [ERROR] Error in middleware for {request.method} {request.path}: {e}")
+        print(f"[ERROR] Error in middleware for {request.method} {request.path}: {e}")
         import traceback
         traceback.print_exc()
         return web.json_response({"detail": f"Internal server error: {str(e)}"}, status=500)
@@ -623,7 +623,7 @@ class ChatGPTAPI:
       )
     except Exception as e:
       if DEBUG >= 1:
-        print(f"[ChatGPTAPI] _get_synapse_api_urls: {e}")
+        print(f"_get_synapse_api_urls: {e}")
     return []
 
   async def _trigger_training_on_peers(self, body: dict) -> None:
@@ -638,15 +638,22 @@ class ChatGPTAPI:
         async with aiohttp.ClientSession() as session:
           async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status in (200, 201) and DEBUG >= 1:
-              print(f"[ChatGPTAPI] Training phân tán: đã gửi start tới {base_url}")
+              print(f"Training phân tán: đã gửi start tới {base_url}")
       except Exception as e:
         if DEBUG >= 1:
-          print(f"[ChatGPTAPI] Training phân tán gửi tới {base_url}: {e}")
+          print(f"Training phân tán gửi tới {base_url}: {e}")
     await asyncio.gather(*[post_one(u) for u in urls], return_exceptions=True)
 
   async def handle_get_models(self, request):
-    """Danh sách model: từ HF_MODELS (download + web UI)."""
-    models_list = [{"id": name, "object": "model", "owned_by": "pytorch", "ready": True} for name in sorted(HF_MODELS)]
+    """Danh sách model: từ HF_MODELS (download + web UI) và hf_models.json."""
+    from synapse.helpers import _load_model_db
+    db = _load_model_db()
+    all_names = set(HF_MODELS.keys())
+    for entry in db:
+        if entry.get("name"):
+            all_names.add(entry["name"])
+            
+    models_list = [{"id": name, "object": "model", "owned_by": "pytorch", "ready": True} for name in sorted(all_names)]
     return web.json_response({"object": "list", "data": models_list})
 
   async def handle_get_models_status(self, request):
@@ -667,6 +674,8 @@ class ChatGPTAPI:
         if rid:
           repo_ids_in_cache.add(rid)
       complete: Set[str] = set()
+      
+      # 1. Quét HF_MODELS truyền thống
       for name, repo_id in HF_MODELS.items():
         if repo_id not in repo_ids_in_cache:
           continue
@@ -675,6 +684,22 @@ class ChatGPTAPI:
           complete.add(name)
         except Exception:
           pass
+          
+      # 2. Quét từ Discovery Database
+      try:
+          from synapse.helpers import _load_model_db
+          db = _load_model_db()
+          for entry in db:
+              rid = entry.get("name")
+              if rid and rid in repo_ids_in_cache:
+                  try:
+                      snapshot_download(repo_id=rid, local_files_only=True)
+                      complete.add(rid) # Save HF repo id as the alias
+                  except Exception:
+                      pass
+      except Exception:
+          pass
+          
       return complete
     except Exception:
       return set()
@@ -695,24 +720,59 @@ class ChatGPTAPI:
       return {}
 
   async def handle_get_models_list(self, request):
-    """Danh sách cho web UI: đã tải (HF cache) + có thể tải (22 model từ HF_MODELS). Có size_gb, parameter_size, quantization_level."""
+    """Danh sách cho web UI: đã tải (HF cache) + có thể tải (mọi model từ db). Truyền full thông số UI/UX."""
     try:
       downloaded_names = self._get_hf_downloaded_names()
       cache_sizes = self._get_hf_cache_size_by_repo()
+      
+      from synapse.helpers import _load_model_db
+      db = _load_model_db()
+              
       downloaded = []
       for n in sorted(downloaded_names):
-        repo_id = HF_MODELS.get(n, "")
+        repo_id = HF_MODELS.get(n, n)
         size_bytes = cache_sizes.get(repo_id, 0)
         size_gb = round(size_bytes / (1024 ** 3), 2) if size_bytes else None
+        
+        entry = next((e for e in db if e.get("name") == repo_id), {})
+        param_size = entry.get("parameter_count", HF_MODEL_PARAMS.get(n, "-"))
+        
         downloaded.append({
           "name": n,
           "status": "downloaded",
           "repo_id": repo_id,
           "size_gb": size_gb,
-          "parameter_size": HF_MODEL_PARAMS.get(n, "-"),
-          "quantization_level": "FP16/BF16",
+          "parameter_size": param_size,
+          "quantization_level": entry.get("quantization", "FP16/BF16"),
+          "memory": f"{entry['min_ram_gb']} - {entry['recommended_ram_gb']}GB" if entry.get("min_ram_gb") else "-",
+          "fit": "-",
+          "speed": "-",
+          "family": entry.get("provider", "-"),
+          "architecture": entry.get("architecture", "-"),
+          "pipeline_tag": entry.get("pipeline_tag", "")
         })
-      available = [{"name": n, "status": "available"} for n in sorted(HF_MODELS.keys()) if n not in downloaded_names]
+        
+      available = []
+      # Thêm các model từ DB mà chưa được tải
+      for entry in db:
+          name = entry.get("name")
+          if name and name not in downloaded_names:
+              available.append({
+                  "name": name,
+                  "status": "available",
+                  "repo_id": name,
+                  "parameter_size": entry.get("parameter_count", "-"),
+                  "family": entry.get("provider", "-"),
+                  "quantization_level": entry.get("quantization", "-"),
+                  "memory": f"{entry['min_ram_gb']} - {entry['recommended_ram_gb']}GB" if entry.get("min_ram_gb") else "-",
+                  "architecture": entry.get("architecture", "-"),
+                  "pipeline_tag": entry.get("pipeline_tag", ""),
+                  "hf_downloads": entry.get("hf_downloads", 0)
+              })
+              
+      # Sort available models by downloads descending for better UI ranking
+      available.sort(key=lambda x: x.get("hf_downloads", 0), reverse=True)
+      
       return web.json_response({
         "downloaded": downloaded,
         "available": available,
@@ -720,25 +780,52 @@ class ChatGPTAPI:
     except Exception as e:
       if DEBUG >= 1:
         traceback.print_exc()
-      # Fallback: trả về toàn bộ 22 model ở "có thể tải" để trang quản lý luôn hiển thị danh sách
+      # Fallback
       available = [{"name": n, "status": "available"} for n in sorted(HF_MODELS.keys())]
       return web.json_response({"downloaded": [], "available": available})
 
   async def handle_post_models_pull(self, request):
-    """Tải model: HF snapshot_download (danh sách từ HF_MODELS)."""
+    """Tải model: Đầu tiên kiểm tra trong HF_MODELS, nếu không có thì scrape metadata và tiến hành HF snapshot_download."""
     try:
       data = await request.json()
       model_name = (data.get("model") or data.get("name") or "").strip()
       if not model_name:
         return web.json_response({"success": False, "message": "Thiếu model"}, status=400)
-      if model_name not in HF_MODELS:
-        return web.json_response({"success": False, "message": f"Model '{model_name}' không có trong danh sách."}, status=400)
+        
+      is_new_discovery = False
+      hf_id = HF_MODELS.get(model_name)
+      
+      if not hf_id:
+          if "/" in model_name:
+              from synapse.model_discovery import discover_and_save_model
+              if DEBUG >= 1: print(f"Không tìm thấy '{model_name}' trong danh sách cứng, bắt đầu tiến trình khám phá...")
+              try:
+                  # This blocks, but it's okay for pulling
+                  discovered = discover_and_save_model(model_name)
+                  if discovered:
+                      hf_id = model_name
+                      is_new_discovery = True
+                  else:
+                      return web.json_response({"success": False, "message": f"Model '{model_name}' không hợp lệ hoặc không có trên HF."}, status=400)
+              except Exception as e:
+                  return web.json_response({"success": False, "message": f"Lỗi cào dữ liệu model: {e}"}, status=400)
+          else:
+              return web.json_response({"success": False, "message": f"Model '{model_name}' không có trong danh sách. Hãy nhập đúng repo ID (ví dụ: unsloth/Qwen)."}, status=400)
+      else:
+          hf_id = resolve_hf_id(model_name)
+          
       from huggingface_hub import snapshot_download
-      hf_id = resolve_hf_id(model_name)
+      # Note: This is synchronous, which can block the event loop for a while.
+      # Usually a thread or process would be better, but we keep existing behavior.
       snapshot_download(repo_id=hf_id)
+      
+      msg = f"Đã tải {model_name} -> {hf_id} (Hugging Face cache)"
+      if is_new_discovery:
+          msg += " [Đã lưu metadata cục bộ]"
+          
       return web.json_response({
         "success": True,
-        "message": f"Đã tải {model_name} -> {hf_id} (Hugging Face cache)",
+        "message": msg,
       })
     except Exception as e:
       if DEBUG >= 2:
@@ -792,12 +879,12 @@ class ChatGPTAPI:
 
   async def handle_post_chat_completions(self, request):
     request_id = None
-    print(f"[ChatGPTAPI] [INFO] handle_post_chat_completions called: path={request.path}, remote={request.remote}")
-    print(f"[ChatGPTAPI] [INFO] Request method: {request.method}, content_type: {request.content_type}")
+    print(f"[INFO] handle_post_chat_completions called: path={request.path}, remote={request.remote}")
+    print(f"[INFO] Request method: {request.method}, content_type: {request.content_type}")
     try:
-      print(f"[ChatGPTAPI] [INFO] Reading request JSON...")
+      print(f"[INFO] Reading request JSON...")
       data = await request.json()
-      print(f"[ChatGPTAPI] [INFO] Request data received: model={data.get('model')}, stream={data.get('stream')}, messages_count={len(data.get('messages', []))}")
+      print(f"[INFO] Request data received: model={data.get('model')}, stream={data.get('stream')}, messages_count={len(data.get('messages', []))}")
       model_from_request = data.get("model") or self.default_model
       if model_from_request and model_from_request.startswith("gpt-"):
         model_from_request = self.default_model
@@ -930,7 +1017,7 @@ class ChatGPTAPI:
                 )
               except asyncio.TimeoutError:
                 if DEBUG >= 1:
-                  print(f"[ChatGPTAPI] Timeout waiting for tokens: {request_id}")
+                  print(f"Timeout waiting for tokens: {request_id}")
                 break
               all_tokens_stream.extend(tokens)
               if is_finished:
@@ -941,7 +1028,7 @@ class ChatGPTAPI:
             prompt_for_stream = prompt
             if tool_calls_stream:
               if DEBUG >= 1:
-                print(f"[ChatGPTAPI] Tool calls (stream, {len(tool_calls_stream)}): {[name for name, _ in tool_calls_stream]}")
+                print(f"Tool calls (stream, {len(tool_calls_stream)}): {[name for name, _ in tool_calls_stream]}")
               try:
                 # Nếu có nhiều tools, chạy song song
                 if len(tool_calls_stream) > 1:
@@ -991,7 +1078,7 @@ class ChatGPTAPI:
                 )
               except asyncio.TimeoutError:
                 if DEBUG >= 1:
-                  print(f"[ChatGPTAPI] Timeout waiting for tokens: {request_id}")
+                  print(f"Timeout waiting for tokens: {request_id}")
                 break
               all_tokens.extend(tokens)
               if is_finished:
@@ -1001,7 +1088,7 @@ class ChatGPTAPI:
             tool_calls = parse_tool_calls(decoded_first)
             if tool_calls:
               if DEBUG >= 1:
-                print(f"[ChatGPTAPI] Tool calls ({len(tool_calls)}): {[name for name, _ in tool_calls]}")
+                print(f"Tool calls ({len(tool_calls)}): {[name for name, _ in tool_calls]}")
               try:
                 # Nếu có nhiều tools, chạy song song
                 if len(tool_calls) > 1:
@@ -1076,7 +1163,7 @@ class ChatGPTAPI:
       )
     except Exception as outer_e:
       if DEBUG >= 1:
-        print(f"[ChatGPTAPI] Unhandled exception in handle_post_chat_completions: {outer_e}")
+        print(f"Unhandled exception in handle_post_chat_completions: {outer_e}")
         traceback.print_exc()
       return web.json_response(
         {"detail": f"Internal server error: {str(outer_e)}"},
@@ -1085,7 +1172,7 @@ class ChatGPTAPI:
     finally:
       if request_id and request_id in self.token_queues:
         if DEBUG >= 2:
-          print(f"[ChatGPTAPI] Cleaning up token queue: {request_id=}")
+          print(f"Cleaning up token queue: {request_id=}")
         del self.token_queues[request_id]
 
   async def handle_post_image_generations(self, request):
@@ -2505,10 +2592,10 @@ class ChatGPTAPI:
   async def handle_tokens(self, request_id: str, tokens: List[int], is_finished: bool):
     token_len = len(tokens) if isinstance(tokens, (list, tuple)) else "?"
     if DEBUG >= 1:
-      print(f"[ChatGPTAPI] [handle_tokens] request_id={request_id[:8]}..., len(tokens)={token_len}, is_finished={is_finished}, queue_exists={request_id in self.token_queues}")
+      print(f"[handle_tokens] request_id={request_id[:8]}..., len(tokens)={token_len}, is_finished={is_finished}, queue_exists={request_id in self.token_queues}")
     if request_id not in self.token_queues:
       if DEBUG >= 1:
-        print(f"[ChatGPTAPI] [ERROR] Queue not found for {request_id[:8]}...")
+        print(f"[ERROR] Queue not found for {request_id[:8]}...")
       return
     await self.token_queues[request_id].put((tokens, is_finished))
 
@@ -2522,32 +2609,32 @@ class ChatGPTAPI:
       await site.start()
       display_host = "127.0.0.1" if host == "0.0.0.0" else host
 
-      print(f"[ChatGPTAPI] [INFO] Available endpoints:")
-      print(f"[ChatGPTAPI] [INFO]   - POST http://{display_host}:{port}/v1/chat/completions")
-      print(f"[ChatGPTAPI] [INFO]   - GET  http://{display_host}:{port}/v1/models")
-      print(f"[ChatGPTAPI] [INFO]   - GET  http://{display_host}:{port}/ (web UI)")
+      print(f"[INFO] Available endpoints:")
+      print(f"[INFO]   - POST http://{display_host}:{port}/v1/chat/completions")
+      print(f"[INFO]   - GET  http://{display_host}:{port}/v1/models")
+      print(f"[INFO]   - GET  http://{display_host}:{port}/ (web UI)")
       try:
         _, tailscale_ips = await get_self_tailscale_info()
         if tailscale_ips:
-          print(f"[ChatGPTAPI] [INFO]   (Tailscale - máy khác truy cập):")
+          print(f"[INFO]   (Tailscale - máy khác truy cập):")
           for ip in tailscale_ips:
-            print(f"[ChatGPTAPI] [INFO]   - POST http://{ip}:{port}/v1/chat/completions")
-            print(f"[ChatGPTAPI] [INFO]   - GET  http://{ip}:{port}/v1/models")
-            print(f"[ChatGPTAPI] [INFO]   - GET  http://{ip}:{port}/ (web UI)")
+            print(f"[INFO]   - POST http://{ip}:{port}/v1/chat/completions")
+            print(f"[INFO]   - GET  http://{ip}:{port}/v1/models")
+            print(f"[INFO]   - GET  http://{ip}:{port}/ (web UI)")
         else:
           lan_ips = [ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip and ip not in ("127.0.0.1", "::1", "localhost")]
           if lan_ips:
-            print(f"[ChatGPTAPI] [INFO]   (Tailscale chưa bật — máy khác truy cập qua LAN):")
+            print(f"[INFO]   (Tailscale chưa bật — máy khác truy cập qua LAN):")
             for ip in lan_ips:
-              print(f"[ChatGPTAPI] [INFO]   - GET  http://{ip}:{port}/ (web UI)")
+              print(f"[INFO]   - GET  http://{ip}:{port}/ (web UI)")
           else:
-            print(f"[ChatGPTAPI] [INFO]   (Tailscale): chưa bật — máy khác dùng IP LAN của máy này, port {port}")
+            print(f"[INFO]   (Tailscale): chưa bật — máy khác dùng IP LAN của máy này, port {port}")
       except Exception:
         lan_ips = [ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip and ip not in ("127.0.0.1", "::1", "localhost")]
         if lan_ips:
-          print(f"[ChatGPTAPI] [INFO]   (Máy khác truy cập qua LAN): GET http://{lan_ips[0]}:{port}/ (web UI)")
+          print(f"[INFO]   (Máy khác truy cập qua LAN): GET http://{lan_ips[0]}:{port}/ (web UI)")
         else:
-          print(f"[ChatGPTAPI] [INFO]   (Máy khác truy cập): dùng IP LAN máy này, port {port}")
+          print(f"[INFO]   (Máy khác truy cập): dùng IP LAN máy này, port {port}")
       
       # Giữ server chạy cho đến khi bị cancel
       try:
@@ -2555,13 +2642,13 @@ class ChatGPTAPI:
         await asyncio.Event().wait()  # Chờ vô hạn cho đến khi task bị cancel
         print("DEBUG: API Server wait loop finished (unexpectedly)!")
       except asyncio.CancelledError:
-        print(f"[ChatGPTAPI] [INFO] API server shutdown requested")
+        print(f"[INFO] API server shutdown requested")
         raise  # Re-raise để cleanup được thực hiện
     except asyncio.CancelledError:
       # Normal shutdown
-      print(f"[ChatGPTAPI] [INFO] API server shutting down...")
+      print(f"[INFO] API server shutting down...")
     except Exception as e:
-      print(f"[ChatGPTAPI] [ERROR] ERROR starting API server: {e}")
+      print(f"[ERROR] ERROR starting API server: {e}")
       import traceback
       traceback.print_exc()
       raise
@@ -2570,9 +2657,9 @@ class ChatGPTAPI:
       if runner:
         try:
           await runner.cleanup()
-          print(f"[ChatGPTAPI] [INFO] API server cleanup completed")
+          print(f"[INFO] API server cleanup completed")
         except Exception as e:
-          print(f"[ChatGPTAPI] [WARNING] Error during runner cleanup: {e}")
+          print(f"[WARNING] Error during runner cleanup: {e}")
 
   def base64_decode(self, base64_string):
     #decode and reshape image
