@@ -45,13 +45,27 @@ class _TeeWriter:
         return getattr(self._stream, name)
 
 
+def _wrap_utf8(stream):
+    """Bọc stream gốc với UTF-8 encoding để tránh lỗi UnicodeEncodeError trên Windows."""
+    import io
+    try:
+        if hasattr(stream, 'buffer'):
+            return io.TextIOWrapper(stream.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    except Exception:
+        pass
+    return stream
+
+
 def install():
     """Thay sys.stdout và sys.stderr bằng Tee để capture mọi print()."""
     global _lines
     with _lock:
         _lines = []
-    sys.stdout = _TeeWriter(sys.__stdout__, "stdout")
-    sys.stderr = _TeeWriter(sys.__stderr__, "stderr")
+    utf8_stdout = _wrap_utf8(sys.__stdout__)
+    utf8_stderr = _wrap_utf8(sys.__stderr__)
+    sys.stdout = _TeeWriter(utf8_stdout, "stdout")
+    sys.stderr = _TeeWriter(utf8_stderr, "stderr")
+
 
 
 def get_lines():
