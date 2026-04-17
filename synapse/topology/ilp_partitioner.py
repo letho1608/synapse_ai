@@ -235,63 +235,39 @@ class ILPPartitioner:
         layer_profiles: List[LayerProfile]
     ) -> List[Partition]:
         """
-        Fallback greedy algorithm nếu ILP timeout hoặc unavailable.
-
-        Thuật toán:
-        1. Sort machines by memory descending
-        2. Assign layers greedily based on memory
-        3. When a machine is full, move to the next one
-        4. If more layers than machines, each remaining layer gets its own partition
+        Fallback algorithm nếu ILP timeout, unavailable, hoặc infeasible.
+        Sử dụng phân bổ tỉ lệ theo RAM (Ring Memory Weighted) để tránh bị 
+        fragmentation tạo ra nhiều shard trên cùng một máy, dẫn đến swap memory.
         """
         machines = list(topology.nodes.keys())
-        n_layers = len(layer_profiles)
-
-        if n_layers == 0 or len(machines) == 0:
+        if not machines:
             return []
 
         # Sort machines by memory descending
         machines.sort(key=lambda m: topology.nodes[m].memory, reverse=True)
 
+        total_mem = sum(topology.nodes[m].memory for m in machines)
+        if total_mem <= 0:
+            total_mem = 1.0
+
         partitions = []
-        current_start = 0
-        current_machine_idx = 0
-        current_memory = 0
+        current_start = 0.0
 
-        for i in range(n_layers):
-            layer_mem = layer_profiles[i].memory_mb
-
-            # If no more machines, all remaining layers go to the last machine
-            if current_machine_idx >= len(machines):
-                continue
-
-            machine_mem = topology.nodes[machines[current_machine_idx]].memory
-
-            if current_memory + layer_mem > machine_mem:
-                # Machine is full, save partition and move to next
-                if current_start < i:
-                    partitions.append(Partition(
-                        node_id=machines[current_machine_idx],
-                        start=current_start / n_layers,
-                        end=i / n_layers
-                    ))
-                current_start = i
-                current_memory = 0
-                current_machine_idx += 1
-
-                # If no more machines, remaining layers will be added at the end
-                if current_machine_idx >= len(machines):
-                    continue
-
-            current_memory += layer_mem
-
-        # Last partition
-        if current_start < n_layers:
-            last_idx = min(current_machine_idx, len(machines) - 1)
-            partitions.append(Partition(
-                node_id=machines[last_idx],
-                start=current_start / n_layers,
-                end=1.0
-            ))
+        for i, m in enumerate(machines):
+            fraction = topology.nodes[m].memory / total_mem
+            end = current_start + fraction
+            
+            # Đảm bảo partition cuối cùng luôn bao phủ đến hết
+            if i == len(machines) - 1:
+                end = 1.0
+                
+            if end > current_start:
+                partitions.append(Partition(
+                    node_id=m, 
+                    start=current_start, 
+                    end=end
+                ))
+            current_start = end
 
         return partitions
     
