@@ -133,7 +133,16 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 "trust_remote_code": True,
                 "torch_dtype": "auto",
                 "device_map": "auto" if self._has_cuda() else None,
+                # Thêm cấu hình cho Sliding Window Attention
+                "attn_implementation": "eager"  # Sử dụng implementation mặc định để tránh xung đột với Sliding Window Attention
             }
+            
+            # Kiểm tra nếu là model Qwen để xử lý đặc biệt
+            is_qwen = "qwen" in hf_id.lower()
+            if is_qwen:
+                # Qwen models cần cấu hình đặc biệt cho Sliding Window Attention
+                load_model_kw["attn_implementation"] = "eager"
+            
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(hf_id, **load_kw, local_files_only=True)
                 self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw, local_files_only=True)

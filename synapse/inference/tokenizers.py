@@ -30,24 +30,25 @@ async def resolve_tokenizer(repo_id: Union[str, PathLike]):
 
 async def _resolve_tokenizer(repo_id_or_local_path: Union[str, PathLike]):
   print(f"DEBUG_CRASH: _resolve_tokenizer called for {repo_id_or_local_path}", flush=True)
-  # try:
-  #   if DEBUG >= 4: print(f"Trying AutoProcessor for {repo_id_or_local_path}")
-  #   processor = AutoProcessor.from_pretrained(repo_id_or_local_path, use_fast=True if "Mistral-Large" in f"{repo_id_or_local_path}" else False, trust_remote_code=True)
-  #   if not hasattr(processor, 'eos_token_id'):
-  #     processor.eos_token_id = getattr(processor, 'tokenizer', getattr(processor, '_tokenizer', processor)).eos_token_id
-  #   if not hasattr(processor, 'encode'):
-  #     processor.encode = getattr(processor, 'tokenizer', getattr(processor, '_tokenizer', processor)).encode
-  #   if not hasattr(processor, 'decode'):
-  #     processor.decode = getattr(processor, 'tokenizer', getattr(processor, '_tokenizer', processor)).decode
-  #   return processor
-  # except Exception as e:
-  #   if DEBUG >= 4: print(f"Failed to load processor for {repo_id_or_local_path}. Error: {e}")
-  #   if DEBUG >= 4: print(traceback.format_exc())
-
+  # Xử lý đặc biệt cho các model Qwen sử dụng Sliding Window Attention
+  is_qwen = "qwen" in str(repo_id_or_local_path).lower()
+  
   try:
     if DEBUG >= 4: print(f"Trying AutoTokenizer for {repo_id_or_local_path}")
     print(f"DEBUG_CRASH: Calling AutoTokenizer.from_pretrained for {repo_id_or_local_path}", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(repo_id_or_local_path, trust_remote_code=True, use_fast=False)
+    
+    # Cấu hình cho tokenizer với các tham số phù hợp với Sliding Window Attention
+    tokenizer_kwargs = {
+        "trust_remote_code": True,
+        "use_fast": False
+    }
+    
+    # Thêm xử lý đặc biệt cho model Qwen
+    if is_qwen:
+        # Qwen models có thể cần cấu hình attention đặc biệt
+        tokenizer_kwargs["use_fast"] = True
+    
+    tokenizer = AutoTokenizer.from_pretrained(repo_id_or_local_path, **tokenizer_kwargs)
     print(f"DEBUG_CRASH: AutoTokenizer.from_pretrained success", flush=True)
     return tokenizer
   except Exception as e:
