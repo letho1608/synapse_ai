@@ -941,13 +941,14 @@ class Node:
         continue
 
       try:
-        other_topology = await asyncio.wait_for(peer.collect_topology(visited, max_depth=max_depth - 1), timeout=10.0)
+        # Tăng timeout lên 30.0s để kiên nhẫn hơn với các node đang bận
+        other_topology = await asyncio.wait_for(peer.collect_topology(visited, max_depth=max_depth - 1), timeout=30.0)
         if DEBUG >= 2: print(f"Collected topology from: {peer.id()}: {other_topology}")
         next_topology.merge(peer.id(), other_topology)
       except asyncio.TimeoutError:
         # Timeout là lỗi thông thường, không cần in traceback
         if DEBUG >= 2:
-          print(f"Timeout collecting topology from {peer.id()} (timeout=10.0s)")
+          print(f"Timeout collecting topology from {peer.id()} (timeout=30.0s)")
       except asyncio.CancelledError:
         # CancelledError có thể xảy ra khi timeout, xử lý gracefully
         if DEBUG >= 2:
@@ -985,7 +986,8 @@ class Node:
     if DEBUG >= 2: print(f"Broadcasting result: {request_id=} {result=} {is_finished=}")
     async def send_result_to_peer(peer):
       try:
-        await asyncio.wait_for(peer.send_result(request_id, result, is_finished), timeout=15.0)
+        # Tăng timeout lên 30s
+        await asyncio.wait_for(peer.send_result(request_id, result, is_finished), timeout=30.0)
       except asyncio.TimeoutError:
         print(f"Timeout broadcasting result to {peer.id()}")
       except Exception as e:

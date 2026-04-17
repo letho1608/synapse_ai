@@ -136,8 +136,8 @@ class TailscaleDiscovery(Discovery):
               try:
                 # Tạo một handle tạm thời để probe
                 probe_handle = self.create_peer_handle("probe", f"{peer_host}:{fallback_port}", "Probe", UNKNOWN_DEVICE_CAPABILITIES)
-                # Tăng timeout dò máy lên 15 giây để bù đắp độ trễ mạng Tailscale
-                peer_id, device_capabilities = await asyncio.wait_for(probe_handle.probe(), timeout=15.0)
+                # Tăng timeout dò máy lên 30 giây để bù đắp độ trễ mạng Tailscale và máy bận
+                peer_id, device_capabilities = await asyncio.wait_for(probe_handle.probe(), timeout=30.0)
                 peer_port = fallback_port
                 if DEBUG >= 1: print(f"TailscaleDiscovery: Probe SUCCESS for {device.name} -> Node ID: {peer_id}")
               except Exception as e:
