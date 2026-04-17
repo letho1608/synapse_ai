@@ -4,6 +4,7 @@ Phân tán: load model từ HF. Danh sách model lấy từ synapse.model_list (
 """
 
 import numpy as np
+import asyncio
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
