@@ -449,124 +449,90 @@
                     </div>
                 </div>
 
-                <!-- Models Page - Quản lý mô hình (đã tải / có thể tải từ HF) -->
+                <!-- Models Page - Quản lý mô hình hợp nhất -->
                 <div x-show="currentPage === 'models'" x-cloak>
-                <div class="card">
-                <div class="card-header">
-                <h2 class="card-title">Đã tải</h2>
-                            <span class="badge" x-text="modelList.downloaded.length + ' model'"></span>
-                        </div>
-                        <div class="monitoring-table-wrap">
-                            <table class="table monitoring-table">
-                                <thead>
-                                <tr>
-                                <th>Tên model</th>
-                                <th>Kích thước</th>
-                                <th>Tham số</th>
-                                <th>Quantization</th>
-                                <th>Memory</th>
-                                <th>Fit</th>
-                                <th>Speed</th>
-                                <th>Trạng thái</th>
-                                <th>Thao tác</th>
-                                </tr>
-                                </thead>
-                                <tbody>
-                                <template x-for="m in modelList.downloaded" :key="m.name">
-                                <tr>
-                                <td x-text="m.name"></td>
-                                <td x-text="m.size_gb ? m.size_gb + ' GB' : '-'"></td>
-                                <td x-text="m.parameter_size || '-'"></td>
-                                <td x-text="m.quantization_level || '-'"></td>
-                                <td x-text="m.memory_needed_gb ? m.memory_needed_gb + 'GB' : '-'"></td>
-                                <td>
-                                <span class="fit-badge" :class="m.fit?.toLowerCase().replace(' ', '-')" x-show="m.fit">
-                                <span x-text="m.fit_emoji || ''"></span>
-                                <span x-text="m.fit || ''"></span>
-                                </span>
-                                <span x-show="!m.fit">-</span>
-                                </td>
-                                <td x-text="m.estimated_speed ? m.estimated_speed + ' t/s' : '-'"></td>
-                                <td><span class="badge badge-success">Đã tải</span></td>
-                                <td>
-                                                <button type="button" class="btn btn-outline btn-sm"
-                                                    :disabled="deleteLoading === m.name" @click="deleteModel(m.name)">
-                                                    <i class="fas fa-spinner fa-spin"
-                                                        x-show="deleteLoading === m.name"></i>
-                                                    <i class="fas fa-trash-alt" x-show="deleteLoading !== m.name"></i>
-                                                    <span
-                                                        x-text="deleteLoading === m.name ? 'Đang xóa...' : 'Xóa'"></span>
-                                                </button>
-                                            </td>
-                                        </tr>
-                                    </template>
-                                    <tr x-show="modelList.downloaded.length === 0">
-                                    <td colspan="9" class="empty-state">Chưa có model nào. Tải model ở mục bên dưới.
-                                    </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
                     <div class="card">
                         <div class="card-header">
-                            <h2 class="card-title">Có thể tải</h2>
-                            <span class="badge"
-                                x-text="filteredAvailableModels().length + '/' + modelList.available.length + ' model'"></span>
+                            <h2 class="card-title">Danh sách Mô hình</h2>
+                            <span class="badge" x-text="allFilteredModels().length + ' model'"></span>
                         </div>
-                        <!-- Family filter + search -->
+                        
+                        <!-- Status filter + search -->
                         <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;align-items:center">
-                            <input type="text" class="form-input" placeholder="Tìm model..." x-model="modelSearch"
-                                style="max-width:200px;height:34px;padding:4px 12px;font-size:13px">
-                            <button class="model-family-btn" :class="{active: modelFamilyFilter===''}"
-                                @click="modelFamilyFilter=''">Tất cả</button>
-                            <template x-for="fam in ['Qwen','LLaMA','Phi','Mistral','Code']" :key="fam">
-                                <button class="model-family-btn" :class="{active: modelFamilyFilter===fam}"
-                                    @click="modelFamilyFilter===fam ? modelFamilyFilter='' : modelFamilyFilter=fam"
-                                    x-text="fam"></button>
-                            </template>
+                            <input type="text" class="form-input" placeholder="Tìm model (tên, family)..." x-model="modelSearch"
+                                style="max-width:300px;height:34px;padding:4px 12px;font-size:13px">
+                            
+                            <button class="model-family-btn" :class="{active: modelStatusFilter==='all' || modelStatusFilter===''}"
+                                @click="modelStatusFilter='all'">Tất cả</button>
+                            <button class="model-family-btn" :class="{active: modelStatusFilter==='downloaded'}"
+                                @click="modelStatusFilter='downloaded'">Đã tải</button>
+                            <button class="model-family-btn" :class="{active: modelStatusFilter==='available'}"
+                                @click="modelStatusFilter='available'">Chưa tải</button>
                         </div>
-                        <div class="monitoring-table-wrap">
-                            <table class="table monitoring-table">
+
+                        <div class="monitoring-table-wrap" style="overflow-x: auto;">
+                            <table class="table monitoring-table" style="table-layout: fixed; width: 100%;">
                                 <thead>
                                     <tr>
-                                        <th>Tên model</th>
-                                        <th>Tham số</th>
-                                        <th>Family</th>
-                                        <th>HF Repo</th>
-                                        <th>Thao tác</th>
+                                        <th style="width: 25%;">Tên model (Repo)</th>
+                                        <th style="width: 8%;">Tham số</th>
+                                        <th style="width: 10%;">Kiến trúc</th>
+                                        <th style="width: 12%;">Family</th>
+                                        <th style="width: 8%;">Quant</th>
+                                        <th style="width: 10%;">Memory</th>
+                                        <th style="width: 10%;">Kích thước/Tải</th>
+                                        <th style="width: 9%;">Loại Model</th>
+                                        <th style="width: 8%;">Thao tác</th>
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    <template x-for="m in filteredAvailableModels()" :key="m.name">
-                                        <tr>
+                                    <template x-for="m in allFilteredModels()" :key="m.name">
+                                        <tr :class="{'row-downloaded': m.isDownloaded}">
                                             <td>
-                                                <span x-text="m.name"></span>
-                                                <span class="badge badge-sm badge-info" x-show="m.type==='code'"
-                                                    style="margin-left:4px">💻 Code</span>
-                                                <span class="badge badge-sm badge-success" x-show="m.type!=='code'"
-                                                    style="margin-left:4px">💬 Chat</span>
+                                                <span x-text="m.name" style="font-family:monospace;font-size:13px;word-break:break-all;" :style="m.isDownloaded ? 'font-weight: bold; color: var(--text-primary);' : ''"></span>
+                                                <span class="badge badge-sm badge-success" x-show="m.isDownloaded" style="margin-left:4px">Đã tải</span>
                                             </td>
-                                            <td><span class="badge badge-muted" x-text="m.params || '-'"></span></td>
-                                            <td><span x-text="m.family || '-'"
-                                                    style="font-size:12px;color:var(--text-secondary)"></span></td>
-                                            <td><span x-text="m.hf_repo || '-'"
-                                                    style="font-size:11px;color:var(--text-muted);font-family:monospace"></span>
+                                            <td><span class="badge badge-muted" x-text="m.parameter_size || '-'"></span></td>
+                                            <td><span x-text="m.architecture || '-'" style="font-size:12px;color:var(--text-secondary)"></span></td>
+                                            <td><span x-text="m.family || '-'" style="font-size:12px;color:var(--text-secondary)"></span></td>
+                                            <td><span x-text="m.quantization_level || '-'" style="font-size:12px"></span></td>
+                                            <td><span x-text="m.memory || '-'" style="font-size:12px;color:var(--primary)"></span></td>
+                                            <td>
+                                                <template x-if="m.isDownloaded">
+                                                    <span x-text="m.size_gb ? m.size_gb + ' GB' : '-'" style="font-size:12px;color:var(--text-muted)"></span>
+                                                </template>
+                                                <template x-if="!m.isDownloaded">
+                                                    <span x-text="m.hf_downloads > 0 ? new Intl.NumberFormat('en-US', {notation: 'compact'}).format(m.hf_downloads) : '-'" style="font-size:12px;color:var(--text-muted)"></span>
+                                                </template>
                                             </td>
                                             <td>
-                                                <button type="button" class="btn btn-primary btn-sm"
-                                                    :disabled="pullLoading === m.name" @click="pullModel(m.name)">
-                                                    <i class="fas fa-spinner fa-spin"
-                                                        x-show="pullLoading === m.name"></i>
-                                                    <i class="fas fa-download" x-show="pullLoading !== m.name"></i>
-                                                    <span
-                                                        x-text="pullLoading === m.name ? 'Đang tải...' : 'Tải'"></span>
-                                                </button>
+                                                <span class="badge badge-sm badge-success" x-show="m.pipeline_tag && (m.pipeline_tag.includes('text') || m.pipeline_tag.includes('chat'))" title="Văn bản">💬 Chữ</span>
+                                                <span class="badge badge-sm badge-warning" x-show="m.pipeline_tag && (m.pipeline_tag.includes('image') || m.pipeline_tag.includes('vision') || m.pipeline_tag.includes('video'))" title="Hình ảnh/Video">👁️ Ảnh</span>
+                                                <span class="badge badge-sm badge-info" x-show="m.pipeline_tag && (m.pipeline_tag.includes('audio') || m.pipeline_tag.includes('speech') || m.pipeline_tag.includes('voice'))" title="Âm thanh">🎙️ Âm thanh</span>
+                                                <span class="badge badge-sm badge-muted" x-show="m.pipeline_tag && !m.pipeline_tag.includes('text') && !m.pipeline_tag.includes('chat') && !m.pipeline_tag.includes('image') && !m.pipeline_tag.includes('vision') && !m.pipeline_tag.includes('audio') && !m.pipeline_tag.includes('speech')" x-text="m.pipeline_tag || '-'"></span>
+                                            </td>
+                                            <td>
+                                                <template x-if="m.isDownloaded">
+                                                    <button type="button" class="btn btn-outline btn-sm"
+                                                        :disabled="deleteLoading === m.name" @click="deleteModel(m.name)">
+                                                        <i class="fas fa-spinner fa-spin" x-show="deleteLoading === m.name"></i>
+                                                        <i class="fas fa-trash-alt" x-show="deleteLoading !== m.name"></i>
+                                                        <span x-text="deleteLoading === m.name ? 'Đang xóa...' : 'Xóa'"></span>
+                                                    </button>
+                                                </template>
+                                                <template x-if="!m.isDownloaded">
+                                                    <button type="button" class="btn btn-primary btn-sm"
+                                                        :disabled="pullLoading === m.name" @click="pullModel(m.name)">
+                                                        <i class="fas fa-spinner fa-spin" x-show="pullLoading === m.name"></i>
+                                                        <i class="fas fa-download" x-show="pullLoading !== m.name"></i>
+                                                        <span x-text="pullLoading === m.name ? 'Đang tải...' : 'Tải'"></span>
+                                                    </button>
+                                                </template>
                                             </td>
                                         </tr>
                                     </template>
-                                    <tr x-show="filteredAvailableModels().length === 0">
-                                        <td colspan="5" class="empty-state">Không có model nào phù hợp với bộ lọc.</td>
+                                    <tr x-show="allFilteredModels().length === 0">
+                                        <td colspan="9" class="empty-state">Không có model nào phù hợp với bộ lọc.</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -1853,9 +1819,10 @@
                 clusterTrainingJob: null,
                 _layerChart: null,
                 _flopsChart: null,
+                _flopsChart: null,
                 // === Model filter ===
                 modelSearch: '',
-                modelFamilyFilter: '',
+                modelStatusFilter: 'all',  // 'all', 'downloaded', 'available'
                 
                 init() {
                     this.fetchStats();
@@ -2555,49 +2522,27 @@
                     }
                 },
 
-                filteredAvailableModels() {
-                    const META = {
-                        'Qwen/Qwen2.5-0.5B-Instruct': { params: '0.5B', family: 'Qwen', type: 'chat' },
-                        'Qwen/Qwen2.5-1.5B-Instruct': { params: '1.5B', family: 'Qwen', type: 'chat' },
-                        'Qwen/Qwen2.5-3B-Instruct': { params: '3B', family: 'Qwen', type: 'chat' },
-                        'Qwen/Qwen2.5-7B-Instruct': { params: '7B', family: 'Qwen', type: 'chat' },
-                        'Qwen/Qwen2.5-14B-Instruct': { params: '14B', family: 'Qwen', type: 'chat' },
-                        'Qwen/Qwen2.5-Coder-7B-Instruct': { params: '7B', family: 'Code', type: 'code' },
-                        'Qwen/Qwen2.5-Coder-14B-Instruct': { params: '14B', family: 'Code', type: 'code' },
-                        'meta-llama/Llama-3.2-1B-Instruct': { params: '1B', family: 'LLaMA', type: 'chat' },
-                        'meta-llama/Llama-3.2-3B-Instruct': { params: '3B', family: 'LLaMA', type: 'chat' },
-                        'meta-llama/Llama-3.1-8B-Instruct': { params: '8B', family: 'LLaMA', type: 'chat' },
-                        'microsoft/Phi-3.5-mini-instruct': { params: '3.8B', family: 'Phi', type: 'chat' },
-                        'microsoft/phi-4': { params: '14B', family: 'Phi', type: 'chat' },
-                        'mistralai/Mistral-7B-Instruct-v0.3': { params: '7B', family: 'Mistral', type: 'chat' },
-                        'mistralai/Mistral-Nemo-Instruct-2407': { params: '12B', family: 'Mistral', type: 'chat' },
-                        'deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct': { params: '16B', family: 'Code', type: 'code' },
-                        'bigcode/starcoder2-3b': { params: '3B', family: 'Code', type: 'code' },
-                        'bigcode/starcoder2-7b': { params: '7B', family: 'Code', type: 'code' },
-                        'bigcode/starcoder2-15b': { params: '15B', family: 'Code', type: 'code' },
-                    };
+                allFilteredModels() {
                     const search = (this.modelSearch || '').toLowerCase();
-                    const fam = this.modelFamilyFilter || '';
-                    return (this.modelList.available || []).map(m => {
-                        const key = m.name || m.hf_id || '';
-                        const meta = META[key] || {};
-                        let family = meta.family || '';
-                        if (!family) {
-                            const n = key.toLowerCase();
-                            if (n.includes('qwen')) family = 'Qwen';
-                            else if (n.includes('llama')) family = 'LLaMA';
-                            else if (n.includes('phi')) family = 'Phi';
-                            else if (n.includes('mistral')) family = 'Mistral';
-                            else if (n.includes('starcoder') || n.includes('deepseek') || n.includes('coder')) family = 'Code';
-                        }
-                        return {
-                            ...m, params: meta.params || m.parameter_size || '', family,
-                            type: meta.type || (family === 'Code' ? 'code' : 'chat'), hf_repo: key
-                        };
-                    }).filter(m => {
+                    const status = this.modelStatusFilter || 'all';
+                    
+                    // Gắn cờ cho từng model và map lại
+                    const downloaded = (this.modelList.downloaded || []).map(m => ({ ...m, isDownloaded: true }));
+                    const availableRaw = (this.modelList.available || []).map(m => ({ ...m, isDownloaded: false }));
+                    
+                    // Loại bỏ các model "Có thể tải" nếu nó đã nằm trong danh sách "Đã tải"
+                    const downloadedNames = new Set(downloaded.map(m => m.name));
+                    const available = availableRaw.filter(m => !downloadedNames.has(m.name));
+                    
+                    // Gộp 2 mảng lại: Đã tải sẽ luôn đứng trước (vì mảng downloaded đặt trước)
+                    const all = [...downloaded, ...available];
+                    
+                    return all.filter(m => {
                         const matchSearch = !search || (m.name || '').toLowerCase().includes(search) || (m.family || '').toLowerCase().includes(search);
-                        const matchFam = !fam || m.family === fam || (fam === 'Code' && m.type === 'code');
-                        return matchSearch && matchFam;
+                        const matchStatus = status === 'all' 
+                            || (status === 'downloaded' && m.isDownloaded) 
+                            || (status === 'available' && !m.isDownloaded);
+                        return matchSearch && matchStatus;
                     });
                 },
             }

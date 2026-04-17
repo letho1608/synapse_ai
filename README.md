@@ -1,6 +1,6 @@
-# synapse_ai
+# Synapse AI: Decentralized Distributed AI Supercomputing Cluster
 
-**Distributed AI server** — run LLMs across nodes, OpenAI-compatible API, model management & training from one UI.
+**Distributed AI Supercluster** — Run LLMs across multiple nodes, OpenAI-compatible API, unified model management & training from one single dashboard.
 
 [![Repo](https://img.shields.io/badge/repo-github.com%2Fletho1608%2Fsynapse__ai-blue)](https://github.com/letho1608/synapse_ai)
 
@@ -8,7 +8,7 @@
 
 ## Overview
 
-Synapse AI Server lets you run **distributed** large language models (LLMs) across multiple machines over Tailscale: each node runs a portion of the model (layer sharding) and communicates via gRPC. You get **one web UI** to manage models, chat, training, and monitor the cluster without needing a single high-end machine.
+Synapse AI Server is a powerful **decentralized distributed supercomputing system** that allows you to run large language models (LLMs) across multiple machines over Tailscale. Each node in the cluster handles a portion of the model (layer sharding) and communicates via gRPC. You get **one unified web UI** to manage models, chat, train, and monitor the entire cluster status without requiring a single high-end machine.
 
 > **Important:** When using this repo with Tailscale discovery, **you must install and run the Tailscale app** on your machine (the Tailscale app must be running — [tailscale.com/download](https://tailscale.com/download)). If Tailscale is not running, cluster discovery and the Monitoring page will not work correctly.
 
@@ -20,7 +20,7 @@ Synapse AI Server lets you run **distributed** large language models (LLMs) acro
 |---------|-------------|
 | **Distributed inference** | Run LLMs (PyTorch + Hugging Face) across multiple nodes with layer sharding over Tailscale. |
 | **OpenAI API** | `/v1/chat/completions` endpoint (streaming / non-streaming), OpenAI-compatible. |
-| **22 Hugging Face models** | Model list in `synapse/model_list.py`; pull/delete from Web UI. |
+| **500+ Hugging Face models** | Automatic model discovery and management; pull/delete directly from Web UI. |
 | **Web UI** | Dashboard, Model management, Chat with model, Training (LoRA), Dataset, Monitoring (Tailscale nodes), Settings, About. |
 | **LoRA training** | Fine-tune from Web UI; pipeline load-sharing when multiple nodes are available. |
 | **Cluster monitoring** | View Tailscale nodes, total CPU/RAM/GPU/disk, and per-node status. |
@@ -43,7 +43,6 @@ git clone https://github.com/letho1608/synapse_ai.git
 cd synapse_ai
 python -m venv .venv
 .venv\Scripts\activate   # Windows
-# source .venv/bin/activate  # Linux/macOS
 pip install -r requirements.txt
 ```
 
@@ -113,7 +112,6 @@ python main.py run --tailscale-api-key "tskey-api-xxx" --tailnet-name "your-tail
 synapse_ai/
 ├── main.py                 # Entry point (calls synapse.main)
 ├── requirements.txt
-├── .env.example            # Template for .env (copy → .env, set TAILSCALE_API_KEY, TAILNET_NAME)
 ├── README.md
 ├── synapse/
 │   ├── main.py             # Main logic; reads Tailscale from env or CLI
@@ -125,7 +123,7 @@ synapse_ai/
 │   ├── config/             # settings.json
 │   ├── data/               # Datasets (json/jsonl)
 │   ├── tinychat/           # Web UI (dashboard.html, production.css)
-│   └── model_list.py       # 22 Hugging Face models
+│   └── model_list.py       # 500+ Hugging Face models (Auto-discovery)
 └── tests/
 ```
 
