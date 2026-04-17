@@ -13,6 +13,39 @@ import subprocess
 warnings.filterwarnings("ignore", message=".*pynvml.*deprecated.*nvidia-ml-py.*", category=FutureWarning)
 
 
+def _ensure_firewall_rules() -> None:
+    """
+    Tự động mở firewall cho các port Synapse AI trên Windows.
+    Chạy silently - nếu lỗi (thiếu quyền admin) thì bỏ qua, không crash app.
+    """
+    if sys.platform != "win32":
+        return
+    rules = [
+        ("Synapse AI gRPC", "5678"),
+        ("Synapse AI API", "52415"),
+    ]
+    for name, port in rules:
+        try:
+            # Kiểm tra rule đã tồn tại chưa
+            check = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "No rules match" not in check.stdout and check.returncode == 0:
+                continue  # Đã có rule rồi, bỏ qua
+            # Thêm rule mới
+            subprocess.run(
+                [
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name={name}", "dir=in", "action=allow",
+                    "protocol=TCP", f"localport={port}"
+                ],
+                capture_output=True, text=True, timeout=5
+            )
+            print(f"[INFO] Firewall: opened port {port} (TCP) for '{name}'")
+        except Exception:
+            pass  # Thiếu quyền admin hoặc không phải Windows -> bỏ qua
+
 def _detect_nvidia_gpus_via_nvidia_smi() -> list[str]:
     """
     Dùng nvidia-smi (nếu có) để phát hiện rõ có GPU NVIDIA hay không.
@@ -124,6 +157,9 @@ def run():
     # Capture stdout/stderr ngay từ đầu để dashboard hiển thị log như terminal
     from synapse.terminal_log import install as install_terminal_log
     install_terminal_log()
+
+    # Tự động mở firewall port 5678 (gRPC) và 52415 (API)
+    _ensure_firewall_rules()
 
     # Kiểm tra môi trường GPU / PyTorch ngay khi khởi động
     _check_gpu_environment()

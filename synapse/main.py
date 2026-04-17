@@ -53,7 +53,7 @@ parser.add_argument("--resume-checkpoint", type=str, default=None, help="Path to
 parser.add_argument("--save-checkpoint-dir", type=str, default="checkpoints", help="Path to a folder where checkpoints are stored")
 parser.add_argument("--node-id", type=str, default=None, help="Node ID")
 parser.add_argument("--node-host", type=str, default="0.0.0.0", help="Node host")
-parser.add_argument("--node-port", type=int, default=None, help="Node port")
+parser.add_argument("--node-port", type=int, default=5678, help="Node port (gRPC, mặc định 5678)")
 parser.add_argument("--models-seed-dir", type=str, default=None, help="Model seed directory")
 parser.add_argument("--listen-port", type=int, default=5678, help="Listening port for discovery")
 parser.add_argument("--download-quick-check", action="store_true", help="Quick check local path for model shards download")
@@ -91,9 +91,6 @@ inference_engine_name = args.inference_engine if hasattr(args, "inference_engine
 inference_engine = get_inference_engine(inference_engine_name, None)
 shard_downloader: ShardDownloader = inference_engine.shard_downloader
 
-if args.node_port is None:
-  args.node_port = find_available_port(args.node_host)
-  if DEBUG >= 1: print(f"Using available port: {args.node_port}")
 
 args.node_id = args.node_id or get_or_create_node_id()
 chatgpt_api_endpoints = [f"http://{ip}:{args.chatgpt_api_port}/v1/chat/completions" for ip, _ in get_all_ip_addresses_and_interfaces()]
