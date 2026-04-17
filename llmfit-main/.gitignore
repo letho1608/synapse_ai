@@ -1,8 +1,0 @@
-.DS_Store
-/target
-llmfit
-/docs
-llmfit-desktop/gen/schemas/*
-data/gguf_sources_cache.json
-llmfit-web/node_modules/
-llmfit-web/dist/
