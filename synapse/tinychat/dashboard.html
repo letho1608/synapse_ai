@@ -855,20 +855,44 @@
                                         <span x-show="node.vram_gb > 0" x-text="node.vram_gb + ' GB VRAM'"></span>
                                         <span x-show="node.vram_gb <= 0" x-text="node.ram_gb + ' GB RAM'"></span>
                                     </div>
-                                    <div style="margin-top:8px">
+                                    <!-- Real-time CPU/GPU bars -->
+                                    <div style="margin-top:12px">
+                                        <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px">
+                                            <span>CPU: <span x-text="node.cpu_pct + '%'"></span></span>
+                                        </div>
+                                        <div class="resource-bar" style="height:4px;background:rgba(255,255,255,0.05)">
+                                            <div class="resource-bar-fill" :style="`width:${node.cpu_pct}%;background:var(--info);transition:width 0.5s ease`" style="margin-left:0"></div>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top:8px" x-show="node.has_gpu">
+                                        <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px">
+                                            <span>GPU: <span x-text="node.gpu_utilization + '%'"></span></span>
+                                            <span x-text="node.gpu_mem_used_gb + '/' + node.vram_gb + 'GB'"></span>
+                                        </div>
+                                        <div class="resource-bar" style="height:4px;background:rgba(255,255,255,0.05)">
+                                            <div class="resource-bar-fill" :style="`width:${node.gpu_utilization}%;background:var(--success);transition:width 0.5s ease`" style="margin-left:0"></div>
+                                        </div>
+                                    </div>
+
+                                    <div style="margin-top:12px">
+                                        <div style="font-size:10px;color:var(--text-muted);margin-bottom:2px">Layer Mapping:</div>
                                         <div class="resource-bar">
                                             <div class="resource-bar-fill bar-layer"
                                                 :style="`margin-left:${node.layer_start_pct}%;width:${node.layer_end_pct-node.layer_start_pct}%`">
                                             </div>
                                         </div>
                                         <div style="font-size:10px;color:var(--text-muted);margin-top:3px"
-                                            x-text="node.share_pct + '% layers'"></div>
+                                            x-text="node.share_pct + '% layers (' + node.layer_start_pct + '% → ' + node.layer_end_pct + '%)'"></div>
                                     </div>
-                                    <div style="margin-top:6px">
+                                    <div style="margin-top:8px">
                                         <span class="badge badge-muted" style="font-size:10px"
                                             x-text="node.flops_fp16 > 0 ? node.flops_fp16.toFixed(1) + ' TFLOPS' : 'CPU only'"></span>
                                         <span x-show="node.is_self" class="badge badge-success"
                                             style="font-size:10px;margin-left:4px">● Online</span>
+                                        <span x-show="!node.is_self" class="badge" 
+                                              :class="node.ip ? 'badge-info' : 'badge-muted'"
+                                              style="font-size:10px;margin-left:4px"
+                                              x-text="node.ip ? '● Connected' : '○ Offline'"></span>
                                     </div>
                                 </div>
                             </template>
@@ -892,7 +916,9 @@
                                         <th>Throughput (Thực tế)</th>
                                         <th>CPU Cores</th>
                                         <th>Layer %</th>
-                                        <th>CPU Hiện tại</th>
+                                        <th>CPU %</th>
+                                        <th>GPU %</th>
+                                        <th>GPU VRAM</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -931,10 +957,32 @@
                                                 </div>
                                             </td>
                                             <td>
-                                                <span x-show="node.cpu_pct !== null && node.cpu_pct !== undefined"
-                                                    x-text="node.cpu_pct + '%'"></span>
-                                                <span x-show="node.cpu_pct === null || node.cpu_pct === undefined"
-                                                    class="text-muted">-</span>
+                                                <div style="display:flex;align-items:center;gap:6px">
+                                                    <span style="min-width:35px" x-text="node.cpu_pct + '%'"></span>
+                                                    <div style="flex:1;height:4px;background:rgba(0,0,0,0.05);border-radius:2px;overflow:hidden">
+                                                        <div :style="`width:${node.cpu_pct}%;height:100%;background:var(--info)`"></div>
+                                                    </div>
+                                                </div>
+                                            </td>
+                                            <td>
+                                                <template x-if="node.has_gpu">
+                                                    <div style="display:flex;align-items:center;gap:6px">
+                                                        <span style="min-width:35px" x-text="node.gpu_utilization + '%'"></span>
+                                                        <div style="flex:1;height:4px;background:rgba(0,0,0,0.05);border-radius:2px;overflow:hidden">
+                                                            <div :style="`width:${node.gpu_utilization}%;height:100%;background:var(--success)`"></div>
+                                                        </div>
+                                                    </div>
+                                                </template>
+                                                <span x-show="!node.has_gpu" class="text-muted">-</span>
+                                            </td>
+                                            <td>
+                                                <template x-if="node.has_gpu">
+                                                    <div>
+                                                        <span x-text="node.gpu_mem_used_gb.toFixed(2) + ' GB'"></span>
+                                                        <div style="font-size:10px;color:var(--text-muted)" x-text="'của ' + node.vram_gb + ' GB'"></div>
+                                                    </div>
+                                                </template>
+                                                <span x-show="!node.has_gpu" class="text-muted">-</span>
                                             </td>
                                         </tr>
                                     </template>

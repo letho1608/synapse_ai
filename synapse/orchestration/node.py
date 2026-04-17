@@ -13,6 +13,8 @@ from synapse.topology.partitioning_strategy import Partition, PartitioningStrate
 from synapse import DEBUG
 from synapse.helpers import AsyncCallbackSystem
 from synapse.viz.topology_viz import TopologyViz
+import psutil
+import subprocess
 from synapse.loading import RepoProgressEvent, ShardDownloader
 
 class Node:
@@ -1015,7 +1017,64 @@ class Node:
 
   @property
   def current_topology(self) -> Topology:
+    self.refresh_local_metrics()
     return self.topology
+
+  def refresh_local_metrics(self) -> None:
+    """Updates the local node's DeviceCapabilities with real-time info."""
+    try:
+      caps = self.topology.get_node(self.id)
+      if not caps:
+        # Fallback to self.device_capabilities if not in topology yet
+        caps = self.device_capabilities
+        self.topology.update_node(self.id, caps)
+      
+      # CPU Usage
+      caps.cpu_usage_pct = psutil.cpu_percent()
+      
+      # RAM Usage
+      mem = psutil.virtual_memory()
+      caps.ram_used_mb = int(mem.used / (1024 * 1024))
+      
+      # GPU Usage (using the same logic as ChatGPTAPI)
+      gpu_util = self._get_gpu_utilization_local()
+      if gpu_util is not None:
+        caps.gpu_usage_pct = float(gpu_util)
+      
+      # Update VRAM usage if we can detect it
+      # In windows/cuda we can use nvidia-smi
+      gpu_mem = self._get_gpu_memory_used_local()
+      if gpu_mem is not None:
+        caps.gpu_memory_used_mb = gpu_mem
+        
+      self.topology.update_node(self.id, caps)
+    except Exception as e:
+      if DEBUG >= 2:
+        print(f"[Node] Error refreshing metrics: {e}")
+
+  def _get_gpu_utilization_local(self) -> Optional[int]:
+    try:
+      out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=2
+      )
+      if out.returncode == 0 and out.stdout.strip():
+        vals = [int(v.strip()) for v in out.stdout.strip().split("\n") if v.strip().isdigit()]
+        return int(sum(vals)/len(vals)) if vals else None
+    except Exception: pass
+    return None
+
+  def _get_gpu_memory_used_local(self) -> Optional[int]:
+    try:
+      out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=2
+      )
+      if out.returncode == 0 and out.stdout.strip():
+        vals = [int(v.strip()) for v in out.stdout.strip().split("\n") if v.strip().isdigit()]
+        return int(sum(vals)/len(vals)) if vals else None
+    except Exception: pass
+    return None
 
   def handle_stable_diffusion(self, inference_state, result):
     if inference_state['is_step_finished']:

@@ -293,6 +293,10 @@ class GRPCPeerHandle(PeerHandle):
           gpu_count=capabilities.gpu_count,
           disk_gb=capabilities.disk_gb,
           warmup_throughput=capabilities.warmup_throughput,
+          cpu_usage_pct=capabilities.cpu_usage_pct,
+          gpu_usage_pct=capabilities.gpu_usage_pct,
+          ram_used_mb=capabilities.ram_used_mb,
+          gpu_memory_used_mb=capabilities.gpu_memory_used_mb,
         )
         topology.update_node(node_id, device_capabilities)
       for node_id, peer_connections in response.peer_graph.items():
