@@ -138,8 +138,9 @@ class TailscaleDiscovery(Discovery):
                 peer_id, device_capabilities = await asyncio.wait_for(probe_handle.probe(), timeout=5.0)
                 peer_port = fallback_port
                 if DEBUG >= 1: print(f"TailscaleDiscovery: Probe SUCCESS for {device.name} -> Node ID: {peer_id}")
-              except Exception:
-                # Nếu probe thất bại, bỏ qua
+              except Exception as e:
+                if DEBUG >= 1: 
+                    print(f"TailscaleDiscovery: Probe FAILED for {device.name} at {peer_host}:{fallback_port}. Reason: {e}")
                 pass
 
           if not peer_id:
@@ -156,8 +157,13 @@ class TailscaleDiscovery(Discovery):
 
           if peer_id not in self.known_peers or self.known_peers[peer_id][0].addr() != f"{peer_host}:{peer_port}":
             new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
-            if not await new_peer_handle.health_check():
-              if DEBUG >= 1: print(f"TailscaleDiscovery: Peer {peer_id} at {peer_host}:{peer_port} is not healthy (Firewall checked?). Skipping.")
+            try:
+                if not await new_peer_handle.health_check():
+                  if DEBUG >= 1: print(f"TailscaleDiscovery: Peer {peer_id} at {peer_host}:{peer_port} health_check FAILED. Port {peer_port} likely blocked.")
+                  continue
+            except Exception as e:
+                if DEBUG >= 1: print(f"TailscaleDiscovery: Peer {peer_id} health_check ERROR: {e}")
+                continue
               continue
 
             if DEBUG >= 1: print(f"TailscaleDiscovery: ADDING peer {peer_id} at {peer_host}:{peer_port}")

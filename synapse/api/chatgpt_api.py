@@ -290,6 +290,22 @@ class ChatGPTAPI:
       self._token_tasks.add(task)
       task.add_done_callback(self._token_tasks.discard)
     self.token_callback.on_next(safe_handle_tokens)
+
+    # Listen for cluster-wide training status updates from other nodes
+    def handle_cluster_training_status_sync(request_id: str, opaque_status: str):
+        try:
+            status = json.loads(opaque_status)
+            if status.get("type") == "cluster_training_status":
+                incoming_job = status.get("job")
+                # Nếu mình không phải là Master (không có _training_job hoặc job_id khác)
+                # thì cập nhật cục bộ để Dashboard hiển thị đồng bộ
+                if not self._training_job or self._training_job.get("job_id") != incoming_job.get("job_id"):
+                    # Chỉ cập nhật nếu Job đang chạy hoặc vừa hoàn thành
+                    if incoming_job.get("status") in ["started", "completed", "profiling"]:
+                        self._training_job = incoming_job
+        except Exception:
+            pass
+    node.on_opaque_status.register("cluster_training_sync").on_next(handle_cluster_training_status_sync)
     self.system_prompt = system_prompt
 
     cors = aiohttp_cors.setup(self.app)
@@ -1950,16 +1966,30 @@ class ChatGPTAPI:
         lengths = np.maximum(attention_mask.sum(axis=1), 1).astype(np.int64)
         return input_ids, labels, lengths
 
-      planned_steps = max(1, (len(texts) + batch_size - 1) // batch_size) * epochs
+      # FIX: Đảm bảo planned_steps chính xác và không bị Step 441/40
+      steps_per_epoch = max(1, (len(texts) + batch_size - 1) // batch_size)
+      planned_steps = steps_per_epoch * epochs
       if max_steps > 0:
         total_steps = max(1, min(planned_steps, max_steps))
       else:
         total_steps = max(1, planned_steps)
+      
       step_count = 0
       job["total_steps"] = total_steps
       job["current_step"] = 0
       job["progress"] = 0
+      job["master_node"] = self.node.id # Đánh dấu mình là chủ xị
       effective_max_length = max_length
+
+      # Helper để broadcast trạng thái tới toàn bộ Cluster
+      last_broadcast_time = 0
+      async def broadcast_status(force=False):
+          nonlocal last_broadcast_time
+          now = time.time()
+          if force or (now - last_broadcast_time > 3.0): # 3 giây một lần
+              last_broadcast_time = now
+              status_json = json.dumps({"type": "cluster_training_status", "job": job})
+              asyncio.create_task(self.node.broadcast_opaque_status("cluster_sync", status_json))
 
       # === Giai đoạn 2: Warmup Profiling (Dynamic Load Balancing) ===
       if job.get("use_dynamic_profiling", True):
@@ -2087,9 +2117,14 @@ class ChatGPTAPI:
                   if DEBUG >= 1: print(f"[Sync] Bước {step_count}: Sử dụng Weighted Averaging (Default)...")
               
               job["current_step"] = step_count
-              job["current_epoch"] = epoch
+              job["current_epoch"] = epoch 
+              # Cập nhật progress dựa trên step_count thực tế
               job["progress"] = min(100, int(100 * step_count / max(1, total_steps)))
-              job["current_activity"] = f"Step {step_count}/{total_steps} (Epoch {epoch}) finished."
+              # Luôn đảm bảo Step trực quan trong UI
+              job["current_activity"] = f"Step {step_count}/{total_steps} (Epoch {epoch+1}/{epochs})"
+              
+              # Broadcast tới các máy khác
+              await broadcast_status()
               await asyncio.sleep(0.05) # Giảm starvation
 
             except Exception as e:
@@ -2164,6 +2199,8 @@ class ChatGPTAPI:
         job["current_epoch"] = epochs
         job["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         self.log_activity("Training Completed", model, "success")
+        # Final broadcast
+        await broadcast_status(force=True)
     except asyncio.CancelledError:
       if self._training_job and self._training_job.get("job_id") == job_id:
         job["status"] = "cancelled"
