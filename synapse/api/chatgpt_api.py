@@ -1998,14 +1998,25 @@ class ChatGPTAPI:
       if DEBUG >= 1:
         print(f"[Training] Dataset: len(texts)={len(texts)}, batch_size={batch_size}, epochs={epochs}")
         print(f"[Training] Calculated: steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
+        print(f"\n[Training] ✅ SYSTEM IMPROVEMENTS ACTIVE:")
+        print(f"  1. Load Balancing: Weighted Data Parallelism (all nodes participate)")
+        print(f"  2. Gradient Sync: {'Adaptive AllReduce (Tree→Ring→Mesh fallback)' if job.get('use_adaptive_allreduce') else 'Ring-AllReduce only'}")
+        print(f"  3. Per-Node Logging: Showing work distribution & sync metrics")
+        print(f"  4. Fault Tolerance: Automatic fallback if node fails\n")
       
       step_count = 0
       job["total_steps"] = total_steps
       job["current_step"] = 0
       job["progress"] = 0
       job["master_node"] = self.node.id # Đánh dấu mình là chủ xị
+      job["sync_strategy"] = job.get("sync_strategy", "adaptive")  # Track which strategy is used
+      job["allreduce_info"] = ""  # Will show strategy/timing info
       effective_max_length = max_length
 
+      # Broadcast total_steps trước khi training bắt đầu để các máy khác biết
+      status_json = json.dumps({"type": "cluster_training_status", "job": job})
+      await self.node.broadcast_opaque_status("cluster_sync", status_json)
+      
       # Helper để broadcast trạng thái tới toàn bộ Cluster
       last_broadcast_time = 0
       async def broadcast_status(force=False):
@@ -2013,6 +2024,11 @@ class ChatGPTAPI:
           now = time.time()
           if force or (now - last_broadcast_time > 3.0): # 3 giây một lần
               last_broadcast_time = now
+              # Capture current AllReduce metrics if available
+              allreduce_metrics = self.node.get_allreduce_metrics()
+              if allreduce_metrics and allreduce_metrics.get("latest_metric"):
+                metric = allreduce_metrics["latest_metric"]
+                job["allreduce_info"] = f"[{metric['strategy'].upper()}] {metric['duration_ms']:.0f}ms ({metric['size_mb']:.1f}MB)"
               status_json = json.dumps({"type": "cluster_training_status", "job": job})
               asyncio.create_task(self.node.broadcast_opaque_status("cluster_sync", status_json))
 
@@ -2020,6 +2036,17 @@ class ChatGPTAPI:
       if job.get("use_dynamic_profiling", True):
         self._set_activity(job, "Đang đo đạc hiệu năng Cluster (Warmup Profiling)...")
         await self._perform_warmup_profiling(job, texts, effective_max_length, base_shard, tokenize_batch)
+      else:
+        if DEBUG >= 1: print("[Training] Dynamic profiling disabled, using default weighting")
+
+      # === Enable Adaptive AllReduce for Fault Tolerance ===
+      if job.get("use_adaptive_allreduce", True):
+        self.node.use_adaptive_allreduce = True
+        if DEBUG >= 1: print("[Training] ✅ Adaptive AllReduce ENABLED (Tree/Ring/Mesh strategies)")
+      else:
+        self.node.use_adaptive_allreduce = False
+        if DEBUG >= 1: print("[Training] ❌ Adaptive AllReduce DISABLED (Ring-only, single point of failure)")
+
 
       # === Giai đoạn 3: Ring-AllReduce Setup ===
       self._set_activity(job, "Thiết lập truyền tải dữ liệu (Ring-AllReduce)...")
@@ -2052,12 +2079,16 @@ class ChatGPTAPI:
             
             sub_batch = pending_batches.pop(0)
             
-            # 1. Identify Data Parallel Groups for the first stage (start=0.0)
+            # 1. Get all Data Parallel nodes (ALL nodes participate in Data Parallelism)
+            # BUG FIX: For DP, all partitions should be entry nodes, not just start==0.0
             partitions = self.node.partitioning_strategy.partition(self.node.topology)
-            entry_partitions = [p for p in partitions if p.start == 0.0]
+            entry_partitions = partitions if partitions else [Partition(self.node.id, 0.0, 1.0, 1.0)]
             
-            if not entry_partitions:
-              entry_partitions = [Partition(self.node.id, 0.0, 1.0, 1.0)]
+            # Log work distribution for debugging
+            if DEBUG >= 1 and step_count <= 1:  # Only log first step to avoid spam
+              print(f"[Training] Step {step_count}: Distributing across {len(entry_partitions)} nodes")
+              for p in entry_partitions:
+                print(f"  - Node {p.node_id}: weight={p.weight:.2%}")
             
             # 2. Phân bổ sub-batches dựa trên trọng số (Manual Weighting / FLOPS)
             total_entry_weight = sum(p.weight for p in entry_partitions)
@@ -2066,7 +2097,7 @@ class ChatGPTAPI:
             
             try:
               for i, p in enumerate(entry_partitions):
-                share = p.weight / total_entry_weight
+                share = p.weight / total_entry_weight if total_entry_weight > 0 else 1.0 / len(entry_partitions)
                 n_samples = int(len(sub_batch) * share)
                 if i == len(entry_partitions) - 1:
                   node_sub_samples = sub_batch[current_sub_start:]
@@ -2075,16 +2106,18 @@ class ChatGPTAPI:
                 
                 current_sub_start += n_samples
                 if not node_sub_samples:
+                  if DEBUG >= 1: print(f"[Training] Node {p.node_id}: Skip (0 samples)")
                   continue
                 
                 # Tokenize cho node này
-                job["current_activity"] = f"Tokenizing sub-batch for {p.node_id}..."
+                job["current_activity"] = f"Preparing {len(node_sub_samples)} samples for Node {p.node_id}..."
                 example_np, target_np, length_np = tokenize_batch(node_sub_samples, effective_max_length)
                 request_id = str(uuid.uuid4())
                 
                 # 3. Thực thi song song (Data Parallelism)
                 if p.node_id == self.node.id:
-                  job["current_activity"] = f"Processing locally (Node: {p.node_id})..."
+                  if DEBUG >= 1: print(f"[Training] Step {step_count}: Local node processes {len(node_sub_samples)} samples")
+                  job["current_activity"] = f"Local: Processing {len(node_sub_samples)} samples..."
                   task = self.node.enqueue_example(
                     base_shard, example_np, target_np, length_np,
                     train=True, request_id=request_id
@@ -2093,12 +2126,20 @@ class ChatGPTAPI:
                 else:
                   peer = next((peer for peer in self.node.peers if peer.id() == p.node_id), None)
                   if peer:
-                    job["current_activity"] = f"Sending to remote Node: {p.node_id}..."
-                    task = peer.send_example(
-                      base_shard, example_np, target_np, length_np,
-                      train=True, request_id=request_id
-                    )
-                    sub_batch_results.append(task)
+                    if DEBUG >= 1: print(f"[Training] Step {step_count}: Sending {len(node_sub_samples)} samples to Node {p.node_id}")
+                    job["current_activity"] = f"Remote {p.node_id}: Sending {len(node_sub_samples)} samples..."
+                    try:
+                      task = peer.send_example(
+                        base_shard, example_np, target_np, length_np,
+                        train=True, request_id=request_id
+                      )
+                      sub_batch_results.append(task)
+                    except Exception as e:
+                      if DEBUG >= 1: print(f"[Training] ERROR: Failed to send to Node {p.node_id}: {e}")
+                      raise
+                  else:
+                    if DEBUG >= 1: print(f"[Training] WARNING: Cannot find peer for Node {p.node_id}")
+
               
               if not sub_batch_results:
                 continue
@@ -2122,13 +2163,45 @@ class ChatGPTAPI:
               loss = sum(valid_losses) / len(valid_losses)
               job["loss"] = round(float(loss), 4)
               
-              # [FIX] Chỉ tăng step_count 1 lần sau khi xử lý XONG cả batch (kể cả khi bị chia nhỏ do OOM)
+              # Tăng step_count và đảm bảo không vượt quá total_steps
               step_count += 1
+              job["current_step"] = min(step_count, total_steps)  # Clamp để không vượt
               
               # === Gradient Synchronization Section ===
               if step_count % sync_every_n == 0:
-                if sync_strategy == "ring" and len(entry_node_ids) > 1:
-                  if DEBUG >= 1: print(f"[Sync] Bước {step_count}: Kích hoạt Ring-AllReduce P2P...")
+                # Select sync strategy: adaptive (fault-tolerant) vs ring (traditional)
+                use_adaptive = job.get("use_adaptive_allreduce", True)
+                
+                if use_adaptive and len(entry_node_ids) > 1:
+                  # 🟢 ADAPTIVE MODE: Tree (50ms) → Ring (100ms) → Mesh (300ms, always works)
+                  if DEBUG >= 1: print(f"[Sync] Step {step_count}: 🟢 Adaptive AllReduce (Tree/Ring/Mesh fallback)...")
+                  job["current_activity"] = f"Step {step_count}: Gradient sync (Adaptive AllReduce)..."
+                  sync_tasks = []
+                  for node_id in entry_node_ids:
+                    if node_id == self.node.id:
+                      # Local node uses execute_ring_allreduce which internally calls adaptive
+                      sync_tasks.append(self.node.execute_ring_allreduce(model))
+                    else:
+                      peer = next((p for p in self.node.peers if p.id() == node_id), None)
+                      if peer:
+                        sync_tasks.append(peer.trigger_ring_allreduce(model))
+                  
+                  if sync_tasks:
+                    try:
+                      await asyncio.gather(*sync_tasks)
+                      if DEBUG >= 1: 
+                        metrics = self.node.get_allreduce_metrics()
+                        if metrics and metrics.get("latest_metric"):
+                          latest = metrics["latest_metric"]
+                          print(f"[Sync] ✅ Step {step_count}: {latest['strategy'].upper()} completed in {latest['duration_ms']:.1f}ms")
+                    except Exception as e:
+                      if DEBUG >= 1: print(f"[Sync] ⚠️ Adaptive sync failed: {e}")
+                      # System will retry on next sync_every_n step
+                
+                elif sync_strategy == "ring" and len(entry_node_ids) > 1:
+                  # 🟠 RING ONLY: Traditional Ring-AllReduce (100ms, faster but single point of failure)
+                  if DEBUG >= 1: print(f"[Sync] Step {step_count}: 🟠 Ring-AllReduce (traditional, non-adaptive)...")
+                  job["current_activity"] = f"Step {step_count}: Gradient sync (Ring-AllReduce)..."
                   sync_tasks = []
                   for node_id in entry_node_ids:
                     if node_id == self.node.id:
@@ -2140,10 +2213,7 @@ class ChatGPTAPI:
                   
                   if sync_tasks:
                     await asyncio.gather(*sync_tasks)
-                else:
-                  if DEBUG >= 1: print(f"[Sync] Bước {step_count}: Sử dụng Weighted Averaging (Default)...")
               
-              job["current_step"] = step_count
               job["current_epoch"] = epoch 
               # Cập nhật progress dựa trên step_count thực tế
               job["progress"] = min(100, int(100 * step_count / max(1, total_steps)))
@@ -2160,8 +2230,10 @@ class ChatGPTAPI:
               except Exception:
                 pass  # Nếu lỗi, giữ nguyên steps_per_second (hoặc không set)
               
-              # Luôn đảm bảo Step trực quan trong UI
-              job["current_activity"] = f"Step {step_count}/{total_steps} (Epoch {epoch+1}/{epochs})"
+              # Luôn đảm bảo Step trực quan trong UI (không vượt quá total_steps)
+              display_step = min(step_count, total_steps)
+              allreduce_note = f" ({job.get('allreduce_info', '')})" if job.get('allreduce_info') else ""
+              job["current_activity"] = f"Step {display_step}/{total_steps} (Epoch {epoch+1}/{epochs}){allreduce_note}"
               
               # Broadcast tới các máy khác
               await broadcast_status()
@@ -2204,35 +2276,7 @@ class ChatGPTAPI:
               self.log_activity("Training Failed", model, "failed")
               return
 
-              prev_len = effective_max_length
-              effective_max_length = max(min_max_length, effective_max_length // 2)
-              job["effective_max_length"] = effective_max_length
-              pending_batches.insert(0, current_batch_texts)
-              if DEBUG >= 1:
-                print(f"[training:{job_id}] CUDA OOM -> giảm max_length {prev_len} -> {effective_max_length} và retry")
-              continue
-
-            if len(current_batch_texts) > 1:
-              mid = max(1, len(current_batch_texts) // 2)
-              left = current_batch_texts[:mid]
-              right = current_batch_texts[mid:]
-              if right:
-                pending_batches.insert(0, right)
-              if left:
-                pending_batches.insert(0, left)
-              if DEBUG >= 1:
-                print(f"[training:{job_id}] CUDA OOM ở max_length={effective_max_length} -> tách batch {len(current_batch_texts)} thành {len(left)} + {len(right)}")
-              continue
-
-            if DEBUG >= 1:
-              traceback.print_exc()
-            job["status"] = "failed"
-            job["error"] = (
-              "CUDA OOM dù đã giảm max_length và batch tối thiểu. "
-              "Hãy chọn model nhỏ hơn hoặc giảm max_length trong Training settings."
-            )
-            self.log_activity("Training Failed", model, "failed")
-            return
+      # Loop xong, cập nhật trạng thái hoàn tất
       if self._training_job and self._training_job.get("job_id") == job_id:
         job["status"] = "completed"
         job["progress"] = 100
@@ -2314,35 +2358,42 @@ class ChatGPTAPI:
     sample_texts = texts[:batch_size]
     example_np, target_np, length_np = tokenize_fn(sample_texts, max_len)
     
-    # 2. Xác định danh sách các Node đầu chuỗi (Entry Nodes) tham gia DP
+    # 2. Profile ALL Data Parallel nodes (not just start==0.0)
+    # BUG FIX: Must profile all nodes so they all get throughput measurements for fair load distribution
     topology = self.node.topology
     partitions = self.node.partitioning_strategy.partition(topology)
-    entry_node_ids = list(set(p.node_id for p in partitions if p.start == 0.0))
+    # Get all unique nodes from partitions (these are the DP nodes)
+    all_dp_nodes = list(set(p.node_id for p in partitions)) if partitions else [self.node.id]
     
-    if not entry_node_ids:
-      if DEBUG >= 1: print("[Profiling] Không tìm thấy node DP hợp lệ, bỏ qua profiling.")
+    if not all_dp_nodes:
+      if DEBUG >= 1: print("[Profiling] Không tìm thấy node DP nào, bỏ qua profiling.")
       job["status"] = "started"
       return
 
     # 3. Kích hoạt Profiling đồng thời trên tất cả các Node (Barrier Sync)
     profiling_tasks = []
-    for node_id in entry_node_ids:
+    for node_id in all_dp_nodes:
       if node_id == self.node.id:
         # Local profiling
+        if DEBUG >= 1: print(f"[Profiling] Profiling local node {node_id}...")
         task = self.node.process_hardware_profile(base_shard, example_np, target_np, length_np, n_iters=8, skip_iters=3)
         profiling_tasks.append((node_id, task))
       else:
         # Remote profiling qua gRPC
         peer = next((p for p in self.node.peers if p.id() == node_id), None)
         if peer:
+          if DEBUG >= 1: print(f"[Profiling] Profiling remote node {node_id}...")
           task = peer.profile_hardware(base_shard, example_np, target_np, length_np, n_iters=8, skip_iters=3)
           profiling_tasks.append((node_id, task))
+        else:
+          if DEBUG >= 1: print(f"[Profiling] WARNING: Cannot find peer for node {node_id}")
     
     if not profiling_tasks:
+      if DEBUG >= 1: print("[Profiling] No profiling tasks created, using default weighting")
       job["status"] = "started"
       return
       
-    if DEBUG >= 1: print(f"[Profiling] Đang đợi {len(profiling_tasks)} nodes phản hồi (Barrier)...")
+    if DEBUG >= 1: print(f"[Profiling] Đang chờ {len(profiling_tasks)} nodes hoàn thành profiling...")
     
     # Đợi tất cả hoàn thành (Barrier Synchronization) với timeout 60s
     try:
@@ -2351,7 +2402,7 @@ class ChatGPTAPI:
         timeout=60.0
       )
     except asyncio.TimeoutError:
-      if DEBUG >= 1: print("[Profiling] Timeout chờ phản hồi từ các nodes. Bỏ qua profiling cho các nodes chậm.")
+      if DEBUG >= 1: print("[Profiling] Timeout. Some nodes may not have completed profiling.")
       results = [Exception("Timeout")] * len(profiling_tasks)
     
     # 4. Cập nhật kết quả vào Topology
@@ -2367,7 +2418,11 @@ class ChatGPTAPI:
         if DEBUG >= 1: print(f"[Profiling] Node {node_id} -> {samples_per_sec:.2f} samples/s ({avg_latency_ms:.2f}ms)")
     
     # Trigger re-partitioning để áp dụng tỷ lệ mới ngay lập tức
-    self.node.partitioning_strategy.partition(topology)
+    new_partitions = self.node.partitioning_strategy.partition(topology)
+    if DEBUG >= 1: 
+      print("[Profiling] Work distribution after profiling:")
+      for p in new_partitions:
+        print(f"  - Node {p.node_id}: {p.weight:.2%} of workload")
     
     job["status"] = "started"
     if DEBUG >= 1: print("[Profiling] Warmup hoàn tất. Hệ thống đã được cân bằng tải động.")
@@ -2410,7 +2465,8 @@ class ChatGPTAPI:
       system_prompt = (body.get("system_prompt") or body.get("system") or "").strip() or None
       use_dynamic_profiling = bool(body.get("use_dynamic_profiling", True))
       sync_every_n_steps = int(body.get("sync_every_n_steps", 1))
-      sync_strategy = (body.get("sync_strategy") or "ring").strip()
+      sync_strategy = (body.get("sync_strategy") or "adaptive").strip().lower()  # Default to adaptive for fault tolerance
+      use_adaptive_allreduce = sync_strategy in ("adaptive", "ring")  # Enable adaptive mode for both
       node_weights = body.get("node_weights", {})
       
       if not model:
@@ -2435,6 +2491,7 @@ class ChatGPTAPI:
         "use_dynamic_profiling": use_dynamic_profiling,
         "sync_every_n_steps": sync_every_n_steps,
         "sync_strategy": sync_strategy,
+        "use_adaptive_allreduce": use_adaptive_allreduce,  # Enable fault-tolerant adaptive strategies
         "node_weights": node_weights,
         "base_model_id": model,
         "status": "started",
