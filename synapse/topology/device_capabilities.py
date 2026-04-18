@@ -74,6 +74,7 @@ class DeviceCapabilities(BaseModel):
     bandwidth_mbps: float = 0.0
     latency_ms: float = 0.0
     warmup_throughput: float = 0.0
+    training_throughput: float = 0.0
     # Real-time metrics
     cpu_usage_pct: float = 0.0
     gpu_usage_pct: float = 0.0
@@ -88,7 +89,7 @@ class DeviceCapabilities(BaseModel):
             f"Flops: {self.flops}. CPU: {self.cpu_cores} cores. "
             f"Disk: {self.disk_gb} GB. Backend: {self.gpu_backend}. "
             f"Net: {self.bandwidth_mbps} Mbps / {self.latency_ms} ms. "
-            f"Warmup: {self.warmup_throughput:.2f} samples/s"
+            f"Warmup: {self.warmup_throughput:.2f} s/s, Training: {self.training_throughput:.2f} s/s"
         )
 
     def model_post_init(self, __context: Any) -> None:
@@ -111,6 +112,7 @@ class DeviceCapabilities(BaseModel):
             "bandwidth_mbps": self.bandwidth_mbps,
             "latency_ms": self.latency_ms,
             "warmup_throughput": self.warmup_throughput,
+            "training_throughput": self.training_throughput,
             "cpu_usage_pct": self.cpu_usage_pct,
             "gpu_usage_pct": self.gpu_usage_pct,
             "ram_used_mb": self.ram_used_mb,
@@ -130,6 +132,7 @@ UNKNOWN_DEVICE_CAPABILITIES = DeviceCapabilities(
     bandwidth_mbps=0.0,
     latency_ms=0.0,
     warmup_throughput=0.0,
+    training_throughput=0.0,
 )
 
 

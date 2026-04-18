@@ -883,6 +883,99 @@
                         </div>
                     </div>
 
+                    <!-- Training Distribution & Work Status (During Training) -->
+                    <div x-show="clusterTrainingJob && clusterTrainingJob.status === 'started'" class="card">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-tasks" style="color:var(--success);margin-right:8px"></i>Phân tán công việc Training</h2>
+                            <div style="font-size:13px;color:var(--text-muted);margin-top:4px">
+                                <span x-text="'Epoch ' + (clusterTrainingJob.current_epoch + 1) + '/' + clusterTrainingJob.epochs + ' • '"></span>
+                                <span x-text="'Step ' + clusterTrainingJob.current_step + '/' + clusterTrainingJob.total_steps + ' • '"></span>
+                                <span x-text="'Progress: ' + clusterTrainingJob.progress + '%'"></span>
+                            </div>
+                        </div>
+                        <div style="padding:var(--spacing-lg)">
+                            <!-- Overall Training Progress -->
+                            <div style="margin-bottom:20px">
+                                <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px">
+                                    <span style="font-weight:600">Tiến độ Training</span>
+                                    <span x-text="clusterTrainingJob.progress + '%'" style="color:var(--success);font-weight:700"></span>
+                                </div>
+                                <div style="height:8px;background:var(--divider);border-radius:4px;overflow:hidden">
+                                    <div :style="`width:${clusterTrainingJob.progress}%;height:100%;background:var(--success);transition:width 0.5s ease`"></div>
+                                </div>
+                            </div>
+
+                            <!-- Per-Node Status -->
+                            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:var(--spacing-md)">
+                                <template x-for="node in clusterResources" :key="node.node_id">
+                                    <div style="background:var(--surface-hover);border:1px solid var(--border);border-radius:var(--radius-md);padding:var(--spacing-md)">
+                                        <!-- Node Name + Status -->
+                                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+                                            <span style="width:12px;height:12px;border-radius:50%;background:" :style="`background:${node.is_self ? 'var(--primary)' : 'var(--info)'}`"></span>
+                                            <span style="font-weight:600;font-size:13px" x-text="node.name"></span>
+                                            <span x-show="node.is_self" class="badge badge-success badge-xs">Máy này</span>
+                                        </div>
+
+                                        <!-- Task Activity -->
+                                        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;line-height:1.4">
+                                            <div x-text="'Công việc: ' + (node.current_activity || 'Chờ...')"></div>
+                                            <div x-text="'Chip: ' + node.chip"></div>
+                                        </div>
+
+                                        <!-- Resource Utilization -->
+                                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px;margin-bottom:8px">
+                                            <!-- CPU -->
+                                            <div>
+                                                <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                                                    <span>CPU</span>
+                                                    <span style="font-weight:700" x-text="node.cpu_pct + '%'"></span>
+                                                </div>
+                                                <div style="height:4px;background:rgba(0,0,0,0.05);border-radius:2px;overflow:hidden">
+                                                    <div :style="`width:${node.cpu_pct}%;height:100%;background:var(--info)`"></div>
+                                                </div>
+                                            </div>
+                                            <!-- GPU -->
+                                            <template x-if="node.has_gpu">
+                                                <div>
+                                                    <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                                                        <span>GPU</span>
+                                                        <span style="font-weight:700" x-text="node.gpu_utilization + '%'"></span>
+                                                    </div>
+                                                    <div style="height:4px;background:rgba(0,0,0,0.05);border-radius:2px;overflow:hidden">
+                                                        <div :style="`width:${node.gpu_utilization}%;height:100%;background:var(--success)`"></div>
+                                                    </div>
+                                                </div>
+                                            </template>
+                                        </div>
+
+                                        <!-- Layer Assignment -->
+                                        <div style="font-size:11px;background:var(--surface);padding:6px;border-radius:3px;margin-bottom:8px">
+                                            <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                                                <span style="color:var(--text-muted)">Layers assigned:</span>
+                                                <span style="font-weight:700" x-text="Math.round(node.layer_start_pct) + '% → ' + Math.round(node.layer_end_pct) + '%'"></span>
+                                            </div>
+                                            <div style="height:3px;background:rgba(0,0,0,0.1);border-radius:2px;overflow:hidden">
+                                                <div :style="`width:${node.layer_end_pct - node.layer_start_pct}%;height:100%;background:var(--primary);margin-left:${node.layer_start_pct}%`"></div>
+                                            </div>
+                                        </div>
+
+                                        <!-- Loss / Throughput -->
+                                        <div style="font-size:11px;color:var(--text-muted);padding-top:6px;border-top:1px solid var(--divider)">
+                                            <div style="display:flex;justify-content:space-between">
+                                                <span>Loss:</span>
+                                                <span x-text="(clusterTrainingJob.loss || 0).toFixed(4)" style="font-family:monospace;font-weight:700"></span>
+                                            </div>
+                                            <div style="display:flex;justify-content:space-between;margin-top:3px">
+                                                <span>Throughput:</span>
+                                                <span x-text="(node.training_throughput || 0).toFixed(2) + ' s/s'" style="font-family:monospace;color:var(--success);font-weight:700"></span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Ring Sync Visualization (Only during training) -->
                     <div x-show="clusterTrainingJob && clusterTrainingJob.status === 'started' && clusterResources.length > 1" class="card">
                         <div class="card-header">
@@ -1054,8 +1147,8 @@
                                                 <span x-show="node.flops_fp16 <= 0" class="text-muted">CPU only</span>
                                             </td>
                                             <td>
-                                                <span x-show="node.warmup_throughput" style="font-weight:700;color:#059669" x-text="node.warmup_throughput.toFixed(2) + ' s/s'"></span>
-                                                <span x-show="!node.warmup_throughput" class="text-muted">-</span>
+                                                <span x-show="node.warmup_throughput || node.training_throughput" style="font-weight:700;color:#059669" x-text="(node.warmup_throughput || node.training_throughput || 0).toFixed(2) + ' s/s'"></span>
+                                                <span x-show="!(node.warmup_throughput || node.training_throughput)" class="text-muted">-</span>
                                             </td>
                                             <td x-text="node.cpu_cores"></td>
                                             <td>
@@ -1272,27 +1365,84 @@
                         </div>
 
                         <div class="training-progress-card" x-show="trainingJob">
-                            <h3 class="training-section-title">Tiến trình training</h3>
-                            <p class="text-muted"><strong>Job:</strong> <span x-text="trainingJob.job_id"></span> · Bắt
-                                đầu: <span x-text="trainingJob.started_at"></span></p>
-                            <p class="text-muted" x-show="trainingJob.completed_at">Hoàn thành: <span
-                                    x-text="trainingJob.completed_at"></span></p>
-                            <div class="progress-bar-wrap">
-                                <div class="progress-bar" role="progressbar"
-                                    :style="'width: ' + (trainingJob.progress || 0) + '%'"
-                                    :aria-valuenow="trainingJob.progress || 0" aria-valuemin="0" aria-valuemax="100">
+                            <h3 class="training-section-title">Tiến trình Training</h3>
+                            
+                            <!-- Header: Job ID + Status -->
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+                                <div>
+                                    <p class="text-muted" style="font-size:12px;margin:0"><strong>Job:</strong> <span x-text="trainingJob.job_id?.slice(0,8) + '...'"></span></p>
+                                    <p class="text-muted" style="font-size:12px;margin:0">Bắt đầu: <span x-text="trainingJob.started_at"></span></p>
+                                </div>
+                                <span class="badge" :class="trainingJob.status === 'completed' ? 'badge-success' : trainingJob.status === 'failed' || trainingJob.status === 'cancelled' ? 'badge-muted' : 'badge'" 
+                                    style="font-size:12px;padding:6px 12px;text-transform:uppercase;letter-spacing:0.5px"
+                                    x-text="trainingJob.status"></span>
+                            </div>
+
+                            <!-- Overall Progress -->
+                            <div style="margin-bottom:20px">
+                                <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+                                    <span style="font-weight:600;font-size:13px">Tiến độ tổng thể</span>
+                                    <span x-text="(trainingJob.progress || 0) + '%'" style="color:var(--primary);font-weight:700;font-size:14px"></span>
+                                </div>
+                                <div class="progress-bar-wrap">
+                                    <div class="progress-bar" :style="'width: ' + (trainingJob.progress || 0) + '%'"></div>
                                 </div>
                             </div>
-                            <p class="text-muted"><strong x-text="trainingJob.progress + '%'">0%</strong> · Epoch <span
-                                    x-text="trainingJob.current_epoch || 0"></span> / <span
-                                    x-text="trainingJob.epochs"></span> · Trạng thái: <span class="badge"
-                                    :class="trainingJob.status === 'completed' ? 'badge-success' : trainingJob.status === 'failed' || trainingJob.status === 'cancelled' ? 'badge-muted' : 'badge'"
-                                    x-text="trainingJob.status"></span></p>
-                            <p x-show="trainingJob.current_activity" class="text-info" style="font-size: 13px; margin-top: 8px;">
-                                <i class="fas fa-sync fa-spin" x-show="['started', 'profiling'].includes(trainingJob.status)"></i>
-                                <strong>Hoạt động:</strong> <span x-text="trainingJob.current_activity"></span>
-                            </p>
-                            <p x-show="trainingJob.error" class="text-danger" x-text="'Lỗi: ' + trainingJob.error"></p>
+
+                            <!-- Step & Epoch Info (Row 1) -->
+                            <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-bottom:16px;padding:12px;background:var(--surface-hover);border-radius:var(--radius-md)">
+                                <div>
+                                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">BƯỚC (Step)</div>
+                                    <div style="font-size:16px;font-weight:700;font-family:monospace;color:var(--info)">
+                                        <span x-text="trainingJob.current_step || 0"></span> / <span x-text="trainingJob.total_steps || 0"></span>
+                                    </div>
+                                </div>
+                                <div>
+                                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">ĐỢT (Epoch)</div>
+                                    <div style="font-size:16px;font-weight:700;font-family:monospace;color:var(--success)">
+                                        <span x-text="(trainingJob.current_epoch || 0) + 1"></span> / <span x-text="trainingJob.epochs || 0"></span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Loss & Metrics (Row 2) -->
+                            <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-bottom:16px;padding:12px;background:var(--surface-hover);border-radius:var(--radius-md)">
+                                <div>
+                                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">LOSS</div>
+                                    <div style="font-size:16px;font-weight:700;font-family:monospace;color:var(--warning)">
+                                        <span x-text="trainingJob.loss != null ? trainingJob.loss.toFixed(4) : '-'"></span>
+                                    </div>
+                                </div>
+                                <div>
+                                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">TỐC ĐỘ</div>
+                                    <div style="font-size:16px;font-weight:700;font-family:monospace;color:var(--success)">
+                                        <span x-text="(trainingJob.steps_per_second || 0).toFixed(2)"></span> <span style="font-size:12px;color:var(--text-muted)">/s</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Current Activity (Highlighted) -->
+                            <div x-show="trainingJob.current_activity" style="padding:12px;background:rgba(15,118,110,0.1);border-left:3px solid var(--primary);border-radius:4px;margin-bottom:16px">
+                                <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">HOẠT ĐỘNG HIỆN TẠI</div>
+                                <div style="display:flex;align-items:center;gap:8px;font-size:13px">
+                                    <i class="fas fa-sync fa-spin" x-show="['started', 'profiling'].includes(trainingJob.status)" style="color:var(--success)"></i>
+                                    <span style="font-weight:600" x-text="trainingJob.current_activity"></span>
+                                </div>
+                            </div>
+
+                            <!-- Error Message -->
+                            <div x-show="trainingJob.error" style="padding:12px;background:rgba(239,68,68,0.1);border-left:3px solid #EF4444;border-radius:4px;margin-bottom:16px">
+                                <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">LỖI</div>
+                                <div style="font-size:12px;color:#EF4444;font-family:monospace" x-text="trainingJob.error"></div>
+                            </div>
+
+                            <!-- Remaining Info: Model, Dataset, Parameters -->
+                            <div style="padding:12px;background:var(--surface-hover);border-radius:var(--radius-md);font-size:12px;color:var(--text-muted);line-height:1.6">
+                                <div><strong>Model:</strong> <span x-text="trainingJob.model"></span></div>
+                                <div><strong>Dataset:</strong> <span x-text="trainingJob.dataset"></span></div>
+                                <div><strong>Batch size:</strong> <span x-text="trainingJob.batch_size || trainingJob.effective_batch_size || '-'"></span></div>
+                                <div x-show="trainingJob.training_strategy"><strong>Chiến lược:</strong> <span x-text="trainingJob.training_strategy"></span></div>
+                            </div>
                         </div>
                         <button type="button" class="btn btn-primary" @click="startTraining()"
                             :disabled="trainingLoading || !trainingModel || !trainingDataset || (trainingJob && trainingJob.status === 'started')">

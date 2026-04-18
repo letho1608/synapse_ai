@@ -1986,13 +1986,18 @@ class ChatGPTAPI:
         lengths = np.maximum(attention_mask.sum(axis=1), 1).astype(np.int64)
         return input_ids, labels, lengths
 
-      # FIX: Đảm bảo planned_steps chính xác và không bị Step 441/40
-      steps_per_epoch = max(1, (len(texts) + batch_size - 1) // batch_size)
+      # FIX: Tính steps chính xác - 1 step = 1 batch (dù batch có bị chia thành sub-batches hay không)
+      import math
+      steps_per_epoch = max(1, math.ceil(len(texts) / batch_size))
       planned_steps = steps_per_epoch * epochs
       if max_steps > 0:
         total_steps = max(1, min(planned_steps, max_steps))
       else:
         total_steps = max(1, planned_steps)
+      
+      if DEBUG >= 1:
+        print(f"[Training] Dataset: len(texts)={len(texts)}, batch_size={batch_size}, epochs={epochs}")
+        print(f"[Training] Calculated: steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
       
       step_count = 0
       job["total_steps"] = total_steps
@@ -2142,6 +2147,19 @@ class ChatGPTAPI:
               job["current_epoch"] = epoch 
               # Cập nhật progress dựa trên step_count thực tế
               job["progress"] = min(100, int(100 * step_count / max(1, total_steps)))
+              
+              # Tính toán tốc độ (steps per second) cho dashboard display
+              try:
+                import datetime
+                started_at_str = job.get("started_at", "")
+                if started_at_str:
+                  started_at = datetime.datetime.strptime(started_at_str, "%Y-%m-%d %H:%M:%S")
+                  elapsed_seconds = (datetime.datetime.now() - started_at).total_seconds()
+                  if elapsed_seconds > 0.5:  # Chỉ tính khi đã train đủ lâu
+                    job["steps_per_second"] = step_count / elapsed_seconds
+              except Exception:
+                pass  # Nếu lỗi, giữ nguyên steps_per_second (hoặc không set)
+              
               # Luôn đảm bảo Step trực quan trong UI
               job["current_activity"] = f"Step {step_count}/{total_steps} (Epoch {epoch+1}/{epochs})"
               
@@ -2477,8 +2495,131 @@ class ChatGPTAPI:
       nodes_raw = list(topology.all_nodes()) if topology else []
       total_flops = sum(n[1].flops.fp16 for n in nodes_raw) if nodes_raw else 0
 
+      # Map partition by node_id để nhanh tra cứu
+      partition_map = {p.node_id: p for p in partitions}
+      
       result = []
-      for partition in partitions:
+      # Ưu tiên: Đầu tiên xử lý tất cả node từ topology (để đảm bảo không bỏ sót)
+      # nếu chúng có partition, thì dùng partition; nếu không, tạo dummy partition
+      processed_node_ids = set()
+      
+      for node_id, caps in nodes_raw:
+        processed_node_ids.add(node_id)
+        partition = partition_map.get(node_id)
+        # Nếu node không có partition, tạo dummy partition (full 0-100%)
+        if not partition:
+          from .partitioning_strategy import Partition
+          partition = Partition(node_id, 0.0, 1.0, weight=1.0)
+        
+        is_self = (node_id == self.node.id)
+
+        # Tên hiển thị: dùng tailscale name nếu có, else node_id đầu 8 ký tự
+        ts_info = ts_map.get(node_id, {})
+        raw_name = ts_info.get("name")
+        if is_self:
+          display_name = "Máy này"
+        elif raw_name and raw_name != "Máy này" and raw_name != "localhost":
+          display_name = raw_name
+        else:
+          display_name = f"Node-{node_id[:8]}"
+          
+        addresses = ts_info.get("addresses") or []
+        ip = addresses[0] if addresses else ""
+
+        # Hardware từ DeviceCapabilities
+        chip = caps.chip if caps else "Unknown"
+        flops_fp16 = caps.flops.fp16 if caps else 0
+        flops_fp32 = caps.flops.fp32 if caps else 0
+        flops_int8 = caps.flops.int8 if caps else 0
+
+        gpu_count = caps.gpu_count if caps else 0
+        gpu_backend = caps.gpu_backend if caps else "Unknown"
+        
+        # Logic xác định GPU thực sự (không nhầm lẫn RAM hệ thống với VRAM)
+        has_gpu = gpu_count > 0 and gpu_backend not in ("CPU (x86)", "CPU (ARM)", "Unknown")
+        
+        if has_gpu:
+          vram_gb = round(caps.memory / 1024, 1) if caps and caps.memory else 0
+          ram_gb = round(caps.system_ram_mb / 1024, 1) if caps and caps.system_ram_mb else 0
+        else:
+          vram_gb = 0
+          # Nếu không phải GPU, lấy memory (đang chứa RAM hệ thống) hoặc system_ram_mb
+          ram_gb = round((caps.system_ram_mb or (caps.memory if caps else 0)) / 1024, 1)
+        
+        cpu_cores = caps.cpu_cores if caps else 0
+        disk_gb = caps.disk_gb if caps else 0
+
+        # Layer range từ partition (start/end là 0.0→1.0 tỷ lệ)
+        share_pct = round((partition.end - partition.start) * 100, 1)
+        # Tính flops share thực tế
+        flops_share_pct = round(flops_fp16 / total_flops * 100, 1) if total_flops > 0 else share_pct
+
+        # Real-time metrics
+        cpu_pct = caps.cpu_usage_pct if caps else 0
+        gpu_util = caps.gpu_usage_pct if caps else 0
+        ram_used_gb = round(caps.ram_used_mb / 1024, 2) if caps else 0
+        gpu_mem_used_gb = round(caps.gpu_memory_used_mb / 1024, 2) if caps else 0
+        
+        # Training throughput: Tính từ job nếu đang training, ngược lại từ DeviceCapabilities
+        training_throughput = getattr(caps, 'training_throughput', 0)
+        
+        # Nếu job đang chạy, tính training throughput từ job progress
+        if self._training_job and self._training_job.get("status") == "started":
+          try:
+            import time
+            started_at_str = self._training_job.get("started_at", "")
+            if started_at_str:
+              # Parse timestamp format: "%Y-%m-%d %H:%M:%S"
+              import datetime
+              started_at = datetime.datetime.strptime(started_at_str, "%Y-%m-%d %H:%M:%S")
+              elapsed_seconds = (datetime.datetime.now() - started_at).total_seconds()
+              
+              current_step = self._training_job.get("current_step", 0)
+              total_steps = self._training_job.get("total_steps", 1)
+              
+              # Tính throughput (steps per second)
+              if elapsed_seconds > 1.0:
+                training_throughput = current_step / elapsed_seconds
+              elif current_step > 0:
+                training_throughput = current_step  # Rough estimate
+          except Exception:
+            pass  # Nếu lỗi parsing, giữ nguyên training_throughput
+
+        result.append({
+          "node_id": node_id,
+          "name": display_name,
+          "ip": ip,
+          "is_self": is_self,
+          "chip": chip,
+          "gpu_backend": gpu_backend,
+          "has_gpu": has_gpu,
+          "vram_gb": vram_gb,
+          "ram_gb": ram_gb,
+          "cpu_cores": cpu_cores,
+          "disk_gb": disk_gb,
+          "flops_fp16": round(flops_fp16, 2),
+          "flops_fp32": round(flops_fp32, 2),
+          "flops_int8": round(flops_int8, 2),
+          "layer_start_pct": round(partition.start * 100, 1),
+          "layer_end_pct": round(partition.end * 100, 1),
+          "share_pct": share_pct,
+          "flops_share_pct": flops_share_pct,
+          # Real-time
+          "cpu_pct": cpu_pct,
+          "gpu_utilization": gpu_util,
+          "ram_used_gb": ram_used_gb,
+          "gpu_mem_used_gb": gpu_mem_used_gb,
+          "ram_total_gb": ram_gb,
+          "warmup_throughput": caps.warmup_throughput if caps else 0,
+          "training_throughput": training_throughput,
+          "current_activity": caps.current_activity if caps else "",
+          "last_seen_secs": round(time.time() - caps.last_updated, 1) if caps and hasattr(caps, "last_updated") else None,
+        })
+      
+      # Nếu topology rỗng hoặc vẫn không có node nào, thêm máy này
+      if not result:
+        try:
+          specs_self = self.node.device_capabilities
         node_id = partition.node_id
         caps = topology.get_node(node_id) if topology else None
         is_self = (node_id == self.node.id)
