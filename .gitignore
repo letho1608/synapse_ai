@@ -5,11 +5,19 @@ env/
 bin/
 lib/
 share/
+*.md
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Testing
+tests/
+test_*.py
+
+# Documentation & Markdown
+*.md
 
 # IDEs
 .vscode/

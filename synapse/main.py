@@ -18,6 +18,8 @@ from synapse.networking.tailscale.tailscale_discovery import TailscaleDiscovery
 from synapse.networking.grpc.grpc_peer_handle import GRPCPeerHandle
 from synapse.topology.ring_memory_weighted_partitioning_strategy import RingMemoryWeightedPartitioningStrategy
 from synapse.api import ChatGPTAPI
+from synapse.api.metrics_streaming import get_metrics_stream_manager
+from synapse.api.websocket_metrics import setup_websocket_routes
 # REFACTORED IMPORTS
 from synapse.loading import ShardDownloader, RepoProgressEvent, create_local_model_loader, get_models_dir
 from synapse.helpers import find_available_port, DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, terminal_link, shutdown, check_model_hardware_fit
@@ -158,6 +160,19 @@ api = ChatGPTAPI(
   system_prompt=args.system_prompt,
   chatgpt_api_port=args.chatgpt_api_port,
 )
+
+# ✅ Initialize real-time metrics streaming
+stream_manager = get_metrics_stream_manager()
+ws_handler, http_handler = setup_websocket_routes(api.app, stream_manager)
+api.stream_manager = stream_manager
+api.ws_handler = ws_handler
+api.http_handler = http_handler
+
+if DEBUG >= 1:
+  print(f"[METRICS] Real-time metrics streaming initialized")
+  print(f"[METRICS] WebSocket endpoints: /v1/ws/training/metrics, /v1/ws/training/sync")
+  print(f"[METRICS] HTTP endpoints: /v1/training/metrics/history, /v1/training/sync/history")
+
 buffered_token_output = {}
 def update_topology_viz(req_id, tokens, is_finished):
   if not topology_viz: return

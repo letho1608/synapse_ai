@@ -59,6 +59,11 @@ class TailscaleDiscovery(Discovery):
     self.probe_failure_cache: Dict[str, float] = {} # Mới: Cache các IP bị lỗi (IP -> timestamp) để tránh spam
     self._tailscale_devices_cache: Dict[str, Device] = {} # Mới: Cache danh sách thiết bị
     self._tailscale_cache_timestamp: float = 0 # Mới: Timestamp của cache
+    # ✅ IMPROVEMENT 1: Adaptive Peer Timeout
+    self.peer_timeout_adaptive = True
+    self.peer_timeout_base = 60  # 1 minute for dynamic envs (vs 600s fixed)
+    self.peer_timeout_max = 600
+    self.peer_failure_history: Dict[str, List[float]] = {}  # peer_id -> list of failure timestamps
     self.discovery_task = None
     self.cleanup_task = None
     self.tailscale_api_key = tailscale_api_key
@@ -248,6 +253,34 @@ class TailscaleDiscovery(Discovery):
         await asyncio.sleep(0.1)
     return [peer_handle for peer_handle, _, _ in self.known_peers.values()]
 
+  def _calculate_adaptive_timeout(self, peer_id: str) -> int:
+    """
+    ✅ IMPROVEMENT 1: Calculate timeout based on peer failure history
+    
+    Peers with frequent failures get shorter timeouts for faster churn detection
+    Peers with no failures keep maximum timeout
+    """
+    if not self.peer_timeout_adaptive:
+      return self.discovery_timeout
+    
+    # Count failures in last 5 minutes
+    now = time.time()
+    recent_failures = len([
+        t for t in self.peer_failure_history.get(peer_id, [])
+        if now - t < 300  # 5 minute window
+    ])
+    
+    # More failures = shorter timeout (detect churn faster)
+    if recent_failures > 3:
+      # Exponential backoff: timeout decreases as failures increase
+      timeout = max(self.peer_timeout_base, self.peer_timeout_max // (recent_failures + 1))
+      if DEBUG_DISCOVERY >= 2:
+        print(f"  Adaptive timeout for {peer_id}: {timeout}s (recent_failures={recent_failures})")
+      return timeout
+    
+    # Default: Base timeout + slight variance based on history depth
+    return min(self.peer_timeout_base + (60 * max(0, 1 - recent_failures / 5)), self.peer_timeout_max)
+
   async def task_cleanup_peers(self):
     while True:
       try:
@@ -287,9 +320,41 @@ class TailscaleDiscovery(Discovery):
       health_ok = await peer_handle.health_check()
     except Exception as e:
       if DEBUG_DISCOVERY >= 2: print(f"Error checking peer {peer_id}: {e}")
+      # Record failure in history for adaptive timeout
+      if peer_id not in self.peer_failure_history:
+        self.peer_failure_history[peer_id] = []
+      self.peer_failure_history[peer_id].append(current_time)
+      # Keep only recent failures (last 5 minutes)
+      cutoff = current_time - 300
+      self.peer_failure_history[peer_id] = [
+          t for t in self.peer_failure_history[peer_id] if t > cutoff
+      ]
       return True
 
-    should_remove = ((not is_connected and current_time - connected_at > self.discovery_timeout) or (current_time - last_seen > self.discovery_timeout) or (not health_ok))
+    # ✅ IMPROVEMENT 1: Use adaptive timeout instead of fixed discovery_timeout
+    timeout = self._calculate_adaptive_timeout(peer_id)
+    
+    should_remove = (
+        (not is_connected and current_time - connected_at > timeout) 
+        or (current_time - last_seen > timeout) 
+        or (not health_ok)
+    )
+    
+    if not health_ok or (current_time - last_seen > timeout):
+      # Record failure for adaptive timeout calculation
+      if peer_id not in self.peer_failure_history:
+        self.peer_failure_history[peer_id] = []
+      self.peer_failure_history[peer_id].append(current_time)
+      # Keep only recent failures (last 5 minutes)
+      cutoff = current_time - 300
+      self.peer_failure_history[peer_id] = [
+          t for t in self.peer_failure_history[peer_id] if t > cutoff
+      ]
+    else:
+      # Successful check: clear failure history for this peer
+      if peer_id in self.peer_failure_history:
+        self.peer_failure_history[peer_id] = []
+    
     return should_remove
 
   async def get_devices_for_ui(self) -> List[Dict]:
