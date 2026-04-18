@@ -85,12 +85,15 @@ class GRPCPeerHandle(PeerHandle):
       raise
 
   async def is_connected(self) -> bool:
-    if self.channel is None:
+    if self.channel is None or self.stub is None:
       return False
-    state = self.channel.get_state()
-    # Chỉ coi là connected nếu channel ở trạng thái READY
-    # Các trạng thái khác (CONNECTING, TRANSIENT_FAILURE, SHUTDOWN) đều không phải connected
-    return state == grpc.ChannelConnectivity.READY
+    try:
+      state = self.channel.get_state()
+      # Chỉ coi là connected nếu channel ở trạng thái READY
+      # Các trạng thái khác (CONNECTING, TRANSIENT_FAILURE, SHUTDOWN) đều không phải connected
+      return state == grpc.ChannelConnectivity.READY
+    except Exception:
+      return False
 
   async def disconnect(self):
     if self.channel:
@@ -120,8 +123,18 @@ class GRPCPeerHandle(PeerHandle):
           await self.disconnect()
         else:
           raise
-      except Exception:
-        raise
+      except Exception as e:
+        last_exc = e
+        error_msg = str(e)
+        if DEBUG >= 2:
+          print(f"Unexpected error calling {rpc_name} on {self._id}@{self.address} (attempt {attempt}/{self.max_rpc_retries}): {e}")
+        
+        # Đặc biệt xử lý "Channel is closed" hoặc "UsageError" bằng cách disconnect để force reconnect
+        if "Channel is closed" in error_msg or "UsageError" in error_msg:
+          await self.disconnect()
+        
+        if attempt >= self.max_rpc_retries:
+          raise
 
       if attempt < self.max_rpc_retries:
         delay = self.rpc_retry_base_delay * attempt

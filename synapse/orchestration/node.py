@@ -1098,8 +1098,15 @@ class Node:
         continue
 
       try:
+        # Kiểm tra trạng thái kết nối cơ bản trước khi gọi RPC nặng
+        is_p_connected = await peer.is_connected()
+        if not is_p_connected:
+          if DEBUG >= 3: print(f"Peer {peer.id()} is not connected, attempting collection anyway (will trigger auto-connect)")
+        
         # Tăng timeout lên 30.0s để kiên nhẫn hơn với các node đang bận
+        # GRPCPeerHandle.collect_topology giờ đã có cơ chế tự động reconnect nếu lỗi kênh (Channel is closed)
         other_topology = await asyncio.wait_for(peer.collect_topology(visited, max_depth=max_depth - 1), timeout=30.0)
+        
         if DEBUG >= 2: print(f"Collected topology from: {peer.id()}: {other_topology}")
         next_topology.merge(peer.id(), other_topology)
       except asyncio.TimeoutError:

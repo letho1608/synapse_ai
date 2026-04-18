@@ -4,6 +4,7 @@ import uuid
 import time
 import asyncio
 import json
+import datetime
 import os
 import psutil
 from pathlib import Path
@@ -2533,6 +2534,9 @@ class ChatGPTAPI:
         return web.json_response(self._cluster_resources_cache)
 
       topology = self.node.current_topology
+      if DEBUG >= 1:
+        print(f"[ChatGPTAPI] [DEBUG] handle_get_cluster_resources: topology={type(topology).__name__}, nodes={list(topology.all_nodes()) if topology else 'None'}")
+      
       partitions = []
       total_layers = 32  # default
       if topology and self.node.partitioning_strategy:
@@ -2623,11 +2627,9 @@ class ChatGPTAPI:
         # Nếu job đang chạy, tính training throughput từ job progress
         if self._training_job and self._training_job.get("status") == "started":
           try:
-            import time
             started_at_str = self._training_job.get("started_at", "")
             if started_at_str:
               # Parse timestamp format: "%Y-%m-%d %H:%M:%S"
-              import datetime
               started_at = datetime.datetime.strptime(started_at_str, "%Y-%m-%d %H:%M:%S")
               elapsed_seconds = (datetime.datetime.now() - started_at).total_seconds()
               
@@ -2673,8 +2675,10 @@ class ChatGPTAPI:
           "last_seen_secs": round(time.time() - caps.last_updated, 1) if caps and hasattr(caps, "last_updated") else None,
         })
       
-      # Nếu topology rỗng hoặc vẫn không có node nào, thêm máy này
-      if not result:
+      # Nếu topology rỗng hoặc vẫn không có node nào, THÊM MÁY NÀY một cách an toàn
+      is_self_included = any(n.get("is_self") for n in result)
+      if not is_self_included:
+        if DEBUG >= 1: print("[ChatGPTAPI] [INFO] Local node not in topology, adding fallback info...")
         try:
           specs_self = self.node.device_capabilities
           cpu_pct_s = psutil.cpu_percent()
@@ -2739,16 +2743,30 @@ class ChatGPTAPI:
         except Exception:
           pass
 
-      return web.json_response({
+      final_response = {
         "nodes": result,
         "total_nodes": len(result),
         "peer_graph": peer_graph,
         "training_job": self._training_job,
-      })
+      }
+      
+      # Cập nhật cache
+      self._cluster_resources_cache = final_response
+      self._cluster_resources_time = current_time
+      
+      return web.json_response(final_response)
     except Exception as e:
       if DEBUG >= 1:
+        print(f"[ChatGPTAPI] Error in handle_get_cluster_resources: {e}")
         traceback.print_exc()
-      return web.json_response({"nodes": [], "total_nodes": 0, "peer_graph": {}, "training_job": None}, status=500)
+      # Trả về cấu trúc mặc định thay vì 500 để UI có thể xử lý mượt mà
+      return web.json_response({
+        "nodes": [],
+        "total_nodes": 0,
+        "peer_graph": {},
+        "training_job": None,
+        "error": str(e)
+      })
 
   async def handle_tokens(self, request_id: str, tokens: List[int], is_finished: bool):
     token_len = len(tokens) if isinstance(tokens, (list, tuple)) else "?"
