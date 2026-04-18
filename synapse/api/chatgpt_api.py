@@ -2620,92 +2620,6 @@ class ChatGPTAPI:
       if not result:
         try:
           specs_self = self.node.device_capabilities
-        node_id = partition.node_id
-        caps = topology.get_node(node_id) if topology else None
-        is_self = (node_id == self.node.id)
-
-        # Tên hiển thị: dùng tailscale name nếu có, else node_id đầu 8 ký tự
-        ts_info = ts_map.get(node_id, {})
-        # [FIX] Tránh trùng tên "Máy này" - máy kia dù có tự đặt là "Máy này" thì ở đây vẫn hiện ID/Hostname
-        raw_name = ts_info.get("name")
-        if is_self:
-          display_name = "Máy này"
-        elif raw_name and raw_name != "Máy này" and raw_name != "localhost":
-          display_name = raw_name
-        else:
-          display_name = f"Node-{node_id[:8]}"
-          
-        addresses = ts_info.get("addresses") or []
-        ip = addresses[0] if addresses else ""
-
-        # Hardware từ DeviceCapabilities
-        chip = caps.chip if caps else "Unknown"
-        flops_fp16 = caps.flops.fp16 if caps else 0
-        flops_fp32 = caps.flops.fp32 if caps else 0
-        flops_int8 = caps.flops.int8 if caps else 0
-
-        gpu_count = caps.gpu_count if caps else 0
-        gpu_backend = caps.gpu_backend if caps else "Unknown"
-        
-        # Logic xác định GPU thực sự (không nhầm lẫn RAM hệ thống với VRAM)
-        has_gpu = gpu_count > 0 and gpu_backend not in ("CPU (x86)", "CPU (ARM)", "Unknown")
-        
-        if has_gpu:
-          vram_gb = round(caps.memory / 1024, 1) if caps and caps.memory else 0
-          ram_gb = round(caps.system_ram_mb / 1024, 1) if caps and caps.system_ram_mb else 0
-        else:
-          vram_gb = 0
-          # Nếu không phải GPU, lấy memory (đang chứa RAM hệ thống) hoặc system_ram_mb
-          ram_gb = round((caps.system_ram_mb or (caps.memory if caps else 0)) / 1024, 1)
-        
-        cpu_cores = caps.cpu_cores if caps else 0
-        disk_gb = caps.disk_gb if caps else 0
-
-        # Layer range từ partition (start/end là 0.0→1.0 tỷ lệ)
-        share_pct = round((partition.end - partition.start) * 100, 1)
-        # Tính flops share thực tế
-        flops_share_pct = round(flops_fp16 / total_flops * 100, 1) if total_flops > 0 else share_pct
-
-        # Real-time metrics
-        cpu_pct = caps.cpu_usage_pct if caps else 0
-        gpu_util = caps.gpu_usage_pct if caps else 0
-        ram_used_gb = round(caps.ram_used_mb / 1024, 2) if caps else 0
-        gpu_mem_used_gb = round(caps.gpu_memory_used_mb / 1024, 2) if caps else 0
-
-        result.append({
-          "node_id": node_id,
-          "name": display_name,
-          "ip": ip,
-          "is_self": is_self,
-          "chip": chip,
-          "gpu_backend": gpu_backend,
-          "has_gpu": has_gpu,
-          "vram_gb": vram_gb,
-          "ram_gb": ram_gb,
-          "cpu_cores": cpu_cores,
-          "disk_gb": disk_gb,
-          "flops_fp16": round(flops_fp16, 2),
-          "flops_fp32": round(flops_fp32, 2),
-          "flops_int8": round(flops_int8, 2),
-          "layer_start_pct": round(partition.start * 100, 1),
-          "layer_end_pct": round(partition.end * 100, 1),
-          "share_pct": share_pct,
-          "flops_share_pct": flops_share_pct,
-          # Real-time
-          "cpu_pct": cpu_pct,
-          "gpu_utilization": gpu_util,
-          "ram_used_gb": ram_used_gb,
-          "gpu_mem_used_gb": gpu_mem_used_gb,
-          "ram_total_gb": ram_gb,
-          "warmup_throughput": caps.warmup_throughput if caps else 0,
-          "current_activity": caps.current_activity if caps else "",
-          "last_seen_secs": round(time.time() - caps.last_updated, 1) if caps and hasattr(caps, "last_updated") else None,
-        })
-
-      # Nếu không có partitions (chỉ 1 node, chưa kết nối), tạo entry cho máy này
-      if not result:
-        try:
-          specs_self = self.node.device_capabilities
           cpu_pct_s = psutil.cpu_percent()
           ram_s = psutil.virtual_memory()
           chip_s = specs_self.chip if specs_self else "Unknown"
@@ -2748,6 +2662,8 @@ class ChatGPTAPI:
             "gpu_mem_used_gb": round((specs_self.gpu_memory_used_mb if specs_self else 0) / 1024, 2),
             "ram_total_gb": ram_s_gb,
           })
+        except Exception:
+          pass
         except Exception:
           pass
 
