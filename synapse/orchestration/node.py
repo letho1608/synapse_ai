@@ -1,6 +1,7 @@
 import numpy as np
 import json
 import asyncio
+import grpc
 import uuid
 import time
 import traceback
@@ -449,6 +450,18 @@ class Node:
       if train:
         if shard.is_last_layer():
           self.outstanding_requests[request_id] = "training"
+          # ─── DISTRIBUTED: Node này là LAST LAYER, tự train ─────────
+          is_from_remote = shard.start_layer > 0  # Không phải first layer → nhận từ node khác
+          if is_from_remote:
+            print(
+              f"\n[DISTRIBUTED-TRAIN] 🎯  NODE RECEIVER [{self.id[:8]}]"
+              f" | Nhận intermediate tensor từ node khác"
+              f" | shard={shard.start_layer}-{shard.end_layer}/{shard.n_layers-1}"
+              f" | example_shape={example.shape}"
+              f" | request={request_id[:8]}"
+              f" → Đang tính loss & backward..."
+            )
+          # ────────────────────────────────────────────────────────────
           loss, grad = await self.inference_engine.train(request_id, shard, example, target, length)
         else:
           self.outstanding_requests[request_id] = "preprocessing"
@@ -543,8 +556,94 @@ class Node:
     if not target_peer:
       raise ValueError(f"peer for {target_index} not found")
     if DEBUG >= 1: print(f"sending example to {target_peer.id()}: {step} => {target} ({length})")
-    resp = await target_peer.send_example(target_shard, step, target, length, request_id=request_id, train=train)
-    return resp
+
+    # ─── DISTRIBUTED TRAINING DETECTION ─────────────────────────────
+    action = "TRAIN" if train else "EVAL"
+    print(
+      f"\n[DISTRIBUTED-{action}] ✈  NODE SENDER  [{self.id[:8]}]"
+      f" → NODE RECEIVER [{target_peer.id()[:8]}]"
+      f" | shard={target_shard.start_layer}-{target_shard.end_layer}/{target_shard.n_layers-1}"
+      f" | tensor_shape={step.shape}"
+      f" | request={request_id[:8]}"
+    )
+    # ─────────────────────────────────────────────────────────────────
+
+    try:
+      resp = await asyncio.wait_for(
+        target_peer.send_example(target_shard, step, target, length, request_id=request_id, train=train),
+        timeout=30.0,
+      )
+      print(
+        f"[DISTRIBUTED-{action}] ✅  Gửi thành công [{self.id[:8]}] → [{target_peer.id()[:8]}]"
+        f" | request={request_id[:8]}"
+      )
+      return resp
+
+    except asyncio.TimeoutError:
+      # wait_for(30s) hết hạn — bao gồm cả 3 lần retry bên trong _rpc_with_retry
+      print(
+        f"\n[DISTRIBUTED-ERROR] ⏰  TIMEOUT (30s)"
+        f"\n  Sender  : [{self.id[:8]}]"
+        f"\n  Receiver: [{target_peer.id()[:8]}] @ {target_peer.addr()}"
+        f"\n  Node B không phản hồi — có thể treo hoặc quá tải"
+        f"\n  request={request_id[:8]} | tensor_shape={step.shape}"
+      )
+      raise RuntimeError(
+        f"[Distributed] Timeout 30s: Node B [{target_peer.id()[:8]}] không phản hồi."
+      )
+
+    except grpc.aio.AioRpcError as e:
+      # Lỗi gRPC thực — xảy ra sau khi _rpc_with_retry đã thử 3 lần
+      code = e.code()
+      if code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
+        # Node B đã tắt hoặc mất mạng (sau 3 lần retry)
+        print(
+          f"\n[DISTRIBUTED-ERROR] 🔌  NODE B KHÔNG KHẢ DỤNG [{code.name}]"
+          f"\n  Sender  : [{self.id[:8]}]"
+          f"\n  Receiver: [{target_peer.id()[:8]}] @ {target_peer.addr()}"
+          f"\n  Đã retry {target_peer.max_rpc_retries} lần nhưng vẫn thất bại"
+          f"\n  request={request_id[:8]}"
+        )
+        raise RuntimeError(
+          f"[Distributed] Node B [{target_peer.id()[:8]}] không kết nối được ({code.name}). "
+          f"Node B có thể đã tắt hoặc mất mạng."
+        ) from e
+      else:
+        # Lỗi gRPC khác (PERMISSION_DENIED, UNIMPLEMENTED, DATA_LOSS...)
+        print(
+          f"\n[DISTRIBUTED-ERROR] ❌  gRPC ERROR [{code.name}]"
+          f"\n  Sender  : [{self.id[:8]}]"
+          f"\n  Receiver: [{target_peer.id()[:8]}] @ {target_peer.addr()}"
+          f"\n  Chi tiết: {e.details()}"
+          f"\n  request={request_id[:8]}"
+        )
+        raise
+
+    except ConnectionError as e:
+      # _rpc_with_retry hết 3 lần retry và tự raise ConnectionError
+      print(
+        f"\n[DISTRIBUTED-ERROR] 🔌  KẾT NỐI THẤT BẠI (sau {target_peer.max_rpc_retries} lần retry)"
+        f"\n  Sender  : [{self.id[:8]}]"
+        f"\n  Receiver: [{target_peer.id()[:8]}] @ {target_peer.addr()}"
+        f"\n  Chi tiết: {e}"
+        f"\n  request={request_id[:8]}"
+      )
+      raise RuntimeError(
+        f"[Distributed] Mất kết nối tới Node B [{target_peer.id()[:8]}] @ {target_peer.addr()}."
+      ) from e
+
+    except Exception as e:
+      # Mọi lỗi không mong đợi (serialization, OOM bên Node B...)
+      print(
+        f"\n[DISTRIBUTED-ERROR] 💥  LỖI KHÔNG XÁC ĐỊNH [{type(e).__name__}]"
+        f"\n  Sender  : [{self.id[:8]}]"
+        f"\n  Receiver: [{target_peer.id()[:8]}] @ {target_peer.addr()}"
+        f"\n  shard={target_shard.start_layer}-{target_shard.end_layer}/{target_shard.n_layers-1}"
+        f"\n  Chi tiết: {e}"
+        f"\n  request={request_id[:8]}"
+      )
+      traceback.print_exc()
+      raise
 
   async def forward_prompt(
       self,
