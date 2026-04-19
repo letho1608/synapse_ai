@@ -5,7 +5,6 @@ Chay: pytest tests/test_network_config.py -v
 import sys
 import os
 import tempfile
-import json
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -23,7 +22,6 @@ def test_network_topology_from_path():
     assert peer.port == 50051
     assert peer.device_capabilities is not None
     assert peer.device_capabilities.model == "Unknown Model"
-    print("  [OK] test_network_topology_from_path")
 
 
 def test_network_topology_file_not_found():
@@ -32,7 +30,6 @@ def test_network_topology_file_not_found():
     from synapse.networking.manual.network_topology_config import NetworkTopology
     with pytest.raises(FileNotFoundError):
         NetworkTopology.from_path("/nonexistent/path/config.json")
-    print("  [OK] test_network_topology_file_not_found")
 
 
 def test_network_topology_invalid_json():
@@ -52,7 +49,6 @@ def test_network_topology_invalid_json():
                 NetworkTopology.from_path(path)
         finally:
             os.unlink(path)
-    print("  [OK] test_network_topology_invalid_json")
 
 
 def test_device_capabilities():
@@ -69,4 +65,3 @@ def test_device_capabilities():
     d = cap.to_dict()
     assert "model" in d and d["model"] == "Test"
     assert UNKNOWN_DEVICE_CAPABILITIES.model == "Unknown Model"
-    print("  [OK] test_device_capabilities")

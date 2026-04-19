@@ -65,10 +65,7 @@ class InferenceEngine(ABC):
       empty_logits = np.zeros((1, 0, vocab_size), dtype=np.float32)
       return empty_logits, inference_state
     
-    if shard.model_id != 'stable-diffusion-2-1-base':
-      x = tokens.reshape(1, -1)
-    else:
-      x = tokens
+    x = tokens.reshape(1, -1)
     output_data, inference_state = await self.infer_tensor(request_id, shard, x, inference_state)
 
     return output_data, inference_state

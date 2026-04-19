@@ -64,24 +64,24 @@ parser.add_argument("--discovery-timeout", type=int, default=30, help="Discovery
 parser.add_argument("--discovery-config-path", type=str, default=None, help="Path to discovery config json file")
 parser.add_argument("--wait-for-peers", type=int, default=0, help="Number of peers to wait to connect to before starting")
 parser.add_argument("--chatgpt-api-port", type=int, default=52415, help="ChatGPT API port")
-parser.add_argument("--chatgpt-api-response-timeout", type=int, default=900, help="ChatGPT API response timeout in seconds")
+parser.add_argument("--chatgpt-api-response-timeout", type=int, default=600, help="ChatGPT API response timeout in seconds")
 parser.add_argument("--max-generate-tokens", type=int, default=10000, help="Max tokens to generate in each request")
 parser.add_argument("--inference-engine", type=str, default="pytorch", help="Inference engine (pytorch)")
 parser.add_argument("--disable-tui", action=argparse.BooleanOptionalAction, default=True, help="Disable TUI (default: on)")
 parser.add_argument("--run-model", type=str, help="Specify a model to run directly")
 parser.add_argument("--prompt", type=str, help="Prompt for the model when using --run-model", default="")
-parser.add_argument("--default-temp", type=float, help="Default token sampling temperature", default=0.0)
-# Tailscale API key: Hardcode trực tiếp ở đây (thay giá trị bên dưới)
-# Có thể override bằng command line argument --tailscale-api-key nếu cần
-TAILSCALE_API_KEY_DEFAULT = "tskey-api-kZkPWrVyM311CNTRL-91psFey7AHYgSzXpLr7GJYKZm43RZkXVD"  # TODO: Thay bằng API key thật của bạn
-parser.add_argument("--tailscale-api-key", type=str, default=TAILSCALE_API_KEY_DEFAULT, help="Tailscale API key (mặc định lấy từ hardcode trong code)")
-# Tailnet name: Hardcode trực tiếp ở đây (thay giá trị bên dưới)
-# Có thể override bằng command line argument --tailnet-name nếu cần
-TAILNET_NAME_DEFAULT = "testdoki925@gmail.com"  # TODO: Thay bằng tailnet name thật của bạn
-parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (mặc định lấy từ hardcode trong code)")
+parser.add_argument("--default-temp", type=float, help="Default token sampling temperature", default=0.7)
+# Tailscale API key: Provide your API key here
+# Can be overridden with --tailscale-api-key
+TAILSCALE_API_KEY_DEFAULT = "tskey-api-kZkPWrVyM311CNTRL-91psFey7AHYgSzXpLr7GJYKZm43RZkXVD"
+parser.add_argument("--tailscale-api-key", type=str, default=TAILSCALE_API_KEY_DEFAULT, help="Tailscale API key (defaults to hardcoded value)")
+# Tailnet name: Provide your tailnet name here
+# Can be overridden with --tailnet-name
+TAILNET_NAME_DEFAULT = "testdoki925@gmail.com"
+parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (defaults to hardcoded value)")
 parser.add_argument("--node-id-filter", type=str, default=None, help="Comma separated list of allowed node IDs (only for UDP and Tailscale discovery)")
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
-parser.add_argument("--system-prompt", type=str, default="Bạn là AI thuộc hệ thống Synapse AI Server do đội ngũ NCKH 2026 của trường Đại học Mỏ-Địa chất phát triển.", help="System prompt for the ChatGPT API")
+parser.add_argument("--system-prompt", type=str, default="Bạn là trợ lý Synapse AI. Hãy luôn trả lời bằng tiếng Việt một cách hữu ích và chính xác.", help="System prompt for the ChatGPT API")
 args = parser.parse_args()
 
 system_info = get_system_info()
@@ -120,9 +120,9 @@ elif args.discovery_module == "tailscale":
   tailnet_name = args.tailnet_name
   
   if not tailscale_api_key or tailscale_api_key == "tskey-api-xxxxx-xxxxx":
-    raise ValueError("Tailscale API key is required. Vui lòng sửa giá trị TAILSCALE_API_KEY_DEFAULT trong file main.py hoặc dùng --tailscale-api-key")
+    raise ValueError("Tailscale API key is required. Please provide it via TAILSCALE_API_KEY_DEFAULT or --tailscale-api-key")
   if not tailnet_name or tailnet_name == "your-org":
-    raise ValueError("Tailnet name is required. Vui lòng sửa giá trị TAILNET_NAME_DEFAULT trong file main.py hoặc dùng --tailnet-name")
+    raise ValueError("Tailnet name is required. Please provide it via TAILNET_NAME_DEFAULT or --tailnet-name")
   
   discovery = TailscaleDiscovery(
     args.node_id,
@@ -169,7 +169,6 @@ buffered_token_output = {}
 def update_topology_viz(req_id, tokens, is_finished):
   if not topology_viz: return
   if not node.inference_engine.shard: return
-  if node.inference_engine.shard.model_id == 'stable-diffusion-2-1-base': return
   # CRITICAL FIX: Always update buffer, even with empty tokens
   if req_id in buffered_token_output: 
     buffered_token_output[req_id].extend(tokens)
@@ -402,12 +401,12 @@ async def main():
                                                    , loadline=lambda line: json.loads(line).get("text",""))
       if args.command == 'eval':
         if not model_name:
-          print("Error: Much like a human, I can't evaluate anything without a model")
+          print("Error: Model name is required for evaluation")
           return
         await eval_model_cli(node, model_name, dataloader, args.batch_size)
       else:
         if not model_name:
-          print("Error: This train ain't leaving the station without a model")
+          print("Error: Model name is required for training")
           return
         await train_model_cli(node, model_name, dataloader, args.batch_size, args.iters, save_interval=args.save_every, checkpoint_dir=args.save_checkpoint_dir)
 

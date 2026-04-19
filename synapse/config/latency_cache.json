@@ -1,21 +1,14 @@
 {
   "version": "1.0",
-  "timestamp": 1776357524.5252135,
+  "timestamp": 1776603958.8277326,
   "matrix": {
-    "node1": {
-      "node1": 0.0,
-      "node2": 50.0,
-      "node3": 50.0
+    "NODE-A": {
+      "NODE-A": 0.0,
+      "NODE-B": 50.0
     },
-    "node2": {
-      "node1": 50.0,
-      "node2": 0.0,
-      "node3": 50.0
-    },
-    "node3": {
-      "node1": 50.0,
-      "node2": 50.0,
-      "node3": 0.0
+    "NODE-B": {
+      "NODE-A": 50.0,
+      "NODE-B": 0.0
     }
   }
 }
