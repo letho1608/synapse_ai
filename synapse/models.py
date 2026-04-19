@@ -6,6 +6,7 @@ Thay thế model_cards cũ bằng hệ thống registry linh hoạt hơn
 
 from synapse.inference.shard import Shard
 from typing import Optional, List, Dict, Any
+from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS
 
 
 # Registry đơn giản để quản lý mô hình
@@ -46,6 +47,9 @@ def get_repo(model_id: str, inference_engine_classname: str) -> Optional[str]:
         Path đến mô hình hoặc None
     """
     if model_id not in _MODEL_REGISTRY:
+        # Dự phòng: Nếu có trong danh sách HF thì dùng chính model_id làm path
+        if model_id in HF_MODELS or any(v == model_id for v in HF_MODELS.values()):
+            return model_id
         return None
     
     model_info = _MODEL_REGISTRY[model_id]
@@ -65,7 +69,7 @@ def get_repo(model_id: str, inference_engine_classname: str) -> Optional[str]:
 def get_pretty_name(model_id: str) -> Optional[str]:
     """Lấy tên đẹp của mô hình"""
     if model_id not in _MODEL_REGISTRY:
-        return None
+        return model_id
     return _MODEL_REGISTRY[model_id].get("pretty_name", model_id)
 
 
@@ -80,11 +84,20 @@ def build_base_shard(model_id: str, inference_engine_classname: str) -> Optional
     Returns:
         Shard object hoặc None
     """
-    if model_id not in _MODEL_REGISTRY:
-        return None
+    n_layers = 0
     
-    model_info = _MODEL_REGISTRY[model_id]
-    n_layers = model_info.get("layers", 0)
+    if model_id in _MODEL_REGISTRY:
+        model_info = _MODEL_REGISTRY[model_id]
+        n_layers = model_info.get("layers", 0)
+    elif model_id in HF_MODEL_LAYERS:
+        # Dự phòng từ danh sách động (hf_models.json)
+        n_layers = HF_MODEL_LAYERS[model_id]
+    else:
+        # Thử tìm kiếm mờ trong HF_MODEL_LAYERS
+        for k, v in HF_MODEL_LAYERS.items():
+            if k.lower() == model_id.lower():
+                n_layers = v
+                break
     
     if n_layers < 1:
         return None
@@ -110,21 +123,30 @@ def get_supported_models(supported_inference_engine_lists: Optional[List[List[st
     Returns:
         List model IDs
     """
-    if not supported_inference_engine_lists:
-        return list(_MODEL_REGISTRY.keys())
-    
-    # TODO: Filter by inference engine if needed
-    return list(_MODEL_REGISTRY.keys())
+    models = set(_MODEL_REGISTRY.keys())
+    models.update(HF_MODELS.values())
+    return sorted(list(models))
 
 
 def list_models() -> List[str]:
     """Liệt kê tất cả mô hình"""
-    return list(_MODEL_REGISTRY.keys())
+    models = set(_MODEL_REGISTRY.keys())
+    models.update(HF_MODELS.values())
+    return sorted(list(models))
 
 
 def get_model_info(model_id: str) -> Optional[Dict[str, Any]]:
     """Lấy thông tin mô hình"""
-    return _MODEL_REGISTRY.get(model_id)
+    if model_id in _MODEL_REGISTRY:
+        return _MODEL_REGISTRY[model_id]
+    
+    if model_id in HF_MODELS.values():
+        # Tạo info cơ bản cho model từ HF
+        return {
+            "layers": HF_MODEL_LAYERS.get(model_id, 0),
+            "pretty_name": model_id
+        }
+    return None
 
 
 # ============================================================================
@@ -152,5 +174,6 @@ register_model(
     hidden_size=768,
     vocab_size=50257
 )
+
 
 # Custom models có thể được thêm vào đây hoặc từ file config

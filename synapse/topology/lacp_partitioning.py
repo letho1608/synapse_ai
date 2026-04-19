@@ -62,10 +62,22 @@ class LACPPartitioningStrategy(PartitioningStrategy):
         # Cached values
         self._cached_latency_matrix: Optional[Dict[str, Dict[str, float]]] = None
         self._cached_clusters: Optional[List[MachineCluster]] = None
+        # Cache kết quả phân vùng cuối cùng
+        self._cached_partitions: Optional[List[Partition]] = None
+        self._cached_topology_fingerprint: Optional[str] = None
+        self._cached_model_id: Optional[str] = None
+
+    def _get_topology_fingerprint(self, topology: Topology) -> str:
+        """Tạo fingerprint duy nhất cho topology dựa trên node IDs và memory."""
+        nodes_info = []
+        for node_id in sorted(topology.nodes.keys()):
+            node = topology.nodes[node_id]
+            nodes_info.append(f"{node_id}:{node.memory}")
+        return "|".join(nodes_info)
     
     def partition(self, topology: Topology, base_shard: Optional[Shard] = None) -> List[Partition]:
         """
-        Main entry point - chia model dựa trên LACP.
+        Main entry point - chia model dựa trên LACP với cơ chế cache.
         
         Args:
             topology: Topology chứa các nodes
@@ -78,6 +90,15 @@ class LACPPartitioningStrategy(PartitioningStrategy):
         if len(nodes) <= 1:
             node_id = nodes[0] if nodes else "localhost"
             return [Partition(node_id=node_id, start=0.0, end=1.0)]
+
+        # --- Kiểm tra Cache ---
+        current_fingerprint = self._get_topology_fingerprint(topology)
+        current_model_id = base_shard.model_id if base_shard else "unknown"
+        
+        if (self._cached_partitions and 
+            self._cached_topology_fingerprint == current_fingerprint and 
+            self._cached_model_id == current_model_id):
+            return self._cached_partitions
 
         # 1. Get latency matrix
         latency_matrix = self._get_latency_prober().get_matrix(topology)
@@ -99,10 +120,14 @@ class LACPPartitioningStrategy(PartitioningStrategy):
             layer_profiles=layer_profiles,
             timeout=self.ilp_timeout
         )
+        partitions = sorted(partitions, key=lambda p: (p.start, p.end, p.node_id))
         
-        # Cache for later use
+        # Cập nhật cache
         self._cached_latency_matrix = latency_matrix
         self._cached_clusters = clusters
+        self._cached_partitions = partitions
+        self._cached_topology_fingerprint = current_fingerprint
+        self._cached_model_id = current_model_id
         
         return partitions
     
@@ -143,7 +168,7 @@ class LACPPartitioningStrategy(PartitioningStrategy):
         from synapse.model_list import HF_MODEL_LAYERS, HF_MODEL_PARAMS
         
         num_layers = 32
-        memory_per_layer_mb = 4000.0  # 4GB
+        memory_per_layer_mb = 500.0  # default cho model 7B
         
         if base_shard:
             model_key = base_shard.model_id
@@ -151,9 +176,21 @@ class LACPPartitioningStrategy(PartitioningStrategy):
             # Khởi tạo mặc định theo base_shard
             if base_shard.n_layers and base_shard.n_layers > 0:
                 num_layers = base_shard.n_layers
-                memory_per_layer_mb = 1000.0  # Fallback an toàn nếu không tìm thấy key model
+                # Heuristic thực tế theo số tầng:
+                # ≤16 tầng → model cực nhỏ (<100M params) → ~50MB/layer
+                # ≤24 tầng → model nhỏ (0.5B-1.5B) → ~100MB/layer
+                # ≤36 tầng → model trung (3B-7B)     → ~400MB/layer
+                # >36 tầng → model lớn (13B+)         → ~800MB/layer
+                if num_layers <= 16:
+                    memory_per_layer_mb = 50.0
+                elif num_layers <= 24:
+                    memory_per_layer_mb = 100.0
+                elif num_layers <= 36:
+                    memory_per_layer_mb = 400.0
+                else:
+                    memory_per_layer_mb = 800.0
 
-            # Sử dụng Local DB nếu có discovery
+            # Sử dụng Local DB nếu có
             from synapse.helpers import _load_model_db
             db = _load_model_db()
             db_entry = None
@@ -169,17 +206,18 @@ class LACPPartitioningStrategy(PartitioningStrategy):
                 # Estimate total mem from recommended_ram_gb
                 mem_gb = db_entry.get("recommended_ram_gb", 14.0)
                 total_mem_mb = mem_gb * 1024
-                memory_per_layer_mb = (total_mem_mb / num_layers) + 300.0
+                # 20% buffer thay vì cộng cứng 300MB
+                memory_per_layer_mb = (total_mem_mb / num_layers) * 1.2
                 
             elif model_key and model_key in HF_MODEL_LAYERS:
                 num_layers = HF_MODEL_LAYERS[model_key]
                 param_str = HF_MODEL_PARAMS.get(model_key, "7B")
                 
-                # Estimate total mem base on B (Billions) / M (Millions) string
+                # Estimate total mem based on B/M param string
                 if "B" in param_str:
                     try:
                         billions = float(param_str.replace("B", ""))
-                        total_mem_mb = billions * 2000  # FP16 (2 byte per param) + overhead
+                        total_mem_mb = billions * 2000  # FP16: 2 bytes per param + overhead
                     except ValueError:
                         total_mem_mb = 7000 * 2
                 elif "M" in param_str:
@@ -191,8 +229,8 @@ class LACPPartitioningStrategy(PartitioningStrategy):
                 else:
                     total_mem_mb = 7000 * 2
                 
-                # Chia cho số layer + dôi dư KV Cache (approx 300MB per layer on distributed usage)
-                memory_per_layer_mb = (total_mem_mb / num_layers) + 300.0
+                # 20% buffer (thay vì +300MB cố định)
+                memory_per_layer_mb = (total_mem_mb / num_layers) * 1.2
         
         return [
             LayerProfile(

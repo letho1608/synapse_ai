@@ -36,14 +36,14 @@ class GRPCPeerHandle(PeerHandle):
       ("grpc.tcp_nodelay", 1),
       ("grpc.optimization_target", "throughput"),
     ]
-    self.max_rpc_retries = 3
+    self.max_rpc_retries = 10
+    self.rpc_retry_base_delay = 0.5 # Tăng thêm delay cơ bản
     self.retryable_status_codes = {
       grpc.StatusCode.UNAVAILABLE,
       grpc.StatusCode.UNKNOWN,
-      grpc.StatusCode.INTERNAL,
       grpc.StatusCode.DEADLINE_EXCEEDED,
+      grpc.StatusCode.RESOURCE_EXHAUSTED,
     }
-    self.rpc_retry_base_delay = 0.5
 
   def id(self) -> str:
     return self._id
@@ -72,14 +72,14 @@ class GRPCPeerHandle(PeerHandle):
         compression=grpc.Compression.Gzip
       )
       self.stub = node_service_pb2_grpc.NodeServiceStub(self.channel)
-      await asyncio.wait_for(self.channel.channel_ready(), timeout=10.0)
+      # More robust waiting for channel readiness
+      try:
+        await asyncio.wait_for(self.channel.channel_ready(), timeout=10.0)
+      except asyncio.TimeoutError:
+        if DEBUG >= 2: print(f"Channel not ready for {self._id}@{self.address} after 10s, will retry on next RPC")
+        # Don't raise here, let the RPC call handle it via _rpc_with_retry
     except Exception as e:
-      # Nếu channel bị đóng hoặc lỗi khác, cleanup và raise
-      # Kiểm tra xem có phải lỗi "Channel is closed" không
-      error_msg = str(e)
-      if "Channel is closed" in error_msg or "UsageError" in error_msg:
-        if DEBUG >= 2:
-          print(f"Channel closed error during connect for {self._id}@{self.address}: {e}")
+      if DEBUG >= 2: print(f"Fatal error during connect for {self._id}@{self.address}: {e}")
       await self.disconnect()
       raise
 
@@ -187,6 +187,7 @@ class GRPCPeerHandle(PeerHandle):
     await self._rpc_with_retry(
       "SendPrompt",
       lambda: self.stub.SendPrompt(request),
+      timeout=120.0 # Prompt processing is slow on CPU
     )
 
   async def send_tensor(self, shard: Shard, tensor: np.ndarray, inference_state: Optional[dict] = None, request_id: Optional[str] = None) -> Optional[np.array]:
@@ -204,6 +205,7 @@ class GRPCPeerHandle(PeerHandle):
     response = await self._rpc_with_retry(
       "SendTensor",
       lambda: self.stub.SendTensor(request),
+      timeout=120.0 # Tensor processing is even slower
     )
 
     if not response.tensor_data or not response.shape or not response.dtype:
@@ -265,6 +267,7 @@ class GRPCPeerHandle(PeerHandle):
       response = await self._rpc_with_retry(
         "CollectTopology",
         lambda: self.stub.CollectTopology(request),
+        timeout=30.0
       )
       topology = Topology()
       for node_id, capabilities in response.nodes.items():
@@ -294,6 +297,7 @@ class GRPCPeerHandle(PeerHandle):
     await self._rpc_with_retry(
       "SendResult",
       lambda: self.stub.SendResult(request),
+      timeout=30.0
     )
 
   async def send_opaque_status(self, request_id: str, status: str) -> None:

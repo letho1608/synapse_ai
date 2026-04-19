@@ -6,13 +6,16 @@ from dataclasses import dataclass
 import numpy as np
 
 try:
+    import pulp as _pulp_module
     from pulp import (
         LpProblem, LpMinimize, LpVariable, LpBinary,
         LpSum, PULP_CBC_CMD
     )
+    LP_STATUS_OPTIMAL = _pulp_module.LpStatusOptimal  # = 1
     PULP_AVAILABLE = True
 except ImportError:
     PULP_AVAILABLE = False
+    LP_STATUS_OPTIMAL = 1  # fallback constant
     # Define placeholder classes for when pulp is not available
     LpProblem = None
     LpMinimize = None
@@ -108,7 +111,7 @@ class ILPPartitioner:
         - Each layer assigned to exactly one machine
         - Memory constraint per machine
         """
-        machines = list(topology.nodes.keys())
+        machines = sorted(topology.nodes.keys())
         n_layers = len(layer_profiles)
         n_machines = len(machines)
         
@@ -168,9 +171,10 @@ class ILPPartitioner:
     
         # Check solution status before extracting
         # LpStatusOptimal = 1, LpStatusNotSolved = 0, LpStatusInfeasible = -1, etc.
-        if prob.status != pulp.LpStatusOptimal:
+        if prob.status != LP_STATUS_OPTIMAL:
             # Solution is not optimal (could be infeasible, undefined, etc.)
             # Fallback to greedy
+            print(f"[ILP] Status={prob.status} (not optimal), falling back to greedy")
             return self._greedy_fallback(topology, latency_matrix, layer_profiles)
     
         # Extract solution
@@ -182,7 +186,7 @@ class ILPPartitioner:
     
     def _extract_partitions(
         self,
-        x: Dict[Tuple[int, int], LpVariable],
+        x: Dict[Tuple[int, int], Any],
         machines: List[str],
         layer_profiles: List[LayerProfile],
         n_layers: int
@@ -239,12 +243,9 @@ class ILPPartitioner:
         Sử dụng phân bổ tỉ lệ theo RAM (Ring Memory Weighted) để tránh bị 
         fragmentation tạo ra nhiều shard trên cùng một máy, dẫn đến swap memory.
         """
-        machines = list(topology.nodes.keys())
+        machines = sorted(topology.nodes.keys(), key=lambda m: (-topology.nodes[m].memory, m))
         if not machines:
             return []
-
-        # Sort machines by memory descending
-        machines.sort(key=lambda m: topology.nodes[m].memory, reverse=True)
 
         total_mem = sum(topology.nodes[m].memory for m in machines)
         if total_mem <= 0:

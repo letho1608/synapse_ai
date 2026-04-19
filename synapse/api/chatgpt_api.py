@@ -97,7 +97,10 @@ def generate_completion(
   finish_reason: Union[Literal["length", "stop"], None],
   object_type: Literal["chat.completion", "text_completion"],
 ) -> dict:
-  raw_content = tokenizer.decode(tokens)
+  try:
+    raw_content = tokenizer.decode(tokens, skip_special_tokens=True)
+  except TypeError:
+    raw_content = tokenizer.decode(tokens)
   content = _clean_completion_content(raw_content)
   completion = {
     "id": f"chatcmpl-{request_id}",
@@ -183,12 +186,14 @@ def build_prompt(tokenizer, _messages: List[Message], tools: Optional[List[Dict]
         prompt_parts.append(content)
     return "\n".join(prompt_parts)
   
-  chat_template_args = {"conversation": [m.to_dict() for m in messages], "tokenize": False, "add_generation_prompt": True}
-  if tools: 
-    chat_template_args["tools"] = tools
+  # Pass conversation as positional argument (not keyword), which is what apply_chat_template expects
+  conversation = [m.to_dict() for m in messages]
+  chat_template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+  if tools:
+    chat_template_kwargs["tools"] = tools
 
   try:
-    prompt = tokenizer.apply_chat_template(**chat_template_args)
+    prompt = tokenizer.apply_chat_template(conversation, **chat_template_kwargs)
     if DEBUG >= 3: print(f"!!! Prompt: {prompt}")
     return prompt
   except (ValueError, AttributeError):
@@ -205,12 +210,12 @@ def build_prompt(tokenizer, _messages: List[Message], tools: Optional[List[Dict]
     return "\n".join(prompt_parts)
   except UnicodeEncodeError:
     # Handle Unicode encoding by ensuring everything is UTF-8
-    chat_template_args["conversation"] = [
-      {k: v.encode('utf-8').decode('utf-8') if isinstance(v, str) else v 
+    conversation_utf8 = [
+      {k: v.encode('utf-8').decode('utf-8') if isinstance(v, str) else v
        for k, v in m.to_dict().items()}
       for m in messages
     ]
-    prompt = tokenizer.apply_chat_template(**chat_template_args)
+    prompt = tokenizer.apply_chat_template(conversation_utf8, **chat_template_kwargs)
     if DEBUG >= 3: print(f"!!! Prompt (UTF-8 encoded): {prompt}")
     return prompt
 
@@ -272,23 +277,25 @@ class ChatGPTAPI:
     # Get the callback system and register our handler
     self.token_callback = node.on_token.register("chatgpt-api-token-handler")
     def safe_handle_tokens(_request_id, tokens, is_finished):
-      """Safely handle tokens with error handling"""
-      async def _handle():
-        try:
-          await self.handle_tokens(_request_id, tokens, is_finished)
-        except Exception as e:
-          if DEBUG >= 1:
-            print(f"Error in handle_tokens for {_request_id}: {e}")
-            import traceback
-            traceback.print_exc()
-      # Create task and ensure it runs
-      task = asyncio.create_task(_handle())
-      # Store task to prevent garbage collection
-      if not hasattr(self, '_token_tasks'):
-        self._token_tasks = set()
-      self._token_tasks.add(task)
-      task.add_done_callback(self._token_tasks.discard)
-    self.token_callback.on_next(safe_handle_tokens)
+        """Safely handle tokens with error handling"""
+        async def _handle():
+            try:
+                await self.handle_tokens(_request_id, tokens, is_finished)
+            except Exception as e:
+                if DEBUG >= 1:
+                    print(f"Error in handle_tokens for {_request_id}: {e}")
+                import traceback
+                traceback.print_exc()
+        # Create task and ensure it runs - THIS IS THE FIX
+        task = asyncio.create_task(_handle())
+        # Store task to prevent garbage collection
+        if not hasattr(self, '_token_tasks'):
+            self._token_tasks = set()
+        self._token_tasks.add(task)
+        task.add_done_callback(self._token_tasks.discard)
+    
+    # Register the callback to trigger safe_handle_tokens when tokens arrive
+    self.token_callback.on_next(lambda rid, tok, fin: safe_handle_tokens(rid, tok, fin))
     self.system_prompt = system_prompt
 
     cors = aiohttp_cors.setup(self.app)
@@ -885,11 +892,15 @@ class ChatGPTAPI:
       print(f"[INFO] Reading request JSON...")
       data = await request.json()
       print(f"[INFO] Request data received: model={data.get('model')}, stream={data.get('stream')}, messages_count={len(data.get('messages', []))}")
+      max_tokens = data.get("max_tokens")
+      if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = None
       model_from_request = data.get("model") or self.default_model
       if model_from_request and model_from_request.startswith("gpt-"):
         model_from_request = self.default_model
       # Tương thích client cũ: bỏ prefix "ollama/" nếu có
-      model_id = (model_from_request[7:] if model_from_request.startswith("ollama/") else model_from_request).strip()
+      model_id_raw = (model_from_request[7:] if model_from_request.startswith("ollama/") else model_from_request).strip()
+      model_id = resolve_hf_id(model_id_raw)
 
       # Engine PyTorch: dùng process_prompt phân tán (nhiều node / layer sharding)
       if self.inference_engine_classname == "PyTorchHFInferenceEngine":
@@ -978,27 +989,30 @@ class ChatGPTAPI:
               if DEBUG >= 1:
                 traceback.print_exc()
         # Inject system prompt và tool instructions
-        tool_instructions = build_tool_instructions()
+        tool_instructions = build_tool_instructions() if (chat_request.tools or detect_tool_intent(last_user or "")) else ""
         has_system_message = any(msg.role == "system" for msg in chat_request.messages)
-        if self.system_prompt:
-          if not has_system_message:
-            system_content = self.system_prompt + "\n\n" + tool_instructions
-            system_message = Message(role="system", content=system_content)
-            chat_request.messages.insert(0, system_message)
-          else:
+        
+        if not has_system_message and self.system_prompt:
+          # TỐI GIẢN: Giảm tải context để tránh sập gRPC trên CPU yếu
+          system_content = "Bạn là trợ lý AI. Trả lời bằng tiếng Việt."
+          if tool_instructions:
+            system_content += "\n\n" + tool_instructions
+          chat_request.messages.insert(0, Message(role="system", content=system_content))
+        elif tool_instructions:
+          # Append to existing or create new if only tools are needed
+          if has_system_message:
             for msg in chat_request.messages:
               if msg.role == "system":
                 msg.content = (msg.content or "") + "\n\n" + tool_instructions
                 break
-        elif not has_system_message:
-          system_message = Message(role="system", content=tool_instructions)
-          chat_request.messages.insert(0, system_message)
+          else:
+            chat_request.messages.insert(0, Message(role="system", content=tool_instructions))
         prompt = build_prompt(tokenizer, chat_request.messages, chat_request.tools)
         stream = data.get("stream", False)
         if self.on_chat_completion_request:
           self.on_chat_completion_request(request_id, chat_request, prompt)
         process_task = asyncio.create_task(
-          self.node.process_prompt(base_shard, prompt, request_id=request_id)
+          self.node.process_prompt(base_shard, prompt, request_id=request_id, max_generate_tokens=max_tokens)
         )
         try:
           if stream:
@@ -1009,6 +1023,7 @@ class ChatGPTAPI:
             )
             await response.prepare(request)
             all_tokens_stream: List[int] = []
+            process_done_at: Optional[float] = None
             while True:
               try:
                 tokens, is_finished = await asyncio.wait_for(
@@ -1016,9 +1031,22 @@ class ChatGPTAPI:
                   timeout=float(self.response_timeout),
                 )
               except asyncio.TimeoutError:
-                if DEBUG >= 1:
-                  print(f"Timeout waiting for tokens: {request_id}")
-                break
+                if process_task.done():
+                  if process_done_at is None:
+                    process_done_at = time.time()
+                  task_exc = process_task.exception()
+                  if task_exc:
+                    if DEBUG >= 1:
+                      print(f"Inference task failed for {request_id}: {task_exc}")
+                    return web.json_response(
+                      {"error": {"message": f"Inference failed: {task_exc}", "code": "inference_failed"}},
+                      status=500,
+                    )
+                  if time.time() - process_done_at >= 5.0:
+                    if DEBUG >= 1:
+                      print(f"Grace timeout waiting for streamed tokens: {request_id}")
+                    break
+                  continue
               all_tokens_stream.extend(tokens)
               if is_finished:
                 break
@@ -1045,7 +1073,7 @@ class ChatGPTAPI:
                 new_prompt_s = build_prompt(tokenizer, new_messages_s, None)
                 request_id_s = str(uuid.uuid4())
                 self.token_queues[request_id_s] = asyncio.Queue()
-                asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s))
+                asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s, max_generate_tokens=max_tokens))
                 tokens_to_stream = []
                 while True:
                   try:
@@ -1070,16 +1098,30 @@ class ChatGPTAPI:
             return response
           else:
             all_tokens = []
+            process_done_at: Optional[float] = None
             while True:
               try:
                 tokens, is_finished = await asyncio.wait_for(
                   self.token_queues[request_id].get(),
-                  timeout=float(self.response_timeout),
+                  timeout=10.0,
                 )
               except asyncio.TimeoutError:
-                if DEBUG >= 1:
-                  print(f"Timeout waiting for tokens: {request_id}")
-                break
+                if process_task.done():
+                  if process_done_at is None:
+                    process_done_at = time.time()
+                  task_exc = process_task.exception()
+                  if task_exc:
+                    if DEBUG >= 1:
+                      print(f"Inference task failed for {request_id}: {task_exc}")
+                    return web.json_response(
+                      {"error": {"message": f"Inference failed: {task_exc}", "code": "inference_failed"}},
+                      status=500,
+                    )
+                  if time.time() - process_done_at >= 5.0:
+                    if DEBUG >= 1:
+                      print(f"Grace timeout waiting for tokens: {request_id}")
+                    break
+                continue
               all_tokens.extend(tokens)
               if is_finished:
                 break
@@ -1106,7 +1148,7 @@ class ChatGPTAPI:
                 request_id_2 = str(uuid.uuid4())
                 self.token_queues[request_id_2] = asyncio.Queue()
                 process_task_2 = asyncio.create_task(
-                  self.node.process_prompt(base_shard, new_prompt, request_id=request_id_2)
+                  self.node.process_prompt(base_shard, new_prompt, request_id=request_id_2, max_generate_tokens=max_tokens)
                 )
                 all_tokens_2 = []
                 while True:
@@ -1131,6 +1173,10 @@ class ChatGPTAPI:
                     await process_task_2
                   except asyncio.CancelledError:
                     pass
+                  except Exception as cleanup_e:
+                    if DEBUG >= 1:
+                      print(f"[WARN] process_task_2 cleanup error for {request_id_2}: {cleanup_e}")
+                      traceback.print_exc()
                 return web.json_response(completion)
               except Exception as tool_e:
                 if DEBUG >= 1:
@@ -1157,6 +1203,10 @@ class ChatGPTAPI:
               await process_task
             except asyncio.CancelledError:
               pass
+            except Exception as cleanup_e:
+              if DEBUG >= 1:
+                print(f"[WARN] process_task cleanup error for {request_id}: {cleanup_e}")
+                traceback.print_exc()
       return web.json_response(
         {"error": {"message": "Chọn model trong danh sách (Quản lý mô hình).", "code": "model_not_found"}},
         status=400,
@@ -2594,8 +2644,8 @@ class ChatGPTAPI:
     if DEBUG >= 1:
       print(f"[handle_tokens] request_id={request_id[:8]}..., len(tokens)={token_len}, is_finished={is_finished}, queue_exists={request_id in self.token_queues}")
     if request_id not in self.token_queues:
-      if DEBUG >= 1:
-        print(f"[ERROR] Queue not found for {request_id[:8]}...")
+      if DEBUG >= 3:
+        print(f"[DEBUG] Queue not found for {request_id[:8]}... (token from non-origin node)")
       return
     await self.token_queues[request_id].put((tokens, is_finished))
 

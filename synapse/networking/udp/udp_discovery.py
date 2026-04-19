@@ -198,8 +198,25 @@ class UDPDiscovery(Discovery):
         if peer_id in self.known_peers: self.known_peers[peer_id] = (self.known_peers[peer_id][0], self.known_peers[peer_id][1], time.time(), peer_prio)
 
   async def task_listen_for_peers(self):
-    await asyncio.get_event_loop().create_datagram_endpoint(lambda: ListenProtocol(self.on_listen_message), local_addr=("0.0.0.0", self.listen_port))
-    if DEBUG_DISCOVERY >= 2: print("Started listen task")
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      try:
+        # SO_REUSEPORT không có trên Windows nhưng có trên Linux, giúp chia sẻ port tốt hơn
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+      except AttributeError:
+        pass
+      
+      sock.bind(("0.0.0.0", self.listen_port))
+      
+      await asyncio.get_event_loop().create_datagram_endpoint(
+        lambda: ListenProtocol(self.on_listen_message),
+        sock=sock
+      )
+      if DEBUG_DISCOVERY >= 2: print(f"Started listen task on port {self.listen_port}")
+    except Exception as e:
+      print(f"Error starting UDP listen task: {e}")
+      traceback.print_exc()
 
   async def task_cleanup_peers(self):
     while True:

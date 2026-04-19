@@ -39,6 +39,7 @@ torch
 peft
 datasets
 accelerate
+bitsandbytes
 
 # LACP Dependencies
 pulp>=2.7.0

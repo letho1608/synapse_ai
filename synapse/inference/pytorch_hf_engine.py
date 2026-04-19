@@ -4,6 +4,7 @@ Phân tán: load model từ HF. Danh sách model lấy từ synapse.model_list (
 """
 
 import numpy as np
+import inspect
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -56,7 +57,13 @@ class HFShardDownloader:
 
 
 class PyTorchHFInferenceEngine(InferenceEngine):
-    """Engine: load model từ Hugging Face, chạy inference (full hoặc theo layer range cho phân tán)."""
+    """Engine: load model từ Hugging Face, chạy inference (full hoặc theo layer range cho phân tán).
+    
+    Hỗ trợ tự nhận diện phần cứng và tối ưu hóa tự động:
+    - Chọn attn_implementation tốt nhất (sdpa / eager fallback)
+    - Chọn torch_dtype phù hợp (bfloat16 / float16 / float32)
+    - Bật Quantization (4-bit / 8-bit) nếu VRAM thấp
+    """
 
     def __init__(self, shard_downloader: Optional[Any] = None):
         self.shard_downloader = shard_downloader or HFShardDownloader()
@@ -65,6 +72,8 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self._model = None
         self._model_id: Optional[str] = None
         self._device = "cuda" if self._has_cuda() else "cpu"
+        # Cache kết quả nhận diện phần cứng để không phải phát hiện lại nhiều lần
+        self._hw_profile: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _has_cuda() -> bool:
@@ -74,8 +83,235 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         except Exception:
             return False
 
+    def _detect_hardware_profile(self) -> Dict[str, Any]:
+        """
+        Nhận diện cấu hình phần cứng của node hiện tại và trả về một profile
+        để định hướng cách nạp mô hình một cách tối ưu nhất.
+
+        Returns dict với các key:
+            - device (str): 'cuda' hoặc 'cpu'
+            - torch_dtype: dtype tối ưu nhất
+            - attn_implementation (str): 'sdpa', hoặc 'eager'
+            - load_in_4bit (bool): True nếu VRAM cực thấp (<= 6GB)
+            - load_in_8bit (bool): True nếu VRAM thấp trung bình (6-10GB)
+            - device_map (str|None): 'auto' nếu có CUDA
+            - vram_gb (float): VRAM khả dụng (0 nếu CPU-only)
+            - supports_bf16 (bool): True nếu GPU hỗ trợ BFloat16
+        """
+        if self._hw_profile is not None:
+            return self._hw_profile
+
+        import torch
+
+        profile: Dict[str, Any] = {
+            "device": "cpu",
+            "torch_dtype": torch.float32,
+            "attn_implementation": "eager",
+            "load_in_4bit": False,
+            "load_in_8bit": False,
+            "device_map": None,
+            "vram_gb": 0.0,
+            "supports_bf16": False,
+        }
+
+        if not self._has_cuda():
+            # CPU-only node: ưu tiên eager để tránh SDPA + sliding-window attention cho Qwen
+            profile["torch_dtype"] = "auto"
+            profile["attn_implementation"] = "eager"
+                
+            if DEBUG >= 1:
+                print(f"[PyTorchHF][HW] CPU-only node → Dtype: auto | Attn: {profile['attn_implementation']}")
+            self._hw_profile = profile
+            return profile
+
+        # --- Node có CUDA ---
+        profile["device"] = "cuda"
+        
+        try:
+            dev = torch.cuda.current_device()
+            total_vram_gb = torch.cuda.get_device_properties(dev).total_memory / (1024 ** 3)
+            # Dùng VRAM khả dụng (trừ đi phần đã dùng)
+            vram_gb = total_vram_gb - (torch.cuda.memory_allocated(dev) / (1024 ** 3))
+            profile["vram_gb"] = vram_gb
+
+            major, _ = torch.cuda.get_device_capability(dev)
+            supports_bf16 = (major >= 8)
+            profile["supports_bf16"] = supports_bf16
+            profile["torch_dtype"] = torch.bfloat16 if supports_bf16 else torch.float16
+
+            # SDPA mặc định cho PyTorch 2.0+
+            if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+                profile["attn_implementation"] = "sdpa"
+
+            # CHỈ BẬT QUANTIZATION KHI THỰC SỰ CẦN THIẾT (Nếu VRAM < 10GB)
+            # Nếu máy người dùng xịn (> 10GB), chạy float16/bf16 cho NHANH nhất.
+            if total_vram_gb <= 12.0:
+                try:
+                    import bitsandbytes
+                    if total_vram_gb <= 6.0:
+                        profile["load_in_4bit"] = True
+                    else:
+                        profile["load_in_8bit"] = True
+                except ImportError:
+                    pass
+
+            if DEBUG >= 1:
+                quant = "4bit" if profile["load_in_4bit"] else ("8bit" if profile["load_in_8bit"] else "none")
+                print(f"[PyTorchHF][HW] Detected: {total_vram_gb:.1f}GB VRAM | Dtype: {profile['torch_dtype']} | Quant: {quant} | Attn: {profile['attn_implementation']}")
+
+        except Exception as e:
+            if DEBUG >= 1: print(f"[PyTorchHF][HW] CUDA Probe Error: {e}")
+            profile["torch_dtype"] = torch.float16
+
+        self._hw_profile = profile
+        return profile
+
     def _get_hf_id(self, model_id: str) -> str:
         return resolve_hf_model_id(model_id)
+
+    def _get_transformer_components(self):
+        """Return transformer layers and projection modules for supported causal LM layouts."""
+        if self._model is None:
+            return None
+
+        model = self._model
+
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            return {
+                "layers": list(model.model.layers),
+                "embed": getattr(model.model, "embed_tokens", None),
+                "final_norm": getattr(model.model, "norm", None),
+                "lm_head": getattr(model, "lm_head", None),
+            }
+
+        if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+            return {
+                "layers": list(model.transformer.h),
+                "embed": getattr(model.transformer, "wte", None),
+                "final_norm": getattr(model.transformer, "ln_f", None),
+                "lm_head": getattr(model, "lm_head", None),
+            }
+
+        if hasattr(model, "layers"):
+            return {
+                "layers": list(model.layers),
+                "embed": getattr(model, "embed_tokens", None),
+                "final_norm": getattr(model, "norm", None),
+                "lm_head": getattr(model, "lm_head", None),
+            }
+
+        return None
+
+    def _get_rotary_embedding_module(self):
+        """Best-effort lấy rotary embedding module cho các kiến trúc Qwen/Llama khác version."""
+        if self._model is None:
+            return None
+
+        # Newer HF layouts thường có model.rotary_emb
+        if hasattr(self._model, "model") and hasattr(self._model.model, "rotary_emb"):
+            return self._model.model.rotary_emb
+
+        # Fallback: rotary_emb có thể nằm trong self_attn của layer đầu tiên
+        components = self._get_transformer_components()
+        if components and components.get("layers"):
+            first_layer = components["layers"][0]
+            self_attn = getattr(first_layer, "self_attn", None)
+            if self_attn is not None and hasattr(self_attn, "rotary_emb"):
+                return self_attn.rotary_emb
+
+        return None
+
+    def _build_position_embeddings(self, hidden_states, position_ids):
+        """Dựng position_embeddings cho rotary embedding module."""
+        rotary_emb = self._get_rotary_embedding_module()
+        if rotary_emb is None:
+            return None
+
+        # Đa số Qwen/Llama dùng chữ ký rotary_emb(x, position_ids).
+        out = rotary_emb(hidden_states, position_ids)
+        return out
+
+    def _call_transformer_block(self, block, hidden_states, attention_mask=None, position_ids=None, position_embeddings=None):
+        # Gọi theo chữ ký thật của layer thay vì thử nhiều fallback.
+        params = inspect.signature(block.forward).parameters
+        kwargs: Dict[str, Any] = {}
+
+        if "attention_mask" in params and attention_mask is not None:
+            kwargs["attention_mask"] = attention_mask
+        if "position_ids" in params and position_ids is not None:
+            kwargs["position_ids"] = position_ids
+        if "position_embeddings" in params and position_embeddings is not None:
+            kwargs["position_embeddings"] = position_embeddings
+        if "use_cache" in params:
+            kwargs["use_cache"] = False
+        if "output_attentions" in params:
+            kwargs["output_attentions"] = False
+
+        output = block(hidden_states, **kwargs)
+
+        if isinstance(output, tuple):
+            return output[0]
+        if hasattr(output, "last_hidden_state"):
+            return output.last_hidden_state
+        return output
+
+    def _forward_transformer_range(self, shard: Shard, input_data: np.ndarray):
+        import torch
+
+        components = self._get_transformer_components()
+        if not components:
+            raise RuntimeError("Unsupported causal LM architecture for distributed shard execution")
+
+        layers = components["layers"]
+        if shard.start_layer < 0 or shard.end_layer >= len(layers):
+            raise RuntimeError(
+                f"Shard range out of bounds for model {shard.model_id}: {shard.start_layer}-{shard.end_layer} / {len(layers)}"
+            )
+
+        device = next(self._model.parameters()).device
+        if np.issubdtype(input_data.dtype, np.floating):
+            if input_data.ndim == 2:
+                input_data = input_data[np.newaxis, :]
+            hidden_states = torch.from_numpy(input_data).to(device=device, dtype=next(self._model.parameters()).dtype)
+        else:
+            input_ids = torch.from_numpy(input_data.astype(np.int64)).to(device)
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            embed = components["embed"]
+            if embed is None:
+                raise RuntimeError(f"Model {shard.model_id} does not expose input embeddings")
+            hidden_states = embed(input_ids)
+
+        # Không truyền mask 2D thủ công: một số bản transformers (Qwen eager path)
+        # kỳ vọng causal mask 4D và sẽ tự dựng bên trong khi attention_mask=None.
+        attention_mask = None
+        seq_len = hidden_states.shape[1]
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(hidden_states.shape[0], -1)
+        position_embeddings = self._build_position_embeddings(hidden_states, position_ids)
+
+        with torch.no_grad():
+            for layer_index in range(shard.start_layer, shard.end_layer + 1):
+                hidden_states = self._call_transformer_block(
+                    layers[layer_index],
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )
+
+            if not shard.is_last_layer():
+                return hidden_states.float().cpu().numpy()
+
+            final_norm = components["final_norm"]
+            if final_norm is not None:
+                hidden_states = final_norm(hidden_states)
+
+            lm_head = components["lm_head"]
+            if lm_head is None:
+                raise RuntimeError(f"Model {shard.model_id} does not expose an output head")
+
+            logits = lm_head(hidden_states)
+            return logits.float().cpu().numpy()
 
     async def ensure_shard(self, shard: Shard) -> None:
         if self._model_id == shard.model_id and self._model is not None:
@@ -126,35 +362,47 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             except Exception as e:
                 raise RuntimeError(f"PyTorchHF load vision {hf_id}: {e}") from e
 
+        # --- Nhận diện phần cứng ---
+        hw = self._detect_hardware_profile()
+        load_model_kw: Dict[str, Any] = {
+            "trust_remote_code": True,
+            "attn_implementation": hw["attn_implementation"],
+            "torch_dtype": hw["torch_dtype"],
+        }
+
+        # Ưu tiên ÉP model vào GPU duy nhất nếu có thể để tránh device_map đẩy sang CPU
+        if hw["device"] == "cuda":
+            if hw["load_in_4bit"] or hw["load_in_8bit"]:
+                # Nếu dùng quantization, phải dùng device_map
+                load_model_kw["device_map"] = "auto"
+                from transformers import BitsAndBytesConfig
+                if hw["load_in_4bit"]:
+                    load_model_kw["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True, bnb_4bit_compute_dtype=hw["torch_dtype"],
+                        bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4"
+                    )
+                else:
+                    load_model_kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            else:
+                # KHÔNG dùng device_map='auto' cho 1 máy để tránh nó đẩy layer sang CPU
+                pass
+
+        if DEBUG >= 1:
+            print(f"[PyTorchHF] Nạp model {shard.model_id} lên {hw['device']}...")
+
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
-            load_kw = {"trust_remote_code": True}
-            load_model_kw = {
-                "trust_remote_code": True,
-                "torch_dtype": "auto",
-                "device_map": "auto" if self._has_cuda() else None,
-                # Thêm cấu hình cho Sliding Window Attention
-                "attn_implementation": "eager"  # Sử dụng implementation mặc định để tránh xung đột với Sliding Window Attention
-            }
-            
-            # Kiểm tra nếu là model Qwen để xử lý đặc biệt
-            is_qwen = "qwen" in hf_id.lower()
-            if is_qwen:
-                # Qwen models cần cấu hình đặc biệt cho Sliding Window Attention
-                load_model_kw["attn_implementation"] = "eager"
-            
             try:
-                self.tokenizer = AutoTokenizer.from_pretrained(hf_id, **load_kw, local_files_only=True)
+                self.tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True, local_files_only=True)
                 self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw, local_files_only=True)
-                if DEBUG >= 1:
-                    print(f"[PyTorchHF] Loaded from cache (local): {shard.model_id}")
-            except (OSError, ValueError) as _e:
-                if DEBUG >= 1:
-                    print(f"[PyTorchHF] Cache miss or incomplete, loading from Hub: {_e}")
-                self.tokenizer = AutoTokenizer.from_pretrained(hf_id, **load_kw)
+            except (OSError, ValueError):
+                self.tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
                 self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw)
-            if self._model.device.type if hasattr(self._model, "device") else "cpu" == "cpu":
-                self._model = self._model.to(self._device)
+
+            # ÉP MODEL LÊN GPU (Nếu không dùng quantization/device_map)
+            if hw["device"] == "cuda" and "device_map" not in load_model_kw:
+                self._model = self._model.to("cuda")
+
             self._model_id = shard.model_id
             self.shard = shard
         except Exception as e:
@@ -237,7 +485,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         await self.ensure_shard(shard)
         if self.tokenizer is None:
             return np.array([], dtype=np.int32)
-        enc = self.tokenizer.encode(prompt, return_tensors="np")
+        enc = self.tokenizer.encode(prompt, add_special_tokens=False, return_tensors="np")
         return enc.flatten().astype(np.int32)
 
     async def decode(self, shard: Shard, tokens: np.ndarray) -> str:
@@ -283,21 +531,11 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         await self.ensure_shard(shard)
         inference_state = inference_state or {}
         try:
-            import torch
             if self._model is None:
                 vocab_size = 32000
                 return np.zeros((1, 0, vocab_size), dtype=np.float32), inference_state
-            device = next(self._model.parameters()).device
-            if input_data.dtype != np.int64:
-                input_data = input_data.astype(np.int64)
-            input_ids = torch.from_numpy(input_data).to(device)
-            if input_ids.dim() == 1:
-                input_ids = input_ids.unsqueeze(0)
-            with torch.no_grad():
-                out = self._model(input_ids)
-            logits = out.logits if hasattr(out, "logits") else out[0]
-            logits_np = logits.float().cpu().numpy()
-            return logits_np, inference_state
+            output = self._forward_transformer_range(shard, input_data)
+            return output, inference_state
         except Exception as e:
             if DEBUG >= 1:
                 import traceback
