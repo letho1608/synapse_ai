@@ -29,13 +29,11 @@ async def resolve_tokenizer(repo_id: Union[str, PathLike]):
 
 
 async def _resolve_tokenizer(repo_id_or_local_path: Union[str, PathLike]):
-  print(f"DEBUG_CRASH: _resolve_tokenizer called for {repo_id_or_local_path}", flush=True)
   # Xử lý đặc biệt cho các model Qwen sử dụng Sliding Window Attention
   is_qwen = "qwen" in str(repo_id_or_local_path).lower()
   
   try:
     if DEBUG >= 4: print(f"Trying AutoTokenizer for {repo_id_or_local_path}")
-    print(f"DEBUG_CRASH: Calling AutoTokenizer.from_pretrained for {repo_id_or_local_path}", flush=True)
     
     # Cấu hình cho tokenizer với các tham số phù hợp với Sliding Window Attention
     tokenizer_kwargs = {
@@ -49,10 +47,8 @@ async def _resolve_tokenizer(repo_id_or_local_path: Union[str, PathLike]):
         tokenizer_kwargs["use_fast"] = True
     
     tokenizer = AutoTokenizer.from_pretrained(repo_id_or_local_path, **tokenizer_kwargs)
-    print(f"DEBUG_CRASH: AutoTokenizer.from_pretrained success", flush=True)
     return tokenizer
   except Exception as e:
-    print(f"DEBUG_CRASH: AutoTokenizer.from_pretrained failed: {e}", flush=True)
     if DEBUG >= 4: print(f"Failed to load tokenizer for {repo_id_or_local_path}. Error: {e}")
     if DEBUG >= 4: print(traceback.format_exc())
 

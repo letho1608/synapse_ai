@@ -63,6 +63,8 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     prompt = request.prompt
     request_id = request.request_id
     inference_state = None if request.inference_state is None else self.deserialize_inference_state(request.inference_state)
+    # HIỆN THÔNG BÁO NHẬN TẢI
+    print(f"[DISTRIBUTED] Receiving PROMPT workload from remote peer for Request: {request_id[:8]}")
     result = await self.node.process_prompt(shard, prompt, request_id, inference_state)
     if DEBUG >= 5: print(f"SendPrompt {shard=} {prompt=} {request_id=} result: {result}")
     tensor_data = result.tobytes() if result is not None else None
@@ -81,6 +83,8 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     inference_state = None if request.inference_state is None else self.deserialize_inference_state(request.inference_state)
 
     result = await self.node.process_tensor(shard, tensor, request_id, inference_state)
+    # HIỆN THÔNG BÁO NHẬN TẢI
+    print(f"📥 [DISTRIBUTED] Receiving workload from remote peer for Request: {request_id[:8]}")
     if DEBUG >= 5: print(f"SendTensor tensor {shard=} {tensor=} {request_id=} result: {result}")
     tensor_data = result.tobytes() if result is not None else None
     return node_service_pb2.Tensor(tensor_data=tensor_data, shape=result.shape, dtype=str(result.dtype)) if result is not None else node_service_pb2.Tensor()
@@ -99,6 +103,8 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     request_id = request.request_id
 
     result = await self.node.process_example(shard, example, target, length, train, request_id)
+    # HIỆN THÔNG BÁO NHẬN TẢI (TRAIN/EVAL)
+    print(f"📥 [DISTRIBUTED] Receiving EXAMPLE workload (Train/Eval) from remote peer for Request: {request_id[:8]}")
 
     # process_example có thể trả về:
     # - loss (float) cho shard đầu/cuối

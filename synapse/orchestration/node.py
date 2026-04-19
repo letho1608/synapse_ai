@@ -5,7 +5,7 @@ import grpc
 import uuid
 import time
 import traceback
-from typing import List, Dict, Optional, Tuple, Union, Set
+from typing import List, Dict, Optional, Tuple, Union, Set, Any
 from synapse.networking import Discovery, PeerHandle, Server
 from synapse.inference.inference_engine import InferenceEngine, Shard, get_inference_engine
 from synapse.topology.topology import Topology
@@ -55,6 +55,9 @@ class Node:
     self.topology_inference_engines_pool: List[List[str]] = []
     self.outstanding_requests = {}
     self._background_tasks: Set[asyncio.Task] = set()
+
+    # Register internal callback for token synchronization in distributed mode
+    self.on_token.register("internal_token_sync").on_next(self._on_token_received)
 
   def _log_task_exception(self, task: asyncio.Task, name: str) -> None:
     self._background_tasks.discard(task)
@@ -145,121 +148,148 @@ class Node:
   token_count = 0
   first_token_time = 0
   async def process_inference_result(
-    self,
-    shard,
-    result: np.ndarray,
-    request_id: Optional[str] = None,
-    inference_state: Optional[dict] = None,
+      self,
+      shard,
+      result: np.ndarray,
+      request_id: Optional[str] = None,
+      inference_state: Optional[dict] = None,
   ):
-    if shard.model_id != 'stable-diffusion-2-1-base':
-      if request_id not in self.buffered_token_output:
-        self.buffered_token_output[request_id] = ([], False)
-      is_finished = len(self.buffered_token_output[request_id][0]) >= self.max_generate_tokens
-      
-      # Kiểm tra result rỗng trước khi sample - đây là nguyên nhân gốc rễ
-      if shard.is_last_layer() and not is_finished:
-        # Kiểm tra xem result có rỗng không (sequence length = 0)
-        if result.size == 0 or (len(result.shape) >= 2 and result.shape[1] == 0):
-          if DEBUG >= 2:
-            print(f"[{request_id}] Warning: Empty result from inference, cannot sample. Marking as finished.")
-          is_finished = True
-          self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
-          forward = np.array([[]], dtype=np.int32).reshape(1, 0)  # Empty tensor với shape đúng
-          intermediate_result = []
-        else:
-          # Sample token from logits
-          buf = self.buffered_token_output[request_id][0]
-          token = await self.inference_engine.sample(result, temp=self.default_sample_temperature, generated_ids=buf if buf else None)
-          await self.inference_engine.ensure_shard(shard)
-          token_value = token.item()
-          
-          # Add to buffer
-          self.buffered_token_output[request_id][0].append(token_value)
-          token_emitted = True
-          
-          # Get eos_token_id safely
-          eos_token_id = None
-          if hasattr(self.inference_engine, 'tokenizer') and self.inference_engine.tokenizer is not None:
-            eos_token_id = getattr(self.inference_engine.tokenizer, 'eos_token_id', None)
-            if eos_token_id is None and hasattr(self.inference_engine.tokenizer, '_tokenizer'):
-              eos_token_id = getattr(self.inference_engine.tokenizer._tokenizer, 'eos_token_id', None)
-          
-          # Qwen-specific stop tokens (in addition to eos_token_id)
-          qwen_stop_tokens = [151643, 151644, 151645]  # <|im_start|>, <|im_end|>, etc
-          
-          # Check for repetition: if token repeats >= 10 times, stop generation
-          buffered_tokens = self.buffered_token_output[request_id][0]
-          if len(buffered_tokens) >= 10:
-            last_10_tokens = buffered_tokens[-10:]
-            if len(set(last_10_tokens)) == 1:  # All 10 last tokens are identical
-              if DEBUG >= 1: 
-                print(f"[{request_id}] Detected repetition loop: token {token_value} repeated 10 times. Stopping generation.")
-              is_finished = True
-          
-          # Check if this is a stop token (eos_token_id or Qwen-specific)
-          if (eos_token_id is not None and token_value == eos_token_id) or (token_value in qwen_stop_tokens):
-              if DEBUG >= 1:
-                  print(f"[{request_id}] Detected EOS/stop token (ID: {token_value}). Stopping generation.")
-              is_finished = True
-              # Remove the eos token from buffer so it doesn't show in output
-              if self.buffered_token_output[request_id][0]:
-                  self.buffered_token_output[request_id][0].pop()
-              token_emitted = False 
-          
-          is_finished = is_finished or len(buffered_tokens) >= self.max_generate_tokens
-          if DEBUG >= 2: 
-            print(f"[{request_id}] Token: {token_value}, Emitted: {token_emitted}, EOS_ID: {eos_token_id}, Finished: {is_finished}")
-          
-          forward = token.reshape(1, -1)
-          # CRITICAL FIX: Send only new token for streaming (delta), not all buffered tokens
-          # This allows API to accumulate tokens correctly
-          if self.buffered_token_output[request_id][0] and token_emitted:
-              # Send only the new token (last one in buffer)
-              intermediate_result = [self.buffered_token_output[request_id][0][-1]]
-              if DEBUG >= 2:
-                print(f"[{request_id}] Sending new token: {intermediate_result}, total buffered: {len(self.buffered_token_output[request_id][0])}")
-          else:
-              # CRITICAL FIX: Even if no token emitted, we need to send signal to API
-              # If generation is finished, we must trigger callback with is_finished=True
-              # If not finished, send empty list but ensure callback is still triggered
-              intermediate_result = []
-              # If finished but no tokens, we still need to notify API
-              if is_finished and not self.buffered_token_output[request_id][0]:
-                # Send empty tokens but with is_finished=True so API knows to stop waiting
-                if DEBUG >= 2:
-                  print(f"[{request_id}] Generation finished with no tokens, sending empty result with is_finished=True")
-      else:
-        forward = result
-        intermediate_result = []
-    else:
-      await self.inference_engine.ensure_shard(shard)
-      is_finished = inference_state.get("is_finished", False)
-      intermediate_result, inference_state = self.handle_stable_diffusion(inference_state, result)
-      forward = result
-    # FIX: For distributed inference, we need to forward tensor to next partition
-    # regardless of is_finished status. The is_finished only affects token generation
-    # at the LAST_LAYER, but tensor should still be forwarded through the pipeline.
-    if not shard.is_last_layer():
-        # Not last layer - always forward tensor to next partition
-        self.outstanding_requests[request_id] = "waiting"
-        self._schedule_task(
-            self.forward_tensor(shard, forward, request_id, self.get_partition_index(offset=1, base_shard=shard), inference_state),
-            "forward_tensor",
-        )
-    else:
-        # Last layer - trigger callbacks for token output
-        if DEBUG >= 1:
-            print(f"[{request_id}] [LAST_LAYER] Triggering callback: tokens={intermediate_result}, is_finished={is_finished}, buffered_tokens={self.buffered_token_output.get(request_id, 'N/A')}")
-        self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
-        self._schedule_task(self.broadcast_result(request_id, intermediate_result, is_finished), "broadcast_result")
-        
-        if is_finished:
-            if shard.model_id != 'stable-diffusion-2-1-base':
-                self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
-            self.outstanding_requests.pop(request_id, None)
-            self._prompt_token_ids.pop(request_id, None)
+    # CRITICAL DEBUG: Print immediately when entering this function
+    if DEBUG >= 2:
+      print(f"[NODE_DEBUG] process_inference_result called: shard={shard.model_id}, is_last={shard.is_last_layer()}, result_shape={result.shape if hasattr(result, 'shape') else 'N/A'}, request_id={request_id}")
+    
+    if request_id not in self.buffered_token_output:
+      self.buffered_token_output[request_id] = ([], False)
+    
+    is_finished = self.buffered_token_output[request_id][1] or (len(self.buffered_token_output[request_id][0]) >= self.max_generate_tokens)
 
-    return  np.array(self.buffered_token_output[request_id][0]) if shard.model_id != 'stable-diffusion-2-1-base' else intermediate_result
+    # Tokens generation logic: only needed for LLMs
+    if shard.is_last_layer() and not is_finished:
+      # Check for empty results before sampling
+      if result.size == 0 or (len(result.shape) >= 2 and result.shape[1] == 0):
+        if DEBUG >= 2:
+          print(f"[{request_id}] Warning: Empty result from inference, cannot sample. Marking as finished.")
+        is_finished = True
+        self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
+        forward = np.array([[]], dtype=np.int32).reshape(1, 0)
+        intermediate_result = []
+      else:
+        # Sample token from logits
+        buf = self.buffered_token_output[request_id][0]
+        
+        # DEBUG: Print result shape and logits info
+        if DEBUG >= 2:
+          print(f"[{request_id}] [DEBUG] result shape: {result.shape}, dtype: {result.dtype}")
+          if result.size > 0 and len(result.shape) >= 3:
+            # Get logits at last position
+            last_logits = result[0, -1, :] if result.shape[1] > 0 else result[0, 0, :]
+            top_k = 5
+            top_indices = np.argsort(last_logits)[-top_k:][::-1]
+            print(f"[{request_id}] [DEBUG] Top {top_k} logits: {[(int(idx), float(last_logits[idx])) for idx in top_indices]}")
+        
+        token = await self.inference_engine.sample(result, temp=self.default_sample_temperature, generated_ids=buf if buf else None)
+        await self.inference_engine.ensure_shard(shard)
+        token_value = token.item()
+        
+        if DEBUG >= 1:
+          print(f"[{request_id}] [DEBUG] Sampled token_value: {token_value}")
+
+        # Get eos_token_id safely
+        eos_token_id = None
+        if hasattr(self.inference_engine, 'tokenizer') and self.inference_engine.tokenizer is not None:
+          eos_token_id = getattr(self.inference_engine.tokenizer, 'eos_token_id', None)
+          if eos_token_id is None and hasattr(self.inference_engine.tokenizer, '_tokenizer'):
+            eos_token_id = getattr(self.inference_engine.tokenizer._tokenizer, 'eos_token_id', None)
+
+        # Qwen-specific stop tokens
+        qwen_stop_tokens = [151643, 151644, 151645]
+
+        stop_ids = set(qwen_stop_tokens)
+        if eos_token_id is not None:
+          stop_ids.add(eos_token_id)
+        
+        if len(buf) == 0 and token_value in stop_ids and result.size > 0:
+          try:
+            retry_logits = np.array(result, copy=True)
+            for sid in stop_ids:
+              if 0 <= sid < retry_logits.shape[-1]:
+                retry_logits[0, -1, sid] = -1e9
+            retry_token = await self.inference_engine.sample(
+              retry_logits,
+              temp=self.default_sample_temperature,
+              generated_ids=buf if buf else None,
+            )
+            token = retry_token
+            token_value = token.item()
+          except Exception:
+            pass
+
+        # Add to buffer
+        self.buffered_token_output[request_id][0].append(token_value)
+        token_emitted = True
+        
+        # Repetition detection
+        buffered_tokens = self.buffered_token_output[request_id][0]
+        if len(buffered_tokens) >= 10:
+          last_10_tokens = buffered_tokens[-10:]
+          if len(set(last_10_tokens)) == 1:
+            if DEBUG >= 1: 
+              print(f"[{request_id}] Detected repetition loop: token {token_value} repeated 10 times. Stopping generation.")
+            is_finished = True
+        
+        # Stop token detection
+        if (eos_token_id is not None and token_value == eos_token_id) or (token_value in qwen_stop_tokens):
+          if DEBUG >= 1:
+            print(f"[{request_id}] Detected EOS/stop token (ID: {token_value}). Stopping generation.")
+          is_finished = True
+          if self.buffered_token_output[request_id][0]:
+            self.buffered_token_output[request_id][0].pop()
+          token_emitted = False 
+        
+        is_finished = is_finished or len(buffered_tokens) >= self.max_generate_tokens
+        if DEBUG >= 2: 
+          print(f"[{request_id}] Token: {token_value}, Emitted: {token_emitted}, Finished: {is_finished}")
+        
+        forward = token.reshape(1, -1)
+        if self.buffered_token_output[request_id][0] and token_emitted:
+          intermediate_result = [self.buffered_token_output[request_id][0][-1]]
+        else:
+          intermediate_result = []
+          if is_finished and not self.buffered_token_output[request_id][0]:
+            if DEBUG >= 2:
+              print(f"[{request_id}] Generation finished with no tokens, sending empty result with is_finished=True")
+    else:
+      forward = result
+      intermediate_result = []
+
+    # Forward tensor to next partition
+    if not shard.is_last_layer():
+      self.outstanding_requests[request_id] = "waiting"
+      forwarded_tokens = await self.forward_tensor(
+        shard,
+        forward,
+        request_id,
+        self.get_partition_index(offset=1, base_shard=shard),
+        inference_state,
+      )
+      if forwarded_tokens is not None and forwarded_tokens.size > 0:
+        self._on_token_received(request_id, forwarded_tokens.flatten().tolist(), False)
+      return forwarded_tokens
+    else:
+      if DEBUG >= 1:
+        print(f"[{request_id}] [LAST_LAYER] Triggering callback: tokens={intermediate_result}, is_finished={is_finished}")
+      self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
+      
+      if intermediate_result or is_finished:
+        self._schedule_task(self.broadcast_result(request_id, intermediate_result, is_finished), name=f"broadcast_{request_id}")
+    
+      if is_finished:
+        if request_id in self.buffered_token_output:
+          self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
+        self.outstanding_requests.pop(request_id, None)
+        self._prompt_token_ids.pop(request_id, None)
+    
+        return np.array(self.buffered_token_output.get(request_id, ([], False))[0])
 
 
   async def process_prompt(
@@ -268,6 +298,7 @@ class Node:
     prompt: str,
     request_id: Optional[str] = None,
     inference_state: Optional[dict] = {},
+    max_generate_tokens: Optional[int] = None,
   ) -> Optional[np.ndarray]:
     shard = self.get_current_shard(base_shard)
     start_time = time.perf_counter_ns()
@@ -286,7 +317,7 @@ class Node:
       )
     )
     start_time = time.perf_counter_ns()
-    resp = await self._process_prompt(base_shard, prompt, request_id, inference_state)
+    resp = await self._process_prompt(base_shard, prompt, request_id, inference_state, max_generate_tokens)
     end_time = time.perf_counter_ns()
     elapsed_time_ns = end_time - start_time
     self._schedule_task(
@@ -305,8 +336,9 @@ class Node:
       )
     )
     if DEBUG >= 2: print(f"[{request_id}] process prompt: {base_shard=} {shard=} {prompt=} {elapsed_time_ns=}")
+    return resp
 
-  async def _process_prompt(self, base_shard: Shard, prompt: str, request_id: Optional[str] = None, inference_state: Optional[dict] = None) -> Optional[np.ndarray]:
+  async def _process_prompt(self, base_shard: Shard, prompt: str, request_id: Optional[str] = None, inference_state: Optional[dict] = None, max_generate_tokens: Optional[int] = None) -> Optional[np.ndarray]:
     if request_id is None:
       request_id = str(uuid.uuid4())
     shard = self.get_current_shard(base_shard)
@@ -320,11 +352,63 @@ class Node:
     else:
       self.outstanding_requests[request_id] = "processing"
       try:
+        token_limit = max_generate_tokens if isinstance(max_generate_tokens, int) and max_generate_tokens > 0 else self.max_generate_tokens
+        latest_result = None
+
+        # First decoding step from full prompt.
         prompt_ids = await self.inference_engine.encode(shard, prompt)
         self._prompt_token_ids[request_id] = prompt_ids
         result, inference_state = await self.inference_engine.infer_prompt(request_id, shard, prompt, inference_state)
-        ret = await self.process_inference_result(shard, result, request_id, inference_state)
-        return result
+        latest_result = await self.process_inference_result(shard, result, request_id, inference_state)
+
+        # Next decoding steps are autoregressive from last generated token.
+        prev_len = -1
+        wait_start = time.perf_counter()
+        while True:
+          # Wait for tokens arriving via callbacks or local processing
+          buffered_tokens, finished = self.buffered_token_output.get(request_id, ([], False))
+          current_len = len(buffered_tokens)
+          
+          if finished or current_len >= token_limit:
+            break
+            
+          if current_len == 0 or current_len == prev_len:
+            # yield to allow callback processing
+            await asyncio.sleep(0.1) # Throttled wait
+            
+            # Watchdog: if we've been waiting too long without any progress
+            if time.perf_counter() - wait_start > 60.0:
+              if DEBUG >= 1: 
+                print(f"[{request_id}] Generation watchdog triggered: no progress in 60s. State: {self.outstanding_requests.get(request_id)}")
+              
+              # If we are waiting for a remote node, maybe try to nudge it?
+              # For now, just continue waiting but log the stall
+              wait_start = time.perf_counter() # Reset watchdog to log again in 60s
+              
+            continue
+            
+          # Progress logging
+          tokens = self.buffered_token_output[request_id][0]
+          if DEBUG >= 1:
+            print(f"[{request_id}] PROGRESS: Generated {len(tokens)}/{self.max_generate_tokens} tokens.")
+          
+          # Check if we are finished
+          if self.buffered_token_output[request_id][1] or len(tokens) >= self.max_generate_tokens:
+            break
+            
+          prev_len = current_len
+          last_token = np.array([[tokens[-1]]])
+          
+          # Continue autoregressive loop
+          latest_result = await self.process_tensor(base_shard, last_token, request_id, inference_state)
+
+        buffered_tokens, finished = self.buffered_token_output.get(request_id, ([], False))
+        if not finished:
+          self.buffered_token_output[request_id] = (buffered_tokens, True)
+          self.trigger_on_token_callbacks(request_id, [], True)
+        self.outstanding_requests.pop(request_id, None)
+        self._prompt_token_ids.pop(request_id, None)
+        return latest_result if latest_result is not None else result
       except Exception as e:
         # CRITICAL FIX: If exception occurs, ensure API is notified
         if DEBUG >= 1:
@@ -505,6 +589,7 @@ class Node:
     end_time = time.perf_counter_ns()
     elapsed_time_ns = end_time - start_time
     if DEBUG >= 2: print(f"[{request_id}] process_tensor: {base_shard=} {shard=} {tensor.size=} {tensor.shape=} {elapsed_time_ns=}")
+    return resp
 
   async def _process_tensor(
     self,
@@ -534,9 +619,10 @@ class Node:
       ret = await self.process_inference_result(shard, result, request_id, inference_state)
       return ret
     except Exception as e:
-      self.outstanding_requests.pop(request_id)
+      self.outstanding_requests.pop(request_id, None)
       print(f"Error processing tensor for shard {shard}: {e}")
       traceback.print_exc()
+      raise
   
   async def forward_example(
     self,
@@ -678,16 +764,28 @@ class Node:
   ) -> None:
     if DEBUG >= 1: print(f"target partition index: {target_index}")
     target_id = self.partitioning_strategy.partition(self.topology, base_shard)[target_index].node_id
-    next_shard = self.get_current_shard(base_shard, target_index)
-    if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. target shard: {next_shard}")
+    target_shard = self.get_current_shard(base_shard, target_index)
+    if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. target shard: {target_shard}")
     if target_id == self.id:
-      await self.process_tensor(next_shard, tensor, request_id, inference_state)
+      return await self.process_tensor(target_shard, tensor, request_id, inference_state)
     else:
       target_peer = next((p for p in self.peers if p.id() == target_id), None)
       if not target_peer:
         raise ValueError(f"Peer for {target_index} not found")
       if DEBUG >= 1: print(f"Sending tensor to {target_peer.id()}: {tensor}")
-      await target_peer.send_tensor(next_shard, tensor, request_id=request_id, inference_state=inference_state)
+      # HIỆN THÔNG BÁO PHÂN TÁN RÕ RÀNG
+      print(f"[DISTRIBUTED] Forwarding workload to Node: {target_id}")
+      # Add a safety watchdog to prevent infinite hangs in forwarding
+      result = await asyncio.wait_for(
+        target_peer.send_tensor(
+          target_shard,
+          tensor,
+          request_id=request_id,
+          inference_state=inference_state,
+        ),
+        timeout=300.0 # Extreme safety margin
+      )
+      return result
 
   def get_partition_index(self, offset: int = 0, base_shard: Optional[Shard] = None):
     if not self.partitioning_strategy:
@@ -842,11 +940,13 @@ class Node:
     if DEBUG >= 2: print(f"Broadcasting result: {request_id=} {result=} {is_finished=}")
     async def send_result_to_peer(peer):
       try:
-        await asyncio.wait_for(peer.send_result(request_id, result, is_finished), timeout=15.0)
+        if DEBUG >= 1: print(f"  [BROADCAST] Sending to {peer.id()}...")
+        await asyncio.wait_for(peer.send_result(request_id, result, is_finished), timeout=30.0)
+        if DEBUG >= 1: print(f"  [BROADCAST] Sent to {peer.id()} successfully.")
       except asyncio.TimeoutError:
-        print(f"Timeout broadcasting result to {peer.id()}")
+        print(f"!!! [BROADCAST_TIMEOUT] Timeout broadcasting result to {peer.id()} (30s)")
       except Exception as e:
-        print(f"Error broadcasting result to {peer.id()}: {e}")
+        print(f"!!! [BROADCAST_ERROR] Error broadcasting result to {peer.id()}: {e}")
         traceback.print_exc()
 
     await asyncio.gather(*[send_result_to_peer(peer) for peer in self.peers], return_exceptions=True)
@@ -872,15 +972,25 @@ class Node:
     # in the case of opaque status, we also want to receive our own opaque statuses
     self.on_opaque_status.trigger_all(request_id, status)
 
+  def _on_token_received(self, request_id: str, tokens: List[int], is_finished: bool) -> None:
+    """Internal callback to synchronize buffered tokens on orchestrator node."""
+    if request_id not in self.buffered_token_output:
+      self.buffered_token_output[request_id] = ([], False)
+    
+    current_tokens, _ = self.buffered_token_output[request_id]
+    
+    # We only add tokens that are not already at the END of our buffer.
+    # This prevents double-adding on the node that actually did the sampling.
+    if tokens:
+      # If we receive multiple tokens, we might need a more robust check, 
+      # but usually it's one token at a time in streaming.
+      if not current_tokens or current_tokens[-len(tokens):] != tokens:
+        current_tokens.extend(tokens)
+    
+    self.buffered_token_output[request_id] = (current_tokens, is_finished)
+    if DEBUG >= 2:
+      print(f"[{request_id}] Internal buffer updated: {len(current_tokens)} tokens, finished={is_finished}")
+
   @property
   def current_topology(self) -> Topology:
     return self.topology
-
-  def handle_stable_diffusion(self, inference_state, result):
-    if inference_state['is_step_finished']:
-      inference_state['step']+=1
-    progress = [inference_state['step'],inference_state['total_steps']]
-    intermediate_result = result
-    if progress[0] == progress[1]:
-      intermediate_result = result
-    return intermediate_result, inference_state
