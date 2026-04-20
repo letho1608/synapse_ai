@@ -162,12 +162,15 @@ class GRPCPeerHandle(PeerHandle):
         return False
       request = node_service_pb2.HealthCheckRequest()
       response = await asyncio.wait_for(self.stub.HealthCheck(request), timeout=5)
+      if response.is_healthy:
+        print(f"✅ [HEALTH CHECK OK] Node {self._id} tại {self.address} đã phản hồi thành công!")
       return response.is_healthy
     except asyncio.TimeoutError:
+      print(f"⚠️  [HEALTH CHECK TIMEOUT] Node {self._id} tại {self.address} không phản hồi trong 5s.")
       return False
-    except Exception:
+    except Exception as e:
+      print(f"❌ [HEALTH CHECK FAILED] Node {self._id} tại {self.address} gặp lỗi: {e}")
       if DEBUG >= 4:
-        print(f"Health check failed for {self._id}@{self.address}.")
         import traceback
         traceback.print_exc()
       return False

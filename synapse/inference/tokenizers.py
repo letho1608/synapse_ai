@@ -2,7 +2,14 @@ import traceback
 from os import PathLike
 import os
 from typing import Union
-from transformers import AutoTokenizer, AutoProcessor
+from transformers import AutoTokenizer
+try:
+    from transformers import AutoProcessor
+except ImportError:
+    AutoProcessor = None
+    if DEBUG >= 1:
+        print("[WARNING] AutoProcessor could not be imported from transformers. Vision models may not work.")
+
 import numpy as np
 from synapse.helpers import DEBUG
 from pathlib import Path

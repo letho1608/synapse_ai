@@ -70,7 +70,13 @@ async def update_device_attributes(device_id: str, api_key: str, node_id: str, n
       "custom:synapse_device_capability_system_ram_mb": str(getattr(device_capabilities, "system_ram_mb", 0)),
     }
 
+    # Track if we've hit a 403 already to avoid repeated calls
+    has_seen_403 = False
+
     for attr_name, attr_value in attributes.items():
+      if has_seen_403:
+        break
+        
       url = f"{base_url}/{attr_name}"
       data = {"value": str(attr_value).replace(' ', '_')}  # Ensure all values are strings for JSON
       async with session.post(url, headers=headers, json=data) as response:
@@ -81,7 +87,9 @@ async def update_device_attributes(device_id: str, api_key: str, node_id: str, n
             if DEBUG_DISCOVERY >= 2: print(f"Device posture attribute {attr_name} not found (404). This feature may not be enabled.")
         elif response.status == 403:
             # 403 means the feature is not available on current billing plan, suppress the error
-            if DEBUG_DISCOVERY >= 2: print(f"Device posture attribute {attr_name} not available (403). Feature requires paid billing plan.")
+            has_seen_403 = True
+            if DEBUG_DISCOVERY >= 3: 
+                print(f"Device posture attribute {attr_name} not available (403). Feature requires paid billing plan. Skipping further attribute updates.")
         else:
             print(f"Failed to update device posture attribute {attr_name}: {response.status} {await response.text()}")
 

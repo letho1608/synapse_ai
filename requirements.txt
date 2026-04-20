@@ -14,7 +14,7 @@ jinja2
 numpy
 nuitka
 nvidia-ml-py
-opencv-python
+opencv-python-headless
 opentelemetry-api
 pandas
 pillow
@@ -40,6 +40,9 @@ peft
 datasets
 accelerate
 bitsandbytes
+torchvision
+timm
+sentencepiece
 
 # LACP Dependencies
 pulp>=2.7.0

@@ -124,8 +124,13 @@ class TailscaleDiscovery(Discovery):
               print(f"Discover peers: skip device {device.device_id} ({device.name}) after timeout/error: {e}")
             continue
           if not peer_id:
-            if DEBUG_DISCOVERY >= 4: print(f"{device.device_id} does not have synapse node attributes. skipping.")
-            continue
+            if DEBUG_DISCOVERY >= 1: 
+              print(f"TailscaleDiscovery: Device {device.name} at {peer_host} has no Synapse attributes (likely Free Plan). Probing port 50051...")
+            
+            # Use hostname as the node_id for fallback, and 50051 as default port
+            peer_id = device.name
+            peer_port = 50051
+            device_capabilities = UNKNOWN_DEVICE_CAPABILITIES
 
           if self.allowed_node_ids and peer_id not in self.allowed_node_ids:
             if DEBUG_DISCOVERY >= 2: print(f"Ignoring peer {peer_id} as it's not in the allowed node IDs list")
@@ -134,7 +139,8 @@ class TailscaleDiscovery(Discovery):
           if peer_id not in self.known_peers or self.known_peers[peer_id][0].addr() != f"{peer_host}:{peer_port}":
             new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
             if not await new_peer_handle.health_check():
-              if DEBUG >= 1: print(f"Peer {peer_id} at {peer_host}:{peer_port} is not healthy. Skipping.")
+              # Lỗi chi tiết đã được in trong GRPCPeerHandle.health_check()
+              if DEBUG >= 1: print(f"🔍 [DISCOVERY] Bỏ qua {peer_id} tại {peer_host}:{peer_port} do không vượt qua bài kiểm tra sức khỏe.")
               continue
 
             if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")
@@ -241,7 +247,14 @@ class TailscaleDiscovery(Discovery):
           for ip in our_ips_for_match for addr in addrs_flat if addr
         ))
         match_name = (name == self.node_id) or (self.node_id and (name == self.node_id or self.node_id in name))
-        match_hostname = bool(hostname and name and hostname in name.lower())
+        # Su dung kiem tra chinh xac (prefix hoac exact) thay vi substring
+        # de tranh nham lan: vi du hostname "hung" se khop voi "doanvanhung-virtual-machine"
+        name_lower = (name or "").lower().split(".")[0]  # Lay phan truoc dau cham (truoc .tailf0c...)
+        match_hostname = bool(hostname and name and (
+          name_lower == hostname or                      # Khop chinh xac
+          name_lower.startswith(hostname + "-") or       # Prefix rõ rang: "hung-pc"
+          name_lower.startswith(hostname + "_")          # Prefix rõ rang: "hung_desktop"
+        ))
         is_self = match_id or match_ip or match_name or match_hostname
         row = {
           "name": name,
@@ -264,16 +277,24 @@ class TailscaleDiscovery(Discovery):
         try:
           peer_id, peer_port, caps = await get_device_attributes(device.device_id, self.tailscale_api_key)
           if peer_id:
-            row["is_synapse_node"] = True
-            row["synapse_node_id"] = peer_id
-            row["synapse_port"] = peer_port
-            row["model"] = caps.model or ""
-            row["memory_gb"] = caps.memory // 1024 if caps.memory else None
-            row["flops_fp16"] = float(caps.flops.fp16) if caps.flops else 0.0
-            row["flops_fp32"] = float(caps.flops.fp32) if caps.flops else 0.0
-            row["cpu_cores"] = caps.cpu_cores
-            row["disk_gb"] = caps.disk_gb
-            row["system_ram_gb"] = (getattr(caps, "system_ram_mb", 0) or 0) // 1024
+            # Chi danh dau la Synapse Node neu may do dang co trong known_peers
+            # (da qua Health Check that su), khong chi dua vao Tailscale Attributes cu
+            is_known_peer = peer_id in self.known_peers
+            if is_known_peer:
+              row["is_synapse_node"] = True
+              row["synapse_node_id"] = peer_id
+              row["synapse_port"] = peer_port
+              row["model"] = caps.model or ""
+              row["memory_gb"] = caps.memory // 1024 if caps.memory else None
+              row["flops_fp16"] = float(caps.flops.fp16) if caps.flops else 0.0
+              row["flops_fp32"] = float(caps.flops.fp32) if caps.flops else 0.0
+              row["cpu_cores"] = caps.cpu_cores
+              row["disk_gb"] = caps.disk_gb
+              row["system_ram_gb"] = (getattr(caps, "system_ram_mb", 0) or 0) // 1024
+            else:
+              # May co Attributes cu tren Tailscale nhung hien khong phan hoi
+              row["is_synapse_node"] = False
+              row["synapse_node_id"] = peer_id  # Van giu ID de hien thi trang thai offline
         except Exception:
           pass
         # Máy này: luôn dùng device_capabilities local (gọi mới mỗi lần) để hiển thị đúng

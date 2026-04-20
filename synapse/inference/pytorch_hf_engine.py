@@ -320,6 +320,19 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         if DEBUG >= 1:
             print(f"[PyTorchHF] Loading {shard.model_id} -> {hf_id}")
 
+        # Check for critical dependencies
+        try:
+            import torchvision
+        except ImportError:
+            if DEBUG >= 1:
+                print("[WARNING] torchvision is missing. Multimodal models (vision) will likely fail.")
+        
+        try:
+            import timm
+        except ImportError:
+            if DEBUG >= 1:
+                print("[WARNING] timm (PyTorch Image Models) is missing. Some models may fail to load.")
+
         is_vision = shard.model_id in VISION_MODELS
         if is_vision:
             try:
