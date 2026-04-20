@@ -115,7 +115,6 @@ class TailscaleDiscovery(Discovery):
         if DEBUG_DISCOVERY >= 2: print("Time since last seen tailscale devices", [(current_time - device.last_seen.timestamp()) for device in devices.values()])
 
         for device in active_devices.values():
-          if device.name == self.node_id: continue
           peer_host = device.addresses[0]
           try:
             peer_id, peer_port, device_capabilities = await get_device_attributes(device.device_id, self.tailscale_api_key)
@@ -132,6 +131,10 @@ class TailscaleDiscovery(Discovery):
             peer_port = 50051
             device_capabilities = UNKNOWN_DEVICE_CAPABILITIES
 
+          # Skip self — compare by UUID node_id (not Tailscale hostname which never matches)
+          if peer_id == self.node_id or device.name == self.node_id:
+            continue
+
           if self.allowed_node_ids and peer_id not in self.allowed_node_ids:
             if DEBUG_DISCOVERY >= 2: print(f"Ignoring peer {peer_id} as it's not in the allowed node IDs list")
             continue
@@ -139,9 +142,17 @@ class TailscaleDiscovery(Discovery):
           if peer_id not in self.known_peers or self.known_peers[peer_id][0].addr() != f"{peer_host}:{peer_port}":
             new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
             if not await new_peer_handle.health_check():
-              # Lỗi chi tiết đã được in trong GRPCPeerHandle.health_check()
-              if DEBUG >= 1: print(f"🔍 [DISCOVERY] Bỏ qua {peer_id} tại {peer_host}:{peer_port} do không vượt qua bài kiểm tra sức khỏe.")
-              continue
+              # Nếu port lưu trữ bị cũ (stale), thử lại với port mặc định 50051
+              if peer_port != 50051:
+                if DEBUG >= 1: print(f"🔄 [DISCOVERY] Port {peer_port} không phản hồi — thử lại với port 50051 cho {peer_id}...")
+                new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:50051", "TS", device_capabilities)
+                peer_port = 50051
+                if not await new_peer_handle.health_check():
+                  if DEBUG >= 1: print(f"🔍 [DISCOVERY] Bỏ qua {peer_id} tại {peer_host}:50051 do không vượt qua bài kiểm tra sức khỏe.")
+                  continue
+              else:
+                if DEBUG >= 1: print(f"🔍 [DISCOVERY] Bỏ qua {peer_id} tại {peer_host}:{peer_port} do không vượt qua bài kiểm tra sức khỏe.")
+                continue
 
             if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")
             self.known_peers[peer_id] = (
