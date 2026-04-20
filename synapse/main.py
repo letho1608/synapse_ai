@@ -81,6 +81,7 @@ TAILNET_NAME_DEFAULT = "testdoki925@gmail.com"
 parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (defaults to hardcoded value)")
 parser.add_argument("--node-id-filter", type=str, default=None, help="Comma separated list of allowed node IDs (only for UDP and Tailscale discovery)")
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
+parser.add_argument("--bind-to-tailscale", action="store_true", help="Force bind gRPC and API server to Tailscale IP")
 parser.add_argument("--system-prompt", type=str, default="Bạn là trợ lý Synapse AI. Hãy luôn trả lời bằng tiếng Việt một cách hữu ích và chính xác.", help="System prompt for the ChatGPT API")
 args = parser.parse_args()
 
@@ -91,11 +92,23 @@ inference_engine_name = args.inference_engine if hasattr(args, "inference_engine
 inference_engine = get_inference_engine(inference_engine_name, None)
 shard_downloader: ShardDownloader = inference_engine.shard_downloader
 
-if args.node_port is None:
-  args.node_port = find_available_port(args.node_host)
-  if DEBUG >= 1: print(f"Using available port: {args.node_port}")
-
 args.node_id = args.node_id or get_or_create_node_id()
+
+# Interface Binding Logic
+if args.bind_to_tailscale:
+    from synapse.networking.tailscale.tailscale_discovery import _get_all_local_ips
+    local_ips = _get_all_local_ips()
+    tailscale_ips = [ip for ip in local_ips if ip.startswith("100.")]
+    if tailscale_ips:
+        args.node_host = tailscale_ips[0]
+        if DEBUG >= 1: print(f"📍 Binding to Tailscale IP: {args.node_host}")
+    else:
+        if DEBUG >= 1: print("⚠️  Warning: --bind-to-tailscale set but no Tailscale IP (100.x.x.x) found. Falling back to 0.0.0.0")
+
+if args.node_port is None:
+    args.node_port = find_available_port(args.node_host)
+    if DEBUG >= 1: print(f"🔌 Using available port: {args.node_port}")
+
 chatgpt_api_endpoints = [f"http://{ip}:{args.chatgpt_api_port}/v1/chat/completions" for ip, _ in get_all_ip_addresses_and_interfaces()]
 web_chat_urls = [f"http://{ip}:{args.chatgpt_api_port}" for ip, _ in get_all_ip_addresses_and_interfaces()]
 

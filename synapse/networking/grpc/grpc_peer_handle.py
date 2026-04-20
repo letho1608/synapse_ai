@@ -166,10 +166,12 @@ class GRPCPeerHandle(PeerHandle):
         print(f"✅ [HEALTH CHECK OK] Node {self._id} tại {self.address} đã phản hồi thành công!")
       return response.is_healthy
     except asyncio.TimeoutError:
-      print(f"⚠️  [HEALTH CHECK TIMEOUT] Node {self._id} tại {self.address} không phản hồi trong 5s.")
+      print(f"⚠️  [HEALTH CHECK TIMEOUT] Node {self._id} tại {self.address} không phản hồi trong 5s. (Hãy kiểm tra Firewall/UFW trên máy đích)")
       return False
     except Exception as e:
       print(f"❌ [HEALTH CHECK FAILED] Node {self._id} tại {self.address} gặp lỗi: {e}")
+      if "Connect call failed" in str(e):
+          print(f"   💡 Gợi ý: Máy đích ({self.address.split(':')[0]}) có vẻ đang từ chối kết nối hoặc cổng bị đóng.")
       if DEBUG >= 4:
         import traceback
         traceback.print_exc()
