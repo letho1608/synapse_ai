@@ -276,6 +276,12 @@ class TailscaleDiscovery(Discovery):
         }
         try:
           peer_id, peer_port, caps = await get_device_attributes(device.device_id, self.tailscale_api_key)
+          
+          # Fallback logic for Free Plan (missing attributes)
+          if not peer_id:
+            peer_id = device.name
+            peer_port = 50051
+
           if peer_id:
             # Chi danh dau la Synapse Node neu may do dang co trong known_peers
             # (da qua Health Check that su), khong chi dua vao Tailscale Attributes cu
