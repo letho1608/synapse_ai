@@ -38,6 +38,7 @@ class GRPCPeerHandle(PeerHandle):
     ]
     self.max_rpc_retries = 10
     self.rpc_retry_base_delay = 0.5 # Tăng thêm delay cơ bản
+    self._lock = asyncio.Lock()
     self.retryable_status_codes = {
       grpc.StatusCode.UNAVAILABLE,
       grpc.StatusCode.UNKNOWN,
@@ -58,30 +59,38 @@ class GRPCPeerHandle(PeerHandle):
     return self._device_capabilities
 
   async def connect(self):
-    # Cleanup channel cũ nếu có
-    if self.channel is not None:
+    async with self._lock:
+      # Cleanup channel cũ nếu có
+      if self.channel is not None:
+        try:
+          # Gọi trực tiếp close để tránh deadlock nếu dùng self.disconnect()
+          await self.channel.close()
+        except Exception:
+          pass  # Ignore errors khi cleanup
+        finally:
+          self.channel = None
+          self.stub = None
+      
       try:
-        await self.disconnect()
-      except Exception:
-        pass  # Ignore errors khi cleanup
-    
-    try:
-      self.channel = grpc.aio.insecure_channel(
-        self.address,
-        options=self.channel_options,
-        compression=grpc.Compression.Gzip
-      )
-      self.stub = node_service_pb2_grpc.NodeServiceStub(self.channel)
-      # More robust waiting for channel readiness
-      try:
-        await asyncio.wait_for(self.channel.channel_ready(), timeout=10.0)
-      except asyncio.TimeoutError:
-        if DEBUG >= 2: print(f"Channel not ready for {self._id}@{self.address} after 10s, will retry on next RPC")
-        # Don't raise here, let the RPC call handle it via _rpc_with_retry
-    except Exception as e:
-      if DEBUG >= 2: print(f"Fatal error during connect for {self._id}@{self.address}: {e}")
-      await self.disconnect()
-      raise
+        self.channel = grpc.aio.insecure_channel(
+          self.address,
+          options=self.channel_options,
+          compression=grpc.Compression.Gzip
+        )
+        self.stub = node_service_pb2_grpc.NodeServiceStub(self.channel)
+        # More robust waiting for channel readiness
+        try:
+          await asyncio.wait_for(self.channel.channel_ready(), timeout=10.0)
+        except asyncio.TimeoutError:
+          if DEBUG >= 2: print(f"Channel not ready for {self._id}@{self.address} after 10s, will retry on next RPC")
+          # Don't raise here, let the RPC call handle it via _rpc_with_retry
+      except Exception as e:
+        if DEBUG >= 2: print(f"Fatal error during connect for {self._id}@{self.address}: {e}")
+        if self.channel:
+          await self.channel.close()
+        self.channel = None
+        self.stub = None
+        raise
 
   async def is_connected(self) -> bool:
     if self.channel is None:
@@ -92,10 +101,14 @@ class GRPCPeerHandle(PeerHandle):
     return state == grpc.ChannelConnectivity.READY
 
   async def disconnect(self):
-    if self.channel:
-      await self.channel.close()
-    self.channel = None
-    self.stub = None
+    async with self._lock:
+      if self.channel:
+        try:
+          await self.channel.close()
+        except Exception:
+          pass
+      self.channel = None
+      self.stub = None
   
   async def _rpc_with_retry(self, rpc_name: str, call_factory, timeout: Optional[float] = None):
     last_exc: Optional[Exception] = None
