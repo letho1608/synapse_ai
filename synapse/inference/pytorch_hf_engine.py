@@ -649,6 +649,22 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                     input_ids = input_ids.unsqueeze(0)
                 if labels.dim() == 1:
                     labels = labels.unsqueeze(0)
+                
+                # --- DIAGNOSTIC: Check vocab range ---
+                if hasattr(self._model, "config") and hasattr(self._model.config, "vocab_size"):
+                    vsize = self._model.config.vocab_size
+                    max_id = input_ids.max().item()
+                    min_id = input_ids.min().item()
+                    if max_id >= vsize or min_id < 0:
+                        print(f"!!! [PyTorchHF] WARNING: input_ids out of range! [0, {vsize-1}], found [{min_id}, {max_id}]")
+                        input_ids = torch.clamp(input_ids, 0, vsize - 1)
+                    
+                    max_label = labels.max().item()
+                    # ignore_index is -100
+                    if max_label >= vsize:
+                        print(f"!!! [PyTorchHF] WARNING: labels out of range! max={max_label}, vocab={vsize}")
+                        labels = torch.where(labels >= vsize, torch.tensor(-100).to(device), labels)
+                # --------------------------------------
                     
                 out = self._model(input_ids)
                 logits = out.logits if hasattr(out, "logits") else out[0]
