@@ -150,6 +150,22 @@ class SystemSpecs:
         total_ram_gb = total_ram_bytes / (1024.0 ** 3)
         available_ram_gb = available_ram_bytes / (1024.0 ** 3)
 
+        # Fallback for systems where psutil might report 0 (e.g. some containers/VMs)
+        if total_ram_gb <= 0:
+            try:
+                # Try reading from /proc/meminfo on Linux
+                if os.path.exists("/proc/meminfo"):
+                    with open("/proc/meminfo", "r") as f:
+                        for line in f:
+                            if "MemTotal" in line:
+                                total_ram_gb = int(line.split()[1]) / (1024.0 ** 2)
+                                break
+            except Exception:
+                pass
+            
+        if total_ram_gb <= 0:
+            total_ram_gb = 4.0 # Safe default
+            
         if available_ram_gb <= 0 and total_ram_gb > 0:
             available_ram_gb = total_ram_gb * 0.8
 

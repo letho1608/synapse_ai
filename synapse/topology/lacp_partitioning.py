@@ -232,10 +232,15 @@ class LACPPartitioningStrategy(PartitioningStrategy):
                 # 20% buffer (thay vì +300MB cố định)
                 memory_per_layer_mb = (total_mem_mb / num_layers) * 1.2
         
+        # --- TRAINING MULTIPLIER ---
+        # Training (with AdamW + Gradients) takes ~4-6x more memory than inference.
+        # We increase estimate to force sharding on low-VRAM nodes.
+        final_memory_per_layer = memory_per_layer_mb * 4.0
+        
         return [
             LayerProfile(
                 layer_id=i,
-                memory_mb=memory_per_layer_mb,
+                memory_mb=final_memory_per_layer,
                 compute_flops=0.0
             )
             for i in range(num_layers)

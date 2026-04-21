@@ -416,6 +416,16 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             if hw["device"] == "cuda" and "device_map" not in load_model_kw:
                 self._model = self._model.to("cuda")
 
+            # --- OPTIMIZATION: Enable Gradient Checkpointing for training ---
+            if hw["device"] == "cuda":
+                try:
+                    if hasattr(self._model, "gradient_checkpointing_enable"):
+                        self._model.gradient_checkpointing_enable()
+                        if DEBUG >= 1: print("[PyTorchHF] Gradient Checkpointing ENABLED to save VRAM.")
+                except Exception as e:
+                    if DEBUG >= 1: print(f"[PyTorchHF] Failed to enable gradient checkpointing: {e}")
+            # -----------------------------------------------------------------
+
             self._model_id = shard.model_id
             self.shard = shard
         except Exception as e:
@@ -680,13 +690,39 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 
                 # Execute specific layer range
                 layers = components["layers"]
+                
+                # OPTIMIZATION: Use manual gradient checkpointing for sharded layers
+                use_checkpointing = getattr(self._model, "gradient_checkpointing_enabled", False)
+                if not use_checkpointing:
+                    # Fallback check for the flag I set in ensure_shard
+                    use_checkpointing = hasattr(self._model, "gradient_checkpointing_enable")
+                
+                from torch.utils.checkpoint import checkpoint
+                
                 for i in range(shard.start_layer, shard.end_layer + 1):
-                    hidden_states = self._call_transformer_block(
-                        layers[i], hidden_states, 
-                        attention_mask=attention_mask, 
-                        position_ids=position_ids, 
-                        position_embeddings=position_embeddings
-                    )
+                    if use_checkpointing and not shard.is_last_layer():
+                        # We use checkpoint only for intermediate layers to save activation memory
+                        # Wrapper function to help checkpoint handle multiple arguments
+                        def create_custom_forward(module):
+                            def custom_forward(*args, **kwargs):
+                                return self._call_transformer_block(module, *args, **kwargs)
+                            return custom_forward
+
+                        hidden_states = checkpoint(
+                            create_custom_forward(layers[i]),
+                            hidden_states,
+                            attention_mask,
+                            position_ids,
+                            position_embeddings,
+                            use_reentrant=False
+                        )
+                    else:
+                        hidden_states = self._call_transformer_block(
+                            layers[i], hidden_states, 
+                            attention_mask=attention_mask, 
+                            position_ids=position_ids, 
+                            position_embeddings=position_embeddings
+                        )
                 
                 if not shard.is_last_layer():
                     # If this is NOT the last node, we stop here and return the hidden states 
@@ -719,6 +755,8 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             # 2. Backward & Step
             opt = self._get_optimizer()
             if opt is not None:
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 opt.zero_grad()
                 loss_val.backward()
                 torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
