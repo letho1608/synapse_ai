@@ -637,39 +637,81 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 loss_val = criterion(preds, labels, input_lens, label_lens)
             else:
                 # --- LLM TRAINING (CrossEntropy) ---
-                if example.dtype != np.int64:
-                    example = example.astype(np.int64)
+                components = self._get_transformer_components()
+                if not components:
+                    raise RuntimeError("Unsupported causal LM layout for training")
+                
+                # Identify input type: Hidden States (float) or IDs (int)
+                is_intermediate = np.issubdtype(example.dtype, np.floating)
+                
+                if is_intermediate:
+                    # Input is a hidden state from a previous node
+                    if example.ndim == 2:
+                        example = example[np.newaxis, :]
+                    hidden_states = torch.from_numpy(example).to(device=device, dtype=self._model.dtype)
+                    hidden_states.requires_grad = True
+                else:
+                    # Input is raw token IDs
+                    if example.dtype != np.int64:
+                        example = example.astype(np.int64)
+                    input_ids = torch.from_numpy(example).to(device)
+                    if input_ids.dim() == 1:
+                        input_ids = input_ids.unsqueeze(0)
+                        
+                    # Diagnostic: Check vocab range
+                    if hasattr(self._model, "config") and hasattr(self._model.config, "vocab_size"):
+                        vsize = self._model.config.vocab_size
+                        max_id = input_ids.max().item()
+                        if max_id >= vsize or input_ids.min().item() < 0:
+                            print(f"!!! [PyTorchHF] WARNING: input_ids out of range! [0, {vsize-1}], found {max_id}")
+                            input_ids = torch.clamp(input_ids, 0, vsize - 1)
+                    
+                    if shard.start_layer == 0:
+                        embed = components["embed"]
+                        hidden_states = embed(input_ids)
+                    else:
+                        raise RuntimeError(f"Received input_ids for non-starting shard {shard.start_layer}. Expected hidden states.")
+
+                # Prepare common forward params
+                seq_len = hidden_states.shape[1]
+                position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(hidden_states.shape[0], -1)
+                position_embeddings = self._build_position_embeddings(hidden_states, position_ids)
+                attention_mask = None # Default causal
+                
+                # Execute specific layer range
+                layers = components["layers"]
+                for i in range(shard.start_layer, shard.end_layer + 1):
+                    hidden_states = self._call_transformer_block(
+                        layers[i], hidden_states, 
+                        attention_mask=attention_mask, 
+                        position_ids=position_ids, 
+                        position_embeddings=position_embeddings
+                    )
+                
+                if not shard.is_last_layer():
+                    # If this is NOT the last node, we stop here and return the hidden states 
+                    # for the next node to continue.
+                    return 0.0, hidden_states.detach().cpu().numpy()
+
+                # Last layer: Apply norm and head
+                final_norm = components["final_norm"]
+                if final_norm:
+                    hidden_states = final_norm(hidden_states)
+                
+                lm_head = components["lm_head"]
+                if not lm_head:
+                    raise RuntimeError("Last layer shard requires lm_head for loss calculation")
+                
+                logits = lm_head(hidden_states)
+                
+                # Loss Calculation
                 if target.dtype != np.int64:
                     target = target.astype(np.int64)
-                    
-                input_ids = torch.from_numpy(example).to(device)
                 labels = torch.from_numpy(target).to(device)
-                
-                if input_ids.dim() == 1:
-                    input_ids = input_ids.unsqueeze(0)
                 if labels.dim() == 1:
                     labels = labels.unsqueeze(0)
                 
-                # --- DIAGNOSTIC: Check vocab range ---
-                if hasattr(self._model, "config") and hasattr(self._model.config, "vocab_size"):
-                    vsize = self._model.config.vocab_size
-                    max_id = input_ids.max().item()
-                    min_id = input_ids.min().item()
-                    if max_id >= vsize or min_id < 0:
-                        print(f"!!! [PyTorchHF] WARNING: input_ids out of range! [0, {vsize-1}], found [{min_id}, {max_id}]")
-                        input_ids = torch.clamp(input_ids, 0, vsize - 1)
-                    
-                    max_label = labels.max().item()
-                    # ignore_index is -100
-                    if max_label >= vsize:
-                        print(f"!!! [PyTorchHF] WARNING: labels out of range! max={max_label}, vocab={vsize}")
-                        labels = torch.where(labels >= vsize, torch.tensor(-100).to(device), labels)
-                # --------------------------------------
-                    
-                out = self._model(input_ids)
-                logits = out.logits if hasattr(out, "logits") else out[0]
-                
-                # Causal LM shift
+                # Shift for causal LM
                 shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
                 shift_labels = labels[..., 1:].contiguous().view(-1)
                 loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
