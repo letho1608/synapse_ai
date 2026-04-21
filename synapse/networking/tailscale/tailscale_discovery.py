@@ -80,8 +80,9 @@ class TailscaleDiscovery(Discovery):
         if DEBUG_DISCOVERY >= 2:
           print(f"Updated device posture attributes")
       except Exception as e:
-        print(f"Error updating device posture attributes: {e}")
-        print(traceback.format_exc())
+        if DEBUG_DISCOVERY >= 1:
+          print(f"TailscaleDiscovery: Unexpected error in posture update loop: {e}")
+          traceback.print_exc()
       finally:
         await asyncio.sleep(self.update_interval)
 
@@ -98,6 +99,9 @@ class TailscaleDiscovery(Discovery):
       if DEBUG_DISCOVERY >= 1: print(f"TailscaleDiscovery: Device ID: {device_id}")
       await update_device_attributes(device_id, self.tailscale_api_key, self.node_id, self.node_port, self.device_capabilities)
       if DEBUG_DISCOVERY >= 1: print("TailscaleDiscovery: Device posture attributes updated successfully")
+    except (asyncio.TimeoutError, aiohttp.ClientError, socket.gaierror) as e:
+      if DEBUG_DISCOVERY >= 1:
+        print(f"TailscaleDiscovery: API timeout/connection error while updating attributes ({type(e).__name__}). Will retry later.")
     except Exception as e:
       print(f"TailscaleDiscovery: Error updating device posture attributes: {e}")
       if DEBUG_DISCOVERY >= 1: traceback.print_exc()

@@ -1022,8 +1022,12 @@ class ChatGPTAPI:
               headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
             await response.prepare(request)
+            
             all_tokens_stream: List[int] = []
+            is_real_streaming = False
+            tool_call_detected = False
             process_done_at: Optional[float] = None
+            
             while True:
               try:
                 tokens, is_finished = await asyncio.wait_for(
@@ -1047,53 +1051,87 @@ class ChatGPTAPI:
                       print(f"Grace timeout waiting for streamed tokens: {request_id}")
                     break
                   continue
+                else:
+                  # Timeout real
+                  break
+
               all_tokens_stream.extend(tokens)
+              
+              # Decide whether to start streaming or buffer for tool detection
+              if not is_real_streaming and not tool_call_detected:
+                decoded_so_far = tokenizer.decode(all_tokens_stream)
+                if "TOOL_CALL" in decoded_so_far:
+                  tool_call_detected = True
+                  if DEBUG >= 1: print(f"[DEBUG] Tool call detected for {request_id}, buffering entire response.")
+                elif len(all_tokens_stream) >= 20 or is_finished:
+                  # No tool call detected yet or response is short/finished, start real-time streaming
+                  is_real_streaming = True
+                  if DEBUG >= 2: print(f"[DEBUG] Starting real-time stream for {request_id}")
+                  for i in range(len(all_tokens_stream)):
+                    chunk = generate_completion(
+                      chat_request, tokenizer, prompt, request_id, all_tokens_stream[i : i + 1], True, None, "chat.completion"
+                    )
+                    await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+              elif is_real_streaming:
+                # Already in real-time streaming mode, push new tokens immediately
+                for t in tokens:
+                  chunk = generate_completion(
+                    chat_request, tokenizer, prompt, request_id, [t], True, None, "chat.completion"
+                  )
+                  await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+              
               if is_finished:
                 break
-            decoded_stream = tokenizer.decode(all_tokens_stream)
-            tool_calls_stream = parse_tool_calls(decoded_stream)
-            tokens_to_stream = all_tokens_stream
-            prompt_for_stream = prompt
-            if tool_calls_stream:
-              if DEBUG >= 1:
-                print(f"Tool calls (stream, {len(tool_calls_stream)}): {[name for name, _ in tool_calls_stream]}")
-              try:
-                # Nếu có nhiều tools, chạy song song
-                if len(tool_calls_stream) > 1:
-                  result_text_s = await run_tools_parallel(tool_calls_stream)
-                  result_msg_s = f"Kết quả từ {len(tool_calls_stream)} tools:\n{result_text_s}\n\nDựa vào kết quả trên trả lời ngắn gọn cho user."
-                else:
-                  name_s, args_s = tool_calls_stream[0]
-                  result_text_s = await run_tool_and_format(name_s, args_s)
-                  result_msg_s = f"Kết quả tool:\n{result_text_s}\n\nDựa vào kết quả trên trả lời ngắn gọn cho user."
-                new_messages_s = list(chat_request.messages) + [
-                  Message("assistant", decoded_stream),
-                  Message("user", result_msg_s),
-                ]
-                new_prompt_s = build_prompt(tokenizer, new_messages_s, None)
-                request_id_s = str(uuid.uuid4())
-                self.token_queues[request_id_s] = asyncio.Queue()
-                asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s, max_generate_tokens=max_tokens))
-                tokens_to_stream = []
-                while True:
-                  try:
-                    tk, fin = await asyncio.wait_for(self.token_queues[request_id_s].get(), timeout=float(self.response_timeout))
-                  except asyncio.TimeoutError:
-                    break
-                  tokens_to_stream.extend(tk)
-                  if fin:
-                    break
-                prompt_for_stream = new_prompt_s
-                if request_id_s in self.token_queues:
-                  del self.token_queues[request_id_s]
-              except Exception:
-                pass
-            for i in range(0, len(tokens_to_stream), 1):
-              chunk = generate_completion(
-                chat_request, tokenizer, prompt_for_stream, request_id, tokens_to_stream[i : i + 1], True, None, "chat.completion"
-              )
-              await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            await response.write(f"data: {json.dumps(generate_completion(chat_request, tokenizer, prompt_for_stream, request_id, [], True, 'stop', 'chat.completion'))}\n\n".encode())
+            
+            # Post-processing for tool calls
+            if tool_call_detected:
+              decoded_full = tokenizer.decode(all_tokens_stream)
+              tool_calls_stream = parse_tool_calls(decoded_full)
+              if tool_calls_stream:
+                if DEBUG >= 1:
+                  print(f"Tool calls (stream, {len(tool_calls_stream)}): {[name for name, _ in tool_calls_stream]}")
+                try:
+                  # Execute tools (same logic as before)
+                  if len(tool_calls_stream) > 1:
+                    result_text_s = await run_tools_parallel(tool_calls_stream)
+                    result_msg_s = f"Kết quả từ {len(tool_calls_stream)} tools:\n{result_text_s}\n\nDựa vào kết quả trên trả lời ngắn gọn cho user."
+                  else:
+                    name_s, args_s = tool_calls_stream[0]
+                    result_text_s = await run_tool_and_format(name_s, args_s)
+                    result_msg_s = f"Kết quả tool:\n{result_text_s}\n\nDựa vào kết quả trên trả lời ngắn gọn cho user."
+                  
+                  new_messages_s = list(chat_request.messages) + [
+                    Message("assistant", decoded_full),
+                    Message("user", result_msg_s),
+                  ]
+                  new_prompt_s = build_prompt(tokenizer, new_messages_s, None)
+                  request_id_s = str(uuid.uuid4())
+                  self.token_queues[request_id_s] = asyncio.Queue()
+                  asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s, max_generate_tokens=max_tokens))
+                  
+                  # Stream the follow-up response in real-time
+                  while True:
+                    try:
+                      tk, fin = await asyncio.wait_for(self.token_queues[request_id_s].get(), timeout=float(self.response_timeout))
+                    except asyncio.TimeoutError:
+                      break
+                    for t in tk:
+                      chunk = generate_completion(chat_request, tokenizer, new_prompt_s, request_id, [t], True, None, "chat.completion")
+                      await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    if fin:
+                      break
+                  if request_id_s in self.token_queues:
+                    del self.token_queues[request_id_s]
+                except Exception as e:
+                  if DEBUG >= 1: print(f"[ERROR] Tool execution failed in stream: {e}")
+              else:
+                # False positive "TOOL_CALL" text or parsing failed, stream the buffered content
+                for i in range(len(all_tokens_stream)):
+                  chunk = generate_completion(chat_request, tokenizer, prompt, request_id, all_tokens_stream[i : i + 1], True, None, "chat.completion")
+                  await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            
+            # Finalize the stream
+            await response.write(f"data: {json.dumps(generate_completion(chat_request, tokenizer, prompt, request_id, [], True, 'stop', 'chat.completion'))}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
             return response
           else:
@@ -2478,27 +2516,43 @@ class ChatGPTAPI:
   async def handle_get_cluster_resources(self, request):
     """
     Tổng hợp tài nguyên + layer sharding của tất cả node trong cluster.
-    Dùng cho trang Cluster UI để trực quan hóa RingMemoryWeightedPartitioning.
-    Trả về: danh sách node với chip, VRAM/RAM, TFLOPS, layer_start/end, share_pct, cpu_pct, gpu_util.
+    Dùng cho trang Cluster UI để trực quan hóa LACP 2.0 / Discrete Sharding.
+    Trả về: danh sách node với chip, TFLOPS, layer_start/end indices, share_pct, cpu_pct, gpu_util.
     """
     try:
       topology = self.node.current_topology
       partitions = []
-      total_layers = 32  # default
+      
+      # Lấy số layer thực tế từ model đang chạy hoặc fallback 32
+      total_layers = 32
+      try:
+        if hasattr(self.node.inference_engine, "num_layers") and self.node.inference_engine.num_layers:
+          total_layers = self.node.inference_engine.num_layers
+      except Exception:
+        pass
+
+      strategy_name = "Manual / Unknown"
       if topology and self.node.partitioning_strategy:
         try:
           partitions = self.node.partitioning_strategy.partition(topology)
+          strategy_name = self.node.partitioning_strategy.__class__.__name__
+          # Đổi tên hiển thị cho đẹp
+          if "LargestRemainder" in strategy_name:
+            strategy_name = "LACP 2.0 (Largest Remainder)"
+          elif "LACP" in strategy_name:
+            strategy_name = "LACP 2.0 (Latency-Aware)"
         except Exception:
           partitions = []
 
-      # Lấy tailscale nodes để có tên thân thiện và IP
+      # Lấy tailscale nodes để có tên thân thiện
       try:
         ts_nodes = await self.node.get_tailscale_nodes()
       except Exception:
         ts_nodes = []
+      total_tailscale_devices = len(ts_nodes)
       ts_map = {n.get("device_id", ""): n for n in ts_nodes if n.get("device_id")}
 
-      # Lấy cpu% và gpu util của máy này
+      # Lấy metrics máy này
       try:
         cpu_pct_self = psutil.cpu_percent()
         ram_self = psutil.virtual_memory()
@@ -2510,7 +2564,7 @@ class ChatGPTAPI:
         ram_total_self = 0
       gpu_util_self = self._get_gpu_utilization()
 
-      # Tổng TFLOPS để tính tỷ lệ
+      # Tổng TFLOPS
       nodes_raw = list(topology.all_nodes()) if topology else []
       total_flops = sum(n[1].flops.fp16 for n in nodes_raw) if nodes_raw else 0
 
@@ -2520,30 +2574,29 @@ class ChatGPTAPI:
         caps = topology.get_node(node_id) if topology else None
         is_self = (node_id == self.node.id)
 
-        # Tên hiển thị: dùng tailscale name nếu có, else node_id đầu 8 ký tự
         ts_info = ts_map.get(node_id, {})
         display_name = ts_info.get("name") or ("Máy này" if is_self else node_id[:12])
-        addresses = ts_info.get("addresses") or []
-        ip = addresses[0] if addresses else ""
-
-        # Hardware từ DeviceCapabilities
+        
+        # Hardware
         chip = caps.chip if caps else "Unknown"
         flops_fp16 = caps.flops.fp16 if caps else 0
-        flops_fp32 = caps.flops.fp32 if caps else 0
-        flops_int8 = caps.flops.int8 if caps else 0
         vram_gb = round(caps.memory / 1024, 1) if caps and caps.memory else 0
         ram_gb = round(caps.system_ram_mb / 1024, 1) if caps and caps.system_ram_mb else 0
-        cpu_cores = caps.cpu_cores if caps else 0
-        disk_gb = caps.disk_gb if caps else 0
         gpu_backend = caps.gpu_backend if caps else "Unknown"
         has_gpu = vram_gb > 0 and gpu_backend not in ("CPU (x86)", "CPU (ARM)", "Unknown")
 
-        # Layer range từ partition (start/end là 0.0→1.0 tỷ lệ)
+        # Layer range: Chuyển đổi từ float range [0.0, 1.0] sang discrete indices [0, total_layers-1]
+        start_layer = int(partition.start * total_layers)
+        end_layer = max(start_layer, int(partition.end * total_layers) - 1)
+        # Ensure last partition covers everything
+        if partition == partitions[-1]:
+          end_layer = total_layers - 1
+        layer_count = (end_layer - start_layer + 1)
+        
         share_pct = round((partition.end - partition.start) * 100, 1)
-        # Tính flops share thực tế
         flops_share_pct = round(flops_fp16 / total_flops * 100, 1) if total_flops > 0 else share_pct
 
-        # Real-time metrics chỉ cho máy này (node khác không có)
+        # Real-time metrics (chỉ máy này)
         cpu_pct = cpu_pct_self if is_self else None
         gpu_util = gpu_util_self if is_self else None
         ram_used = ram_used_self if is_self else None
@@ -2551,67 +2604,52 @@ class ChatGPTAPI:
         result.append({
           "node_id": node_id,
           "name": display_name,
-          "ip": ip,
           "is_self": is_self,
           "chip": chip,
           "gpu_backend": gpu_backend,
           "has_gpu": has_gpu,
           "vram_gb": vram_gb,
           "ram_gb": ram_gb,
-          "cpu_cores": cpu_cores,
-          "disk_gb": disk_gb,
           "flops_fp16": round(flops_fp16, 2),
-          "flops_fp32": round(flops_fp32, 2),
-          "flops_int8": round(flops_int8, 2),
-          "layer_start_pct": round(partition.start * 100, 1),
-          "layer_end_pct": round(partition.end * 100, 1),
+          "layer_start": start_layer,
+          "layer_end": end_layer,
+          "layer_count": layer_count,
           "share_pct": share_pct,
           "flops_share_pct": flops_share_pct,
-          # Real-time (chỉ máy này)
+          "cpu_cores": caps.cpu_cores if caps else 0,
+          "disk_gb": caps.disk_gb if caps else 0,
           "cpu_pct": cpu_pct,
           "gpu_utilization": gpu_util,
           "ram_used_gb": ram_used,
-          "ram_total_gb": ram_gb if is_self else ram_gb,
+          "ram_total_gb": ram_gb,
         })
 
-      # Nếu không có partitions (chỉ 1 node, chưa kết nối), tạo entry cho máy này
+      # Fallback nếu 1 node
       if not result:
         try:
-          specs_self = self.node.device_capabilities
-          cpu_pct_s = psutil.cpu_percent()
-          ram_s = psutil.virtual_memory()
-          chip_s = specs_self.chip if specs_self else "Unknown"
-          vram_s = round(specs_self.memory / 1024, 1) if specs_self and specs_self.memory else 0
-          ram_s_gb = round(specs_self.system_ram_mb / 1024, 1) if specs_self and specs_self.system_ram_mb else 0
-          flops_s = specs_self.flops.fp16 if specs_self else 0
-          gpu_backend_s = specs_self.gpu_backend if specs_self else "Unknown"
-          has_gpu_s = vram_s > 0 and gpu_backend_s not in ("CPU (x86)", "CPU (ARM)", "Unknown")
           result.append({
             "node_id": self.node.id,
             "name": "Máy này",
-            "ip": "127.0.0.1",
             "is_self": True,
-            "chip": chip_s,
-            "gpu_backend": gpu_backend_s,
-            "has_gpu": has_gpu_s,
-            "vram_gb": vram_s,
-            "ram_gb": ram_s_gb,
-            "cpu_cores": specs_self.cpu_cores if specs_self else 0,
-            "disk_gb": specs_self.disk_gb if specs_self else 0,
-            "flops_fp16": round(flops_s, 2),
-            "flops_fp32": round(specs_self.flops.fp32, 2) if specs_self else 0,
-            "flops_int8": round(specs_self.flops.int8, 2) if specs_self else 0,
-            "layer_start_pct": 0.0,
-            "layer_end_pct": 100.0,
+            "chip": self.node.device_capabilities.chip if self.node.device_capabilities else "Unknown",
+            "gpu_backend": self.node.device_capabilities.gpu_backend if self.node.device_capabilities else "Unknown",
+            "has_gpu": True, # Probable
+            "vram_gb": round(self.node.device_capabilities.memory / 1024, 1) if self.node.device_capabilities else 0,
+            "ram_gb": round(self.node.device_capabilities.system_ram_mb / 1024, 1) if self.node.device_capabilities else 0,
+            "flops_fp16": round(self.node.device_capabilities.flops.fp16, 2) if self.node.device_capabilities else 0,
+            "layer_start": 0,
+            "layer_end": total_layers - 1,
+            "layer_count": total_layers,
             "share_pct": 100.0,
             "flops_share_pct": 100.0,
-            "cpu_pct": cpu_pct_s,
+            "cpu_cores": self.node.device_capabilities.cpu_cores if self.node.device_capabilities else 0,
+            "disk_gb": self.node.device_capabilities.disk_gb if self.node.device_capabilities else 0,
+            "cpu_pct": cpu_pct_self,
             "gpu_utilization": self._get_gpu_utilization(),
-            "ram_used_gb": round(ram_s.used / (1024**3), 2),
-            "ram_total_gb": ram_s_gb,
+            "ram_used_gb": ram_used_self,
+            "ram_total_gb": ram_total_self,
           })
-        except Exception:
-          pass
+        except Exception: pass
 
       # Peer graph từ topology
       peer_graph = {}
@@ -2631,13 +2669,16 @@ class ChatGPTAPI:
       return web.json_response({
         "nodes": result,
         "total_nodes": len(result),
+        "total_tailscale_devices": total_tailscale_devices,
+        "total_layers": total_layers,
+        "strategy_name": strategy_name,
         "peer_graph": peer_graph,
         "training_job": self._training_job,
       })
     except Exception as e:
-      if DEBUG >= 1:
-        traceback.print_exc()
-      return web.json_response({"nodes": [], "total_nodes": 0, "peer_graph": {}, "training_job": None}, status=500)
+      if DEBUG >= 1: traceback.print_exc()
+      return web.json_response({"nodes": [], "total_nodes": 0, "total_layers": 32, "strategy_name": "Error"}, status=500)
+
 
   async def handle_tokens(self, request_id: str, tokens: List[int], is_finished: bool):
     token_len = len(tokens) if isinstance(tokens, (list, tuple)) else "?"

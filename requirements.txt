@@ -39,6 +39,11 @@ torch
 peft
 datasets
 accelerate
+anyio
+py-libp2p
+torch-directml
+loguru
+
 bitsandbytes
 
 # LACP Dependencies

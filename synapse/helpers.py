@@ -19,8 +19,13 @@ DEBUG = int(os.getenv("DEBUG", default="0"))
 DEBUG_DISCOVERY = int(os.getenv("DEBUG_DISCOVERY", default="0"))
 VERSION = "0.0.1"
 
-# Single shared thread pool for subprocess operations
-subprocess_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="subprocess_worker")
+# Ensure UTF-8 output for Windows terminals to avoid UnicodeEncodeError with emojis
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 
 def get_system_info():
@@ -178,7 +183,7 @@ def check_model_hardware_fit(model_name: str) -> None:
         run_mode = "CPU"
 
     print(f"\n{'='*55}")
-    print(f"  🖥️  Synapse Hardware Check")
+    print(f"  SYSTEM - Hardware Check")
     print(f"{'='*55}")
     print(f"  CPU  : {specs.cpu_name} ({specs.total_cpu_cores} cores)")
     print(f"  RAM  : {specs.total_ram_gb:.1f}GB total, {specs.available_ram_gb:.1f}GB available")
@@ -186,7 +191,7 @@ def check_model_hardware_fit(model_name: str) -> None:
         unified_tag = " [Unified]" if specs.unified_memory else ""
         print(f"  GPU  : {specs.gpu_name} ({specs.gpu_vram_gb:.1f}GB VRAM{unified_tag})")
     else:
-        print(f"  GPU  : Not detected — CPU inference only")
+        print(f"  GPU  : Not detected")
     print(f"  Mode : {run_mode} ({memory_label})")
     print(f"{'='*55}")
 
@@ -198,21 +203,18 @@ def check_model_hardware_fit(model_name: str) -> None:
 
         mem_required = _estimate_model_memory_gb(params_b, default_quant, ctx)
         fit = _score_fit(mem_required, budget_gb)
-        emoji = _fit_emoji(fit)
 
         print(f"  Model: {entry.get('name', model_name)}")
         print(f"  Params: {params_b:.1f}B | Quant: {default_quant} | Ctx: {ctx:,} tokens")
         print(f"  Memory needed: ~{mem_required:.1f}GB")
-        print(f"  Fit: {emoji} {fit}")
+        print(f"  Fit Status: {fit}")
 
         if fit == "Too Tight":
-            # Find alternatives
             best = _best_quant_for_budget(params_b, ctx, budget_gb)
             if best:
                 q, mem = best
-                print(f"\n  ⚠️  Try quantization '{q}' → needs ~{mem:.1f}GB")
+                print(f"\n  [SUGGESTION] Try quantization '{q}' -> needs ~{mem:.1f}GB")
             else:
-                # Suggest smaller models
                 candidates = []
                 for m in db:
                     p = m.get("parameters_raw", 0) / 1e9 if m.get("parameters_raw") else 0
@@ -222,23 +224,21 @@ def check_model_hardware_fit(model_name: str) -> None:
                             candidates.append((m["name"], p, mem_est))
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 if candidates:
-                    print(f"\n  💡 Suggested models for your hardware:")
+                    print(f"\n  [ADVICE] Smaller models for your hardware:")
                     for name, p, mem in candidates[:3]:
-                        print(f"     • {name} ({p:.1f}B, ~{mem:.1f}GB)")
+                        print(f"     * {name} ({p:.1f}B, ~{mem:.1f}GB)")
     else:
-        # Unknown model - estimate from name
         import re
         param_match = re.search(r"(\d+\.?\d*)\s*b", model_name.lower())
         if param_match:
             params_b = float(param_match.group(1))
             mem_required = _estimate_model_memory_gb(params_b, "Q4_K_M", 4096)
             fit = _score_fit(mem_required, budget_gb)
-            emoji = _fit_emoji(fit)
-            print(f"  Model: {model_name} (estimated {params_b:.1f}B params)")
+            print(f"  Model: {model_name} (est. {params_b:.1f}B params)")
             print(f"  Memory needed: ~{mem_required:.1f}GB (Q4_K_M)")
-            print(f"  Fit: {emoji} {fit}")
+            print(f"  Fit Status: {fit}")
         else:
-            print(f"  Model: {model_name} — not found in database, skipping fit check")
+            print(f"  Model: {model_name} (metadata not found)")
 
     print(f"{'='*55}\n")
 

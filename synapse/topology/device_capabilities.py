@@ -57,6 +57,11 @@ class DeviceFlops(BaseModel):
         return self.model_dump()
 
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "DeviceFlops":
+        return cls(**data)
+
+
 class DeviceCapabilities(BaseModel):
     model: str
     chip: str
@@ -97,6 +102,13 @@ class DeviceCapabilities(BaseModel):
             "gpu_count": self.gpu_count,
             "total_gpu_vram_mb": self.total_gpu_vram_mb,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DeviceCapabilities":
+        # Handle recursive conversion for flops
+        if "flops" in data and isinstance(data["flops"], dict):
+            data["flops"] = DeviceFlops.from_dict(data["flops"])
+        return cls(**data)
 
 
 UNKNOWN_DEVICE_CAPABILITIES = DeviceCapabilities(
@@ -201,6 +213,15 @@ async def device_capabilities() -> DeviceCapabilities:
     Detect hardware capabilities. This replaces the old windows_device_capabilities().
     Uses the full cross-platform detection logic ported from llmit.
     """
+    # Mocking for testing (LACP heterogeneous cluster tests)
+    mock_caps_env = os.getenv("SYNAPSE_MOCK_CAPABILITIES")
+    if mock_caps_env:
+        try:
+            import json
+            return DeviceCapabilities.from_dict(json.loads(mock_caps_env))
+        except Exception:
+            pass
+
     import psutil
 
     try:
