@@ -391,6 +391,16 @@ class TailscaleDiscovery(Discovery):
             # Chi danh dau la Synapse Node neu may do dang co trong known_peers
             # (da qua Health Check that su), khong chi dua vao Tailscale Attributes cu
             is_known_peer = peer_id in self.known_peers
+            if not is_known_peer:
+              # Tìm ngược qua IP/Port (do known_peers lưu bằng UUID thay vì hostname)
+              for known_pid, (h, _, _) in self.known_peers.items():
+                h_ip = h.addr().split(":")[0]
+                if h_ip in addrs_flat:
+                  is_known_peer = True
+                  peer_id = known_pid
+                  peer_port = int(h.addr().split(":")[1])
+                  break
+            
             if is_known_peer:
               row["is_synapse_node"] = True
               row["synapse_node_id"] = peer_id
