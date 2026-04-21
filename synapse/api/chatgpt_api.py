@@ -2484,7 +2484,6 @@ class ChatGPTAPI:
     try:
       topology = self.node.current_topology
       partitions = []
-      total_layers = 32  # default
       if topology and self.node.partitioning_strategy:
         try:
           partitions = self.node.partitioning_strategy.partition(topology)
@@ -2514,10 +2513,14 @@ class ChatGPTAPI:
       nodes_raw = list(topology.all_nodes()) if topology else []
       total_flops = sum(n[1].flops.fp16 for n in nodes_raw) if nodes_raw else 0
 
+      node_partitions = {}
+      for p in partitions:
+        if p.node_id not in node_partitions:
+          node_partitions[p.node_id] = []
+        node_partitions[p.node_id].append(p)
+
       result = []
-      for partition in partitions:
-        node_id = partition.node_id
-        caps = topology.get_node(node_id) if topology else None
+      for node_id, caps in nodes_raw:
         is_self = (node_id == self.node.id)
 
         # Tên hiển thị: dùng tailscale name nếu có, else node_id đầu 8 ký tự
