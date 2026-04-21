@@ -248,7 +248,14 @@ class TailscaleDiscovery(Discovery):
               addr_map[addr] = pid
             elif not _is_uuid(pid) and _is_uuid(existing_pid):
               if pid in self.known_peers: del self.known_peers[pid]
-            else: pass # Cả hai đều cùng loại or same ID
+            else:
+              # Cả hai đều cùng loại (ví dụ 2 UUID cũ và mới), giữ cái có last_seen mới hơn
+              existing_last = self.known_peers[existing_pid][2]
+              if last > existing_last:
+                if existing_pid in self.known_peers: del self.known_peers[existing_pid]
+                addr_map[addr] = pid
+              else:
+                if pid in self.known_peers: del self.known_peers[pid]
           else:
             addr_map[addr] = pid
         # ────────────────────────────────────────────────────────────────────────
