@@ -40,9 +40,17 @@ class Topology:
     self.peer_graph[from_id].add(conn)
 
   def merge(self, peer_node_id: str, other: "Topology"):
-      # Merge all nodes from other topology (not just peer_node_id)
+      """Merge all nodes from other topology (not just peer_node_id)."""
+      # Get current specs of 'self' (the node running this code)
+      # This is tricky because self.id is not stored in Topology itself, 
+      # but we can look for the node marked as self (placeholder logic or passed from elsewhere).
+      # For now, we perform local hardware deduplication in the Orchestration Node layer instead
+      # to keep the basic Topology class generic.
+      
+      # Basic merge:
       for node_id, capabilities in other.nodes.items():
           self.update_node(node_id, capabilities)
+      
       # Merge edges - only add edges that originate from peer_node_id
       # to avoid adding edges from nodes not belonging to this peer
       for node_id, connections in other.peer_graph.items():

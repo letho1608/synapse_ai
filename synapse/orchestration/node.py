@@ -636,6 +636,14 @@ class Node:
   ) -> None:
     if DEBUG >= 1: print(f"target partition index: {target_index}")
     target_id = self.partitioning_strategy.partition(self.topology, base_shard)[target_index].node_id
+    
+    # ── [LOOPBACK SAFETY] ──
+    if target_id == self.id:
+      if DEBUG >= 1: print(f"Loopback detected for partition {target_index}. Processing locally.")
+      target_shard = self.get_current_shard(base_shard, target_index)
+      return await self.process_example(target_shard, step, target, length, train, request_id)
+    # ───────────────────────
+
     target_shard = self.get_current_shard(base_shard, target_index)
     if DEBUG >= 2: print(f"computed target from: {base_shard} {target_index}, {self.topology}. target shard: {target_shard}")
     target_peer = next((p for p in self.peers if p.id() == target_id), None)
@@ -916,6 +924,37 @@ class Node:
           print(f"Error collecting topology from {peer.id()}: {type(e).__name__}: {e}")
 
     next_topology.active_node_id = self.topology.active_node_id
+    
+    # --- [TOPOLOGY PRUNING & DEDUPLICATION] ---
+    # 1. Deduplicate by Hardware: Remove entries that match our hardware but have different UUIDs
+    stale_ids = []
+    ours = self.device_capabilities
+    for nid, caps in list(next_topology.nodes.items()):
+      if nid == self.id: continue
+      # If chip, memory, and core count match exactly, it's likely a ghost of Máy này
+      if (caps.chip == ours.chip and 
+          abs(caps.memory - ours.memory) < 10 and 
+          caps.cpu_cores == ours.cpu_cores and
+          caps.gpu_backend == ours.gpu_backend):
+        if DEBUG >= 1: print(f"🧹 [TOPOLOGY] Detected ghost node of self: {nid}. Removing.")
+        stale_ids.append(nid)
+    
+    for sid in stale_ids:
+      if sid in next_topology.nodes: del next_topology.nodes[sid]
+      if sid in next_topology.peer_graph: del next_topology.peer_graph[sid]
+      # Clean up incoming edges to this ghost
+      for src_id in next_topology.peer_graph:
+        next_topology.peer_graph[src_id] = {c for c in next_topology.peer_graph[src_id] if c.to_id != sid}
+    
+    # 2. Prune by reachability: Only keep nodes that are actually mentioned in visited
+    # (prevents stale nodes reported by long-running peers from polluting the topology)
+    final_nodes = {}
+    for nid, caps in next_topology.nodes.items():
+      if nid in visited or nid == self.id:
+        final_nodes[nid] = caps
+    next_topology.nodes = final_nodes
+    # ------------------------------------------
+
     self.topology = next_topology
     if self.topology_viz:
       self.topology_viz.update_visualization(self.topology, self.partitioning_strategy.partition(self.topology), self.id)
