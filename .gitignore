@@ -9,3 +9,5 @@ data/models/
 .vscode/
 .idea/
 .pytest_cache/
+.roo/
+.code-graph-review/
