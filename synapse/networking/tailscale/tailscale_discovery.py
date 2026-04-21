@@ -155,6 +155,14 @@ class TailscaleDiscovery(Discovery):
             if DEBUG_DISCOVERY >= 2: print(f"Ignoring peer {peer_id} as it's not in the allowed node IDs list")
             continue
 
+          # ── [DEDUP] Kiểm tra xem IP này đã có trong danh sách với ID khác chưa ──
+          # Nếu IP này đã tồn tại với một ID khác (thường là hostname cũ), hãy chuẩn bị để dọn dẹp
+          duplicate_pids = [
+            pid for pid, (h, _, _) in self.known_peers.items() 
+            if h.addr() == f"{peer_host}:{peer_port}" and pid != peer_id
+          ]
+          # ────────────────────────────────────────────────────────────────────
+
           if peer_id not in self.known_peers or self.known_peers[peer_id][0].addr() != f"{peer_host}:{peer_port}":
             new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
             if not await new_peer_handle.health_check():
@@ -180,38 +188,70 @@ class TailscaleDiscovery(Discovery):
                   timeout=5.0,
                 )
                 if remote_topology and remote_topology.nodes:
-                  # Node có edges trong peer_graph là self của remote
                   actual_id = next(
                     (nid for nid, conns in remote_topology.peer_graph.items() if conns),
                     list(remote_topology.nodes.keys())[0],
                   )
                   if actual_id:
-                    # Kiểm tra lại xem UUID thực này có phải là chính mình không
-                    if actual_id == self.node_id:
-                      continue
+                    if actual_id == self.node_id: continue # Chính mình
                     
                     if actual_id != peer_id:
-                      if DEBUG >= 1:
-                        print(f"🔑 [DISCOVERY] Hostname fallback: {peer_id} → UUID thực {actual_id}")
+                      if DEBUG >= 1: print(f"🔑 [DISCOVERY] Hostname fallback: {peer_id} → UUID thực {actual_id}")
+                      # Xóa ID cũ (hostname) nếu có
+                      if peer_id in self.known_peers: del self.known_peers[peer_id]
+                      
                       peer_id = actual_id
                       new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
               except Exception as _e:
-                if DEBUG >= 1:
-                  print(f"[DISCOVERY] Không resolve được UUID thực cho {peer_id}: {_e}")
+                if DEBUG >= 1: print(f"[DISCOVERY] Không resolve được UUID cho {peer_id}: {_e}")
             # ────────────────────────────────────────────────────────────────────────────────
 
+            # Dọn dẹp các ID trùng lặp IP (ví dụ xóa hostname cũ khi đã có UUID mới)
+            for dup_id in duplicate_pids:
+              if dup_id != peer_id:
+                if DEBUG >= 1: print(f"🧹 [DISCOVERY] Xóa bản ghi trùng IP: {dup_id} (ưu tiên {peer_id})")
+                if dup_id in self.known_peers: del self.known_peers[dup_id]
+
             if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")
-            self.known_peers[peer_id] = (
-              new_peer_handle,
-              current_time,
-              current_time,
-            )
+            self.known_peers[peer_id] = (new_peer_handle, current_time, current_time)
           else:
-            if not await self.known_peers[peer_id][0].health_check():
+            # [CASE TRÙNG ID] - Chỉ cần cập nhật timestamp và health check
+            handle = self.known_peers[peer_id][0]
+            if not await handle.health_check():
               if DEBUG >= 1: print(f"Peer {peer_id} at {peer_host}:{peer_port} is not healthy. Removing.")
               if peer_id in self.known_peers: del self.known_peers[peer_id]
               continue
-            self.known_peers[peer_id] = (self.known_peers[peer_id][0], self.known_peers[peer_id][1], current_time)
+            
+            # Vẫn cố gắng Resolve UUID nếu node hiện tại vẫn đang dùng hostname
+            if not _is_uuid(peer_id):
+              try:
+                remote_topology = await asyncio.wait_for(handle.collect_topology(set(), max_depth=0), timeout=2.0)
+                actual_id = next((nid for nid, conns in remote_topology.peer_graph.items() if conns), None)
+                if actual_id and actual_id != peer_id and actual_id != self.node_id:
+                  if DEBUG >= 1: print(f"🔑 [DISCOVERY] Cập nhật Hostname {peer_id} → UUID {actual_id}")
+                  del self.known_peers[peer_id]
+                  peer_id = actual_id
+                  handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
+              except: pass # Bỏ qua lỗi trong vòng lặp lặp lại
+
+            self.known_peers[peer_id] = (handle, self.known_peers[peer_id][1], current_time)
+
+        # ── [FINAL CLEANUP] Dọn dẹp triệt để các Node trùng IP ở cuối mỗi chu kỳ ──
+        addr_map = {}
+        for pid, (h, start, last) in list(self.known_peers.items()):
+          addr = h.addr()
+          if addr in addr_map:
+            existing_pid = addr_map[addr]
+            # Ưu tiên UUID hơn Hostname
+            if _is_uuid(pid) and not _is_uuid(existing_pid):
+              if existing_pid in self.known_peers: del self.known_peers[existing_pid]
+              addr_map[addr] = pid
+            elif not _is_uuid(pid) and _is_uuid(existing_pid):
+              if pid in self.known_peers: del self.known_peers[pid]
+            else: pass # Cả hai đều cùng loại or same ID
+          else:
+            addr_map[addr] = pid
+        # ────────────────────────────────────────────────────────────────────────
 
       except (asyncio.TimeoutError, aiohttp.ClientError) as e:
         if DEBUG_DISCOVERY >= 1:
