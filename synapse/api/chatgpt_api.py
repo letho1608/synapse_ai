@@ -2541,8 +2541,17 @@ class ChatGPTAPI:
         gpu_backend = caps.gpu_backend if caps else "Unknown"
         has_gpu = vram_gb > 0 and gpu_backend not in ("CPU (x86)", "CPU (ARM)", "Unknown")
 
-        # Layer range từ partition (start/end là 0.0→1.0 tỷ lệ)
-        share_pct = round((partition.end - partition.start) * 100, 1)
+        # Layer range từ partition
+        parts = node_partitions.get(node_id, [])
+        if parts:
+          layer_start_pct = round(parts[0].start * 100, 1)
+          layer_end_pct = round(parts[-1].end * 100, 1)
+          share_pct = round(sum(p.end - p.start for p in parts) * 100, 1)
+        else:
+          layer_start_pct = 0.0
+          layer_end_pct = 0.0
+          share_pct = 0.0
+
         # Tính flops share thực tế
         flops_share_pct = round(flops_fp16 / total_flops * 100, 1) if total_flops > 0 else share_pct
 
@@ -2566,8 +2575,8 @@ class ChatGPTAPI:
           "flops_fp16": round(flops_fp16, 2),
           "flops_fp32": round(flops_fp32, 2),
           "flops_int8": round(flops_int8, 2),
-          "layer_start_pct": round(partition.start * 100, 1),
-          "layer_end_pct": round(partition.end * 100, 1),
+          "layer_start_pct": layer_start_pct,
+          "layer_end_pct": layer_end_pct,
           "share_pct": share_pct,
           "flops_share_pct": flops_share_pct,
           # Real-time (chỉ máy này)
