@@ -2,6 +2,7 @@ import asyncio
 import time
 import traceback
 import socket
+import uuid as _uuid_mod
 import aiohttp
 from typing import List, Dict, Callable, Tuple, Set
 from synapse.networking.discovery import Discovery
@@ -9,6 +10,15 @@ from synapse.networking.peer_handle import PeerHandle
 from synapse.topology.device_capabilities import DeviceCapabilities, device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.helpers import DEBUG, DEBUG_DISCOVERY
 from .tailscale_helpers import get_device_id, get_self_tailscale_info, update_device_attributes, get_device_attributes, get_tailscale_devices, Device
+
+
+def _is_uuid(value: str) -> bool:
+  """Check if a string is a valid UUID (v4). Used to detect hostname fallback IDs."""
+  try:
+    _uuid_mod.UUID(str(value))
+    return True
+  except (ValueError, AttributeError):
+    return False
 
 
 def _get_all_local_ips() -> Set[str]:
@@ -153,6 +163,31 @@ class TailscaleDiscovery(Discovery):
               else:
                 if DEBUG >= 1: print(f"🔍 [DISCOVERY] Bỏ qua {peer_id} tại {peer_host}:{peer_port} do không vượt qua bài kiểm tra sức khỏe.")
                 continue
+
+            # ── Resolve UUID thực của peer (tránh ID mismatch khi dùng hostname fallback) ──
+            # Nếu peer_id là hostname (không phải UUID), hỏi peer UUID thực của nó qua gRPC
+            peer_id_is_hostname = not _is_uuid(peer_id)
+            if peer_id_is_hostname:
+              try:
+                remote_topology = await asyncio.wait_for(
+                  new_peer_handle.collect_topology(set(), max_depth=0),
+                  timeout=5.0,
+                )
+                if remote_topology and remote_topology.nodes:
+                  # Node có edges trong peer_graph là self của remote
+                  actual_id = next(
+                    (nid for nid, conns in remote_topology.peer_graph.items() if conns),
+                    list(remote_topology.nodes.keys())[0],
+                  )
+                  if actual_id and actual_id != self.node_id and actual_id != peer_id:
+                    if DEBUG >= 1:
+                      print(f"🔑 [DISCOVERY] Hostname fallback: {peer_id} → UUID thực {actual_id}")
+                    peer_id = actual_id
+                    new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
+              except Exception as _e:
+                if DEBUG >= 1:
+                  print(f"[DISCOVERY] Không resolve được UUID thực cho {peer_id}: {_e}")
+            # ────────────────────────────────────────────────────────────────────────────────
 
             if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")
             self.known_peers[peer_id] = (
