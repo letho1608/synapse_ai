@@ -124,8 +124,14 @@ class TailscaleDiscovery(Discovery):
         if DEBUG_DISCOVERY >= 2: print(f"Active tailscale devices: {len(active_devices)}/{len(devices)}")
         if DEBUG_DISCOVERY >= 2: print("Time since last seen tailscale devices", [(current_time - device.last_seen.timestamp()) for device in devices.values()])
 
+        local_ips = _get_all_local_ips()
         for device in active_devices.values():
           peer_host = device.addresses[0]
+          
+          # Skip self by IP address comparison
+          if peer_host in local_ips:
+            continue
+
           try:
             peer_id, peer_port, device_capabilities = await get_device_attributes(device.device_id, self.tailscale_api_key)
           except (asyncio.TimeoutError, OSError, aiohttp.ClientError) as e:
@@ -141,7 +147,7 @@ class TailscaleDiscovery(Discovery):
             peer_port = 50051
             device_capabilities = UNKNOWN_DEVICE_CAPABILITIES
 
-          # Skip self — compare by UUID node_id (not Tailscale hostname which never matches)
+          # Skip self — compare by UUID node_id or hostname
           if peer_id == self.node_id or device.name == self.node_id:
             continue
 
@@ -179,11 +185,16 @@ class TailscaleDiscovery(Discovery):
                     (nid for nid, conns in remote_topology.peer_graph.items() if conns),
                     list(remote_topology.nodes.keys())[0],
                   )
-                  if actual_id and actual_id != self.node_id and actual_id != peer_id:
-                    if DEBUG >= 1:
-                      print(f"🔑 [DISCOVERY] Hostname fallback: {peer_id} → UUID thực {actual_id}")
-                    peer_id = actual_id
-                    new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
+                  if actual_id:
+                    # Kiểm tra lại xem UUID thực này có phải là chính mình không
+                    if actual_id == self.node_id:
+                      continue
+                    
+                    if actual_id != peer_id:
+                      if DEBUG >= 1:
+                        print(f"🔑 [DISCOVERY] Hostname fallback: {peer_id} → UUID thực {actual_id}")
+                      peer_id = actual_id
+                      new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
               except Exception as _e:
                 if DEBUG >= 1:
                   print(f"[DISCOVERY] Không resolve được UUID thực cho {peer_id}: {_e}")
