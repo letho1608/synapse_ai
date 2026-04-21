@@ -234,7 +234,8 @@ class TailscaleDiscovery(Discovery):
                   handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
               except: pass # Bỏ qua lỗi trong vòng lặp lặp lại
 
-            self.known_peers[peer_id] = (handle, self.known_peers[peer_id][1], current_time)
+            old_connected_at = self.known_peers.get(peer_id, (None, current_time, None))[1]
+            self.known_peers[peer_id] = (handle, old_connected_at, current_time)
 
         # ── [FINAL CLEANUP] Dọn dẹp triệt để các Node trùng IP ở cuối mỗi chu kỳ ──
         addr_map = {}
