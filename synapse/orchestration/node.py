@@ -665,7 +665,7 @@ class Node:
     try:
       resp = await asyncio.wait_for(
         target_peer.send_example(target_shard, step, target, length, request_id=request_id, train=train),
-        timeout=30.0,
+        timeout=300.0,
       )
       print(
         f"[DISTRIBUTED-{action}] ✅  Gửi thành công [{self.id[:8]}] → [{target_peer.id()[:8]}]"
@@ -674,9 +674,9 @@ class Node:
       return resp
 
     except asyncio.TimeoutError:
-      # wait_for(30s) hết hạn — bao gồm cả 3 lần retry bên trong _rpc_with_retry
+      # wait_for(300s) hết hạn — bao gồm cả 3 lần retry bên trong _rpc_with_retry
       print(
-        f"\n[DISTRIBUTED-ERROR] ⏰  TIMEOUT (30s)"
+        f"\n[DISTRIBUTED-ERROR] ⏰  TIMEOUT (300s)"
         f"\n  Sender  : [{self.id[:8]}]"
         f"\n  Receiver: [{target_peer.id()[:8]}] @ {target_peer.addr()}"
         f"\n  Node B không phản hồi — có thể treo hoặc quá tải"
