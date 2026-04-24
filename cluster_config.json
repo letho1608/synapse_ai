@@ -1,0 +1,28 @@
+{
+  "peers": {
+    "node-1": {
+      "address": "127.0.0.1",
+      "port": 50001,
+      "device_capabilities": {
+        "model": "Local Node 1",
+        "chip": "CPU",
+        "memory": 8192,
+        "flops": { "fp32": 1.0, "fp16": 1.0, "int8": 1.0 },
+        "cpu_cores": 4,
+        "system_ram_mb": 8192
+      }
+    },
+    "node-2": {
+      "address": "127.0.0.1",
+      "port": 50002,
+      "device_capabilities": {
+        "model": "Local Node 2",
+        "chip": "CPU",
+        "memory": 8192,
+        "flops": { "fp32": 1.0, "fp16": 1.0, "int8": 1.0 },
+        "cpu_cores": 4,
+        "system_ram_mb": 8192
+      }
+    }
+  }
+}

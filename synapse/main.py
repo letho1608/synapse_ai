@@ -9,6 +9,11 @@ import traceback
 import uuid
 import numpy as np
 from tqdm import tqdm
+from dotenv import load_dotenv
+
+# Load .env file if exists
+load_dotenv()
+
 from synapse.train.dataset import load_dataset, iterate_batches
 from synapse.networking.manual.manual_discovery import ManualDiscovery
 from synapse.orchestration.node import Node
@@ -71,14 +76,12 @@ parser.add_argument("--disable-tui", action=argparse.BooleanOptionalAction, defa
 parser.add_argument("--run-model", type=str, help="Specify a model to run directly")
 parser.add_argument("--prompt", type=str, help="Prompt for the model when using --run-model", default="")
 parser.add_argument("--default-temp", type=float, help="Default token sampling temperature", default=0.0)
-# Tailscale API key: Hardcode trực tiếp ở đây (thay giá trị bên dưới)
-# Có thể override bằng command line argument --tailscale-api-key nếu cần
-TAILSCALE_API_KEY_DEFAULT = "tskey-api-kZkPWrVyM311CNTRL-91psFey7AHYgSzXpLr7GJYKZm43RZkXVD"  # TODO: Thay bằng API key thật của bạn
-parser.add_argument("--tailscale-api-key", type=str, default=TAILSCALE_API_KEY_DEFAULT, help="Tailscale API key (mặc định lấy từ hardcode trong code)")
-# Tailnet name: Hardcode trực tiếp ở đây (thay giá trị bên dưới)
-# Có thể override bằng command line argument --tailnet-name nếu cần
-TAILNET_NAME_DEFAULT = "testdoki925@gmail.com"  # TODO: Thay bằng tailnet name thật của bạn
-parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (mặc định lấy từ hardcode trong code)")
+# Tailscale API key: Ưu tiên từ .env (TAILSCALE_API_KEY), fallback sang hardcode
+TAILSCALE_API_KEY_DEFAULT = os.environ.get("TAILSCALE_API_KEY", "tskey-api-kZkPWrVyM311CNTRL-91psFey7AHYgSzXpLr7GJYKZm43RZkXVD")
+parser.add_argument("--tailscale-api-key", type=str, default=TAILSCALE_API_KEY_DEFAULT, help="Tailscale API key (mặc định lấy từ env TAILSCALE_API_KEY)")
+# Tailnet name: Ưu tiên từ .env (TAILNET_NAME), fallback sang hardcode
+TAILNET_NAME_DEFAULT = os.environ.get("TAILNET_NAME", "testdoki925@gmail.com")
+parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (mặc định lấy từ env TAILNET_NAME)")
 parser.add_argument("--node-id-filter", type=str, default=None, help="Comma separated list of allowed node IDs (only for UDP and Tailscale discovery)")
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
 parser.add_argument("--system-prompt", type=str, default="Bạn là AI thuộc hệ thống Synapse AI Server do đội ngũ NCKH 2026 của trường Đại học Mỏ-Địa chất phát triển.", help="System prompt for the ChatGPT API")
