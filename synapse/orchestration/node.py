@@ -34,7 +34,7 @@ class Node:
     self.discovery = discovery
     self.shard_downloader = shard_downloader
     self.partitioning_strategy = partitioning_strategy
-    self.peers: List[PeerHandle] = {}
+    self.peers: List[PeerHandle] = []
     self.topology: Topology = Topology()
     self.device_capabilities = UNKNOWN_DEVICE_CAPABILITIES
     self.buffered_token_output: Dict[str, Tuple[List[int], bool]] = {}
@@ -553,13 +553,15 @@ class Node:
     next_shard = self.get_current_shard(base_shard, target_index)
     if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. next shard: {next_shard}")
     if target_id == self.id:
-      await self.process_prompt(next_shard, prompt, request_id, inference_state)
+        if DEBUG >= 1: print(f"[DISTRIBUTE] Processing prompt locally (target_index={target_index})")
+        await self.process_prompt(next_shard, prompt, request_id, inference_state)
     else:
-      target_peer = next((p for p in self.peers if p.id() == target_id), None)
-      if not target_peer:
-        raise ValueError(f"Peer for {target_index} not found")
-      if DEBUG >= 1: print(f"Sending prompt to {target_peer.id()}: {prompt}")
-      await target_peer.send_prompt(next_shard, prompt, request_id=request_id, inference_state=inference_state)
+        target_peer = next((p for p in self.peers if p.id() == target_id), None)
+        if not target_peer:
+            raise ValueError(f"Peer for {target_index} not found")
+        if DEBUG >= 1: print(f"[DISTRIBUTE] Sending prompt to peer {target_peer.id()} (target_index={target_index})")
+        await target_peer.send_prompt(next_shard, prompt, request_id=request_id, inference_state=inference_state)
+        print(f"\n>>> [XÁC NHẬN] Đã phân tán Prompt sang Node: {target_peer.id()}")
   
   async def forward_tensor(
     self,
@@ -574,13 +576,15 @@ class Node:
     next_shard = self.get_current_shard(base_shard, target_index)
     if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. target shard: {next_shard}")
     if target_id == self.id:
-      await self.process_tensor(next_shard, tensor, request_id, inference_state)
+        if DEBUG >= 1: print(f"[DISTRIBUTE] Processing tensor locally (target_index={target_index})")
+        await self.process_tensor(next_shard, tensor, request_id, inference_state)
     else:
-      target_peer = next((p for p in self.peers if p.id() == target_id), None)
-      if not target_peer:
-        raise ValueError(f"Peer for {target_index} not found")
-      if DEBUG >= 1: print(f"Sending tensor to {target_peer.id()}: {tensor}")
-      await target_peer.send_tensor(next_shard, tensor, request_id=request_id, inference_state=inference_state)
+        target_peer = next((p for p in self.peers if p.id() == target_id), None)
+        if not target_peer:
+            raise ValueError(f"Peer for {target_index} not found")
+        if DEBUG >= 1: print(f"[DISTRIBUTE] Sending tensor to peer {target_peer.id()} (target_index={target_index})")
+        await target_peer.send_tensor(next_shard, tensor, request_id=request_id, inference_state=inference_state)
+        print(f">>> [XÁC NHẬN] Đã phân tán Tensor sang Node: {target_peer.id()}")
 
   def get_partition_index(self, offset: int = 0):
     if not self.partitioning_strategy:
