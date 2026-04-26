@@ -233,7 +233,7 @@ class UDPDiscovery(Discovery):
         if DEBUG_DISCOVERY >= 2:
           print(
             "Peer statuses:", {
-              peer_handle.id(): f"is_connected={await peer_handle.is_connected()}, health_check={await peer_handle.health_check()}, connected_at={connected_at}, last_seen={last_seen}, prio={prio}"
+              peer_handle.id(): f"is_connected={await peer_handle.is_connected()}, connected_at={connected_at}, last_seen={last_seen}, prio={prio}"
               for peer_handle, connected_at, last_seen, prio in self.known_peers.values()
             }
           )

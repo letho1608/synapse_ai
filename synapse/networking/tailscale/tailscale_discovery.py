@@ -311,7 +311,7 @@ class TailscaleDiscovery(Discovery):
         if DEBUG_DISCOVERY >= 2:
           print(
             "Peer statuses:", {
-              peer_handle.id(): f"is_connected={await peer_handle.is_connected()}, health_check={await peer_handle.health_check()}, connected_at={connected_at}, last_seen={last_seen}"
+              peer_handle.id(): f"is_connected={await peer_handle.is_connected()}, connected_at={connected_at}, last_seen={last_seen}"
               for peer_handle, connected_at, last_seen in self.known_peers.values()
             }
           )

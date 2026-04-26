@@ -273,7 +273,23 @@ class Node:
         inference_state,
       )
       if forwarded_tokens is not None and forwarded_tokens.size > 0:
-        self._on_token_received(request_id, forwarded_tokens.flatten().tolist(), False)
+        token_list = forwarded_tokens.flatten().tolist()
+        
+        is_finished = False
+        if len(token_list) > 0:
+          last_token = token_list[-1]
+          eos_token_id = None
+          if hasattr(self.inference_engine, 'tokenizer') and self.inference_engine.tokenizer is not None:
+            eos_token_id = getattr(self.inference_engine.tokenizer, 'eos_token_id', None)
+            if eos_token_id is None and hasattr(self.inference_engine.tokenizer, '_tokenizer'):
+              eos_token_id = getattr(self.inference_engine.tokenizer._tokenizer, 'eos_token_id', None)
+          stop_ids = {151643, 151644, 151645}
+          if eos_token_id is not None:
+            stop_ids.add(eos_token_id)
+          if last_token in stop_ids:
+            is_finished = True
+            
+        self._on_token_received(request_id, token_list, is_finished)
       return forwarded_tokens
     else:
       if DEBUG >= 1:
@@ -290,6 +306,8 @@ class Node:
         self._prompt_token_ids.pop(request_id, None)
     
         return np.array(self.buffered_token_output.get(request_id, ([], False))[0])
+      
+      return forward
 
 
   async def process_prompt(
@@ -401,6 +419,7 @@ class Node:
           
           # Continue autoregressive loop
           latest_result = await self.process_tensor(base_shard, last_token, request_id, inference_state)
+          wait_start = time.perf_counter()
 
         buffered_tokens, finished = self.buffered_token_output.get(request_id, ([], False))
         if not finished:
