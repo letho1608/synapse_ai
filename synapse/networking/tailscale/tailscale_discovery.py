@@ -155,83 +155,52 @@ class TailscaleDiscovery(Discovery):
             if DEBUG_DISCOVERY >= 2: print(f"Ignoring peer {peer_id} as it's not in the allowed node IDs list")
             continue
 
-          # ── [DEDUP] Kiểm tra xem IP này đã có trong danh sách với ID khác chưa ──
-          # Nếu IP này đã tồn tại với một ID khác (thường là hostname cũ), hãy chuẩn bị để dọn dẹp
-          duplicate_pids = [
-            pid for pid, (h, _, _) in self.known_peers.items() 
-            if h.addr() == f"{peer_host}:{peer_port}" and pid != peer_id
-          ]
+          # ── [STRICT IP DEDUP] Chỉ một Node duy nhất trên một địa chỉ IP:Port ──
+          target_addr = f"{peer_host}:{peer_port}"
+          existing_id_for_ip = next((pid for pid, (h, _, _) in self.known_peers.items() if h.addr() == target_addr), None)
+          
+          if existing_id_for_ip and existing_id_for_ip != peer_id:
+            # Nếu IP trùng, ưu tiên giữ UUID thay vì Hostname
+            if _is_uuid(peer_id) and not _is_uuid(existing_id_for_ip):
+                if DEBUG >= 1: print(f"🧹 [DEDUP] Thay thế '{existing_id_for_ip}' bằng UUID '{peer_id}' cho {target_addr}")
+                del self.known_peers[existing_id_for_ip]
+            elif not _is_uuid(peer_id) and _is_uuid(existing_id_for_ip):
+                # Đã có UUID cho IP này rồi, không cần quan tâm đến hostname nữa
+                continue 
           # ────────────────────────────────────────────────────────────────────
 
-          if peer_id not in self.known_peers or self.known_peers[peer_id][0].addr() != f"{peer_host}:{peer_port}":
-            new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
+          if peer_id not in self.known_peers or self.known_peers[peer_id][0].addr() != target_addr:
+            new_peer_handle = self.create_peer_handle(peer_id, target_addr, "TS", device_capabilities)
+            # Thử kết nối và check sức khỏe (Timeout 15s đã được set trong GRPCPeerHandle)
             if not await new_peer_handle.health_check():
-              # Nếu port lưu trữ bị cũ (stale), thử lại với port mặc định 50051
-              if peer_port != 50051:
-                if DEBUG >= 1: print(f"🔄 [DISCOVERY] Port {peer_port} không phản hồi — thử lại với port 50051 cho {peer_id}...")
-                new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:50051", "TS", device_capabilities)
-                peer_port = 50051
-                if not await new_peer_handle.health_check():
-                  if DEBUG >= 1: print(f"🔍 [DISCOVERY] Bỏ qua {peer_id} tại {peer_host}:50051 do không vượt qua bài kiểm tra sức khỏe.")
-                  continue
-              else:
-                if DEBUG >= 1: print(f"🔍 [DISCOVERY] Bỏ qua {peer_id} tại {peer_host}:{peer_port} do không vượt qua bài kiểm tra sức khỏe.")
-                continue
+                if peer_port != 50051:
+                    # Fallback port mặc định
+                    new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:50051", "TS", device_capabilities)
+                    if not await new_peer_handle.health_check(): continue
+                else:
+                    continue
 
-            # ── Resolve UUID thực của peer (tránh ID mismatch khi dùng hostname fallback) ──
-            # Nếu peer_id là hostname (không phải UUID), hỏi peer UUID thực của nó qua gRPC
-            peer_id_is_hostname = not _is_uuid(peer_id)
-            if peer_id_is_hostname:
+            # Resolve UUID ngay để tránh tình trạng "tên máy" xuất hiện trong UI
+            if not _is_uuid(peer_id):
               try:
-                remote_topology = await asyncio.wait_for(
-                  new_peer_handle.collect_topology(set(), max_depth=0),
-                  timeout=5.0,
-                )
-                if remote_topology and remote_topology.nodes:
-                  actual_id = next(
-                    (nid for nid, conns in remote_topology.peer_graph.items() if conns),
-                    list(remote_topology.nodes.keys())[0],
-                  )
-                  if actual_id:
-                    if actual_id == self.node_id: continue # Chính mình
-                    
-                    if actual_id != peer_id:
-                      if DEBUG >= 1: print(f"🔑 [DISCOVERY] Hostname fallback: {peer_id} → UUID thực {actual_id}")
-                      # Xóa ID cũ (hostname) nếu có
-                      if peer_id in self.known_peers: del self.known_peers[peer_id]
-                      
-                      peer_id = actual_id
-                      new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
-              except Exception as _e:
-                if DEBUG >= 1: print(f"[DISCOVERY] Không resolve được UUID cho {peer_id}: {_e}")
-            # ────────────────────────────────────────────────────────────────────────────────
-
-            # Dọn dẹp các ID trùng lặp IP (ví dụ xóa hostname cũ khi đã có UUID mới)
-            for dup_id in duplicate_pids:
-              if dup_id != peer_id:
-                if DEBUG >= 1: print(f"🧹 [DISCOVERY] Xóa bản ghi trùng IP: {dup_id} (ưu tiên {peer_id})")
-                if dup_id in self.known_peers: del self.known_peers[dup_id]
-
-            if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")
+                topo = await asyncio.wait_for(new_peer_handle.collect_topology(set(), max_depth=0), timeout=5.0)
+                actual_id = next((nid for nid in topo.nodes.keys() if _is_uuid(nid)), None)
+                if actual_id and actual_id != self.node_id:
+                  peer_id = actual_id
+                  new_peer_handle = self.create_peer_handle(peer_id, target_addr, "TS", device_capabilities)
+              except: pass
+            
+            if DEBUG >= 1: print(f"✅ [DISCOVERY] Thêm/Cập nhật node: {peer_id} tại {target_addr}")
             self.known_peers[peer_id] = (new_peer_handle, current_time, current_time)
           else:
-            # [CASE TRÙNG ID] - Đã là node quen thuộc
+            # Case đã biết: Chỉ cập nhật timestamp và check nếu cần
             handle = self.known_peers[peer_id][0]
-            
-            # --- TỐI ƯU HÓA: Check dựa vào kết nối TCP ---
-            if await handle.is_connected():
-              # Nếu vẫn đang kết nối TCP tốt, không cần gọi gRPC health check nữa (tiết kiệm tài nguyên)
-              old_connected_at = self.known_peers.get(peer_id, (None, current_time, None))[1]
-              self.known_peers[peer_id] = (handle, old_connected_at, current_time)
-              continue
-            
-            # Nếu kết nối TCP bị đắt, thử RE-CONNECT & HEALTH CHECK một lần cuối
-            if not await handle.health_check():
-              if DEBUG >= 1: print(f"Peer {peer_id} at {peer_host}:{peer_port} connection lost and health check failed. Removing.")
-              if peer_id in self.known_peers: del self.known_peers[peer_id]
-              continue
-            
-            # Vẫn cố gắng Resolve UUID nếu node hiện tại vẫn đang dùng hostname
+            if not await handle.is_connected():
+                # Nếu đứt kết nối tạm thời, không xóa ngay, để check_peer xử lý với timeout lớn
+                pass 
+
+            old_connected_at = self.known_peers.get(peer_id, (None, current_time, None))[1]
+            self.known_peers[peer_id] = (handle, old_connected_at, current_time)
 
         # ── [FINAL CLEANUP] Dọn dẹp triệt để các Node trùng IP ở cuối mỗi chu kỳ ──
         addr_map = {}
@@ -322,14 +291,25 @@ class TailscaleDiscovery(Discovery):
     try:
       # Kiểm tra trạng thái "sống" của kết nối TCP/gRPC
       is_connected = await peer_handle.is_connected()
+      
+      # Nếu đang ONLINE (gRPC READY), cập nhật last_seen thủ công để node luôn tươi mới
+      if is_connected:
+          self.known_peers[peer_id] = (peer_handle, connected_at, current_time)
+          return False
+          
     except Exception as e:
       if DEBUG_DISCOVERY >= 2: print(f"Error checking peer {peer_id}: {e}")
-      return True
+      return False # Đừng xóa vội nếu gặp lỗi nội bộ
 
-    # Chỉ xóa node nếu:
-    # 1. Kết nối TCP bị đứt QUÁ thời gian timeout
-    # 2. HOẶC Tailscale báo là máy đó đã offline quá lâu
-    should_remove = ((not is_connected and current_time - connected_at > self.discovery_timeout) or (current_time - last_seen > self.discovery_timeout))
+    # Logic xóa node (Gắt gao hơn):
+    # 1. Nếu kết nối TCP bị đứt QUÁ discovery_timeout (ví dụ 30s)
+    # 2. VÀ Tailscale cũng báo là đã offline quá lâu
+    time_since_last_seen = current_time - last_seen
+    should_remove = (not is_connected and time_since_last_seen > self.discovery_timeout)
+    
+    if should_remove and DEBUG_DISCOVERY >= 1:
+        print(f"🧹 [CLEANUP] Removing node {peer_id} after {round(time_since_last_seen)}s of disconnection.")
+        
     return should_remove
 
   async def get_devices_for_ui(self) -> List[Dict]:
