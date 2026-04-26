@@ -96,9 +96,9 @@ class GRPCPeerHandle(PeerHandle):
     if self.channel is None:
       return False
     state = self.channel.get_state()
-    # Chỉ coi là connected nếu channel ở trạng thái READY
-    # Các trạng thái khác (CONNECTING, TRANSIENT_FAILURE, SHUTDOWN) đều không phải connected
-    return state == grpc.ChannelConnectivity.READY
+    # READY và IDLE đều là trạng thái có thể sử dụng lại channel.
+    # gRPC có thể tự chuyển READY -> IDLE khi rảnh, không nên ép reconnect trong trường hợp này.
+    return state in (grpc.ChannelConnectivity.READY, grpc.ChannelConnectivity.IDLE)
 
   async def disconnect(self):
     async with self._lock:
@@ -144,7 +144,7 @@ class GRPCPeerHandle(PeerHandle):
     raise ConnectionError(f"{rpc_name} failed for {self._id}@{self.address} after retries")
 
   async def _ensure_connected(self):
-    if not (await self.is_connected()):
+    if self.channel is None or self.stub is None:
       try:
         await asyncio.wait_for(self.connect(), timeout=10.0)
         # Đảm bảo stub đã được tạo sau khi connect thành công

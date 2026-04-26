@@ -253,11 +253,14 @@ class UDPDiscovery(Discovery):
     if peer_handle is None: return False
 
     try:
-      is_connected = await peer_handle.is_connected()
       health_ok = await peer_handle.health_check()
     except Exception as e:
       if DEBUG_DISCOVERY >= 2: print(f"Error checking peer {peer_id}: {e}")
       return True
 
-    should_remove = ((not is_connected and current_time - connected_at > self.discovery_timeout) or (current_time - last_seen > self.discovery_timeout) or (not health_ok))
-    return should_remove
+    if health_ok:
+      # Health check thành công => peer vẫn sống, cập nhật last_seen để tránh timeout giả.
+      self.known_peers[peer_id] = (peer_handle, connected_at, current_time, prio)
+      return False
+
+    return (current_time - last_seen > self.discovery_timeout)
