@@ -117,10 +117,16 @@ class TailscaleDiscovery(Discovery):
     except Exception as e:
       print(f"TailscaleDiscovery: Error updating device posture attributes: {e}")
       if DEBUG_DISCOVERY >= 1: traceback.print_exc()
+  
+  def _format_time_ago(self, timestamp: float) -> str:
+    diff = time.time() - timestamp
+    if diff < 60: return f"{int(diff)}s"
+    return f"{int(diff/60)}m"
 
   async def task_discover_peers(self):
     while True:
       try:
+        if DEBUG_DISCOVERY >= 1: logger.info("TailscaleDiscovery: Starting per-device scan...")
         devices: dict[str, Device] = await get_tailscale_devices(self.tailscale_api_key, self.tailnet)
         current_time = time.time()
 
@@ -137,18 +143,21 @@ class TailscaleDiscovery(Discovery):
                     (device.name == self.node_id)
           
           if is_self:
-            if DEBUG_DISCOVERY >= 4: print(f"Skipping self: {device.name}")
+            if DEBUG_DISCOVERY >= 2: logger.debug(f"Skipping self: {device.name}")
             continue
             
+          last_seen = self._format_time_ago(device.last_seen.timestamp()) if device.last_seen else "unknown"
           peer_host = device.addresses[0]
+          logger.info(f"Scanning Tailscale device: {device.name} at {peer_host} (last seen: {last_seen} ago)")
+          
           try:
             peer_id, peer_port, device_capabilities = await get_device_attributes(device.device_id, self.tailscale_api_key)
           except (asyncio.TimeoutError, OSError, aiohttp.ClientError) as e:
-            if DEBUG_DISCOVERY >= 1:
-              print(f"Discover peers: skip device {device.device_id} ({device.name}) after timeout/error: {e}")
+            logger.warning(f"Failed to get attributes for {device.name}: {e}")
             continue
+
           if not peer_id:
-            if DEBUG_DISCOVERY >= 4: print(f"{device.device_id} does not have synapse node attributes. skipping.")
+            logger.info(f"Device {device.name} is not a Synapse node (no attributes found).")
             continue
 
           if self.allowed_node_ids and peer_id not in self.allowed_node_ids:
