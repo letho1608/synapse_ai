@@ -62,8 +62,14 @@ class P2PPeerHandle(PeerHandle):
             await asyncio.sleep(0.5) 
             
             res = await self._rpc_call("synapse/rpc/health", {})
-            return res.get("status") == "ok"
-        except Exception:
+            if res.get("status") == "ok":
+                logger.info(f"Verified peer {self._id} at {self.address} is a Synapse node.")
+                return True
+            return False
+        except Exception as e:
+            if "Timeout" in str(e) or "cancelled" in str(e).lower():
+                return False
+            logger.debug(f"Health check failed for {self.address}: {e}")
             return False
 
     async def send_prompt(self, shard: Shard, prompt: str, request_id: Optional[str] = None) -> Optional[np.ndarray]:

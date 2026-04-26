@@ -4,6 +4,7 @@ import traceback
 import socket
 import aiohttp
 from typing import List, Dict, Callable, Tuple, Set
+from loguru import logger
 from synapse.networking.discovery import Discovery
 from synapse.networking.peer_handle import PeerHandle
 from synapse.topology.device_capabilities import DeviceCapabilities, device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
@@ -62,11 +63,22 @@ class TailscaleDiscovery(Discovery):
     self.allowed_node_ids = allowed_node_ids
     self._device_id = None
     self.update_task = None
+    self._our_device_id = None
+    self._our_ips = set()
 
   async def start(self):
-    if DEBUG_DISCOVERY >= 1: print("TailscaleDiscovery: Getting device capabilities...")
     self.device_capabilities = await device_capabilities()
     
+    # Identify ourselves
+    try:
+      self._our_device_id, self._our_ips = await get_self_tailscale_info()
+      if not self._our_ips:
+        self._our_ips = _get_all_local_ips()
+      if DEBUG_DISCOVERY >= 1: 
+        print(f"TailscaleDiscovery: Self identified as {self._our_device_id} with IPs {self._our_ips}")
+    except Exception as e:
+      if DEBUG_DISCOVERY >= 1: print(f"TailscaleDiscovery: Failed to identify self: {e}")
+
     if DEBUG_DISCOVERY >= 1: print("TailscaleDiscovery: Starting discovery tasks...")
     self.discovery_task = asyncio.create_task(self.task_discover_peers())
     self.cleanup_task = asyncio.create_task(self.task_cleanup_peers())
@@ -119,7 +131,15 @@ class TailscaleDiscovery(Discovery):
         if DEBUG_DISCOVERY >= 2: print("Time since last seen tailscale devices", [(current_time - device.last_seen.timestamp()) for device in devices.values()])
 
         for device in active_devices.values():
-          if device.name == self.node_id: continue
+          # Skip ourselves
+          is_self = (self._our_device_id is not None and str(device.device_id) == str(self._our_device_id)) or \
+                    (any(ip in (device.addresses or []) for ip in self._our_ips)) or \
+                    (device.name == self.node_id)
+          
+          if is_self:
+            if DEBUG_DISCOVERY >= 4: print(f"Skipping self: {device.name}")
+            continue
+            
           peer_host = device.addresses[0]
           try:
             peer_id, peer_port, device_capabilities = await get_device_attributes(device.device_id, self.tailscale_api_key)
@@ -136,9 +156,10 @@ class TailscaleDiscovery(Discovery):
             continue
 
           if peer_id not in self.known_peers or self.known_peers[peer_id][0].addr() != f"{peer_host}:{peer_port}":
+            logger.info(f"Checking potential Synapse node: {device.name} IP: {peer_host}:{peer_port}")
             new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
             if not await new_peer_handle.health_check():
-              if DEBUG >= 1: print(f"Peer {peer_id} at {peer_host}:{peer_port} is not healthy. Skipping.")
+              logger.warning(f"Device {device.name} at {peer_host}:{peer_port} failed health check (not a Synapse node?)")
               continue
 
             if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")

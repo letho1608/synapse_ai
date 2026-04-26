@@ -66,6 +66,12 @@ class P2PSocketBridge:
             self._peer_addresses[peer_id] = address
             self._tasks.append(asyncio.create_task(self._read_loop(peer_id, reader)))
             logger.info(f"Connected to peer: {peer_id} at {address}")
+        except (ConnectionRefusedError, OSError) as e:
+            # WinError 1225 is often a ConnectionRefusedError on Windows
+            if "1225" in str(e) or isinstance(e, ConnectionRefusedError):
+                logger.warning(f"Connection refused by peer {peer_id} at {address}. Peer may be offline or starting up.")
+            else:
+                logger.error(f"Failed to connect to peer {peer_id} at {address}: {e}")
         except Exception as e:
             logger.error(f"Failed to connect to peer {peer_id} at {address}: {e}")
 
