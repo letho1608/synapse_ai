@@ -19,11 +19,16 @@ def _detect_nvidia_gpus_via_nvidia_smi() -> list[str]:
     Returns list of GPU names.
     """
     try:
+        kwargs = {}
+        if os.name == 'nt':
+            kwargs['creationflags'] = 0x08000000  # CREATE_NO_WINDOW
+
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=2,
+            **kwargs
         )
         if out.returncode != 0 or not (out.stdout or "").strip():
             return []

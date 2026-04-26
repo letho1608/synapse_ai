@@ -73,7 +73,7 @@ parser.add_argument("--prompt", type=str, help="Prompt for the model when using 
 parser.add_argument("--default-temp", type=float, help="Default token sampling temperature", default=0.7)
 # Tailscale API key: Provide your API key here
 # Can be overridden with --tailscale-api-key
-TAILSCALE_API_KEY_DEFAULT = "tskey-api-kZkPWrVyM311CNTRL-91psFey7AHYgSzXpLr7GJYKZm43RZkXVD"
+TAILSCALE_API_KEY_DEFAULT = "tskey-api-kFGrMwTg3L11CNTRL-zUKTZripuEfqx98GNpBtDfxoo2TdTpTph"
 parser.add_argument("--tailscale-api-key", type=str, default=TAILSCALE_API_KEY_DEFAULT, help="Tailscale API key (defaults to hardcoded value)")
 # Tailnet name: Provide your tailnet name here
 # Can be overridden with --tailnet-name
