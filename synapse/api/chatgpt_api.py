@@ -2051,13 +2051,20 @@ class ChatGPTAPI:
 
       # === Giai đoạn 3: Ring-AllReduce Setup ===
       self._set_activity(job, "Thiết lập truyền tải dữ liệu (Ring-AllReduce)...")
-      # Lấy danh sách entry nodes (DP nodes)
+      # FIX: Get ALL Data Parallel nodes (not just start==0.0)
+      # AllReduce must include ALL nodes that are training
       partitions = self.node.partitioning_strategy.partition(self.node.topology)
-      entry_node_ids = sorted(list(set(p.node_id for p in partitions if p.start == 0.0)))
-      sync_strategy = job.get("sync_strategy", "ring") # ring hoặc averaging
+      all_dp_nodes = sorted(list(set(p.node_id for p in partitions)))  # ALL nodes, not just start==0.0!
+      entry_node_ids = all_dp_nodes  # Use all nodes for AllReduce
       
-      if sync_strategy == "ring" and len(entry_node_ids) > 1:
+      if DEBUG >= 1:
+        print(f"[Training] All Data Parallel nodes for AllReduce: {entry_node_ids}")
+      
+      sync_strategy = job.get("sync_strategy", "adaptive")  # adaptive or ring
+      
+      if len(entry_node_ids) > 1:
         await self._setup_ring_topology(job, entry_node_ids)
+        if DEBUG >= 1: print(f"[Training] ✅ Ring topology setup for {len(entry_node_ids)} nodes")
 
       for epoch in range(epochs):
         if self._training_job is None or self._training_job.get("job_id") != job_id:
@@ -2169,14 +2176,19 @@ class ChatGPTAPI:
               job["current_step"] = min(step_count, total_steps)  # Clamp để không vượt
               
               # === Gradient Synchronization Section ===
-              if step_count % sync_every_n == 0:
+              if step_count % sync_every_n == 0 and len(entry_node_ids) > 1:
                 # Select sync strategy: adaptive (fault-tolerant) vs ring (traditional)
                 use_adaptive = job.get("use_adaptive_allreduce", True)
                 
-                if use_adaptive and len(entry_node_ids) > 1:
+                if DEBUG >= 1: 
+                  print(f"\n[Sync] ═══ Step {step_count} ═══")
+                  print(f"[Sync] Nodes in ring: {entry_node_ids}")
+                  print(f"[Sync] Strategy: {'Adaptive AllReduce' if use_adaptive else 'Ring-AllReduce'}")
+                
+                if use_adaptive:
                   # 🟢 ADAPTIVE MODE: Tree (50ms) → Ring (100ms) → Mesh (300ms, always works)
-                  if DEBUG >= 1: print(f"[Sync] Step {step_count}: 🟢 Adaptive AllReduce (Tree/Ring/Mesh fallback)...")
-                  job["current_activity"] = f"Step {step_count}: Gradient sync (Adaptive AllReduce)..."
+                  if DEBUG >= 1: print(f"[Sync] 🟢 Attempting Adaptive AllReduce (Tree→Ring→Mesh)...")
+                  job["current_activity"] = f"Step {step_count}: Gradient sync (Adaptive)..."
                   sync_tasks = []
                   for node_id in entry_node_ids:
                     if node_id == self.node.id:
@@ -2185,24 +2197,29 @@ class ChatGPTAPI:
                     else:
                       peer = next((p for p in self.node.peers if p.id() == node_id), None)
                       if peer:
+                        if DEBUG >= 1: print(f"[Sync] Triggering AllReduce on remote node {node_id}")
                         sync_tasks.append(peer.trigger_ring_allreduce(model))
+                      else:
+                        if DEBUG >= 1: print(f"[Sync] ⚠️ WARNING: Cannot find peer for {node_id}")
                   
                   if sync_tasks:
                     try:
                       await asyncio.gather(*sync_tasks)
-                      if DEBUG >= 1: 
-                        metrics = self.node.get_allreduce_metrics()
-                        if metrics and metrics.get("latest_metric"):
-                          latest = metrics["latest_metric"]
-                          print(f"[Sync] ✅ Step {step_count}: {latest['strategy'].upper()} completed in {latest['duration_ms']:.1f}ms")
+                      metrics = self.node.get_allreduce_metrics()
+                      if metrics and metrics.get("latest_metric"):
+                        latest = metrics["latest_metric"]
+                        strategy_name = latest['strategy'].upper()
+                        duration = latest['duration_ms']
+                        size = latest['size_mb']
+                        job["allreduce_info"] = f"[{strategy_name}] {duration:.0f}ms ({size:.1f}MB)"
+                        if DEBUG >= 1: print(f"[Sync] ✅ {strategy_name} completed in {duration:.1f}ms\n")
                     except Exception as e:
-                      if DEBUG >= 1: print(f"[Sync] ⚠️ Adaptive sync failed: {e}")
-                      # System will retry on next sync_every_n step
+                      if DEBUG >= 1: print(f"[Sync] ❌ Adaptive sync FAILED: {e}\n")
                 
-                elif sync_strategy == "ring" and len(entry_node_ids) > 1:
+                else:
                   # 🟠 RING ONLY: Traditional Ring-AllReduce (100ms, faster but single point of failure)
-                  if DEBUG >= 1: print(f"[Sync] Step {step_count}: 🟠 Ring-AllReduce (traditional, non-adaptive)...")
-                  job["current_activity"] = f"Step {step_count}: Gradient sync (Ring-AllReduce)..."
+                  if DEBUG >= 1: print(f"[Sync] 🟠 Using Ring-AllReduce (traditional)...")
+                  job["current_activity"] = f"Step {step_count}: Gradient sync (Ring)..."
                   sync_tasks = []
                   for node_id in entry_node_ids:
                     if node_id == self.node.id:
@@ -2214,6 +2231,7 @@ class ChatGPTAPI:
                   
                   if sync_tasks:
                     await asyncio.gather(*sync_tasks)
+                    if DEBUG >= 1: print(f"[Sync] ✅ Ring-AllReduce completed\n")
               
               job["current_epoch"] = epoch 
               # Cập nhật progress dựa trên step_count thực tế
@@ -2233,8 +2251,12 @@ class ChatGPTAPI:
               
               # Luôn đảm bảo Step trực quan trong UI (không vượt quá total_steps)
               display_step = min(step_count, total_steps)
-              allreduce_note = f" ({job.get('allreduce_info', '')})" if job.get('allreduce_info') else ""
-              job["current_activity"] = f"Step {display_step}/{total_steps} (Epoch {epoch+1}/{epochs}){allreduce_note}"
+              allreduce_note = f" {job.get('allreduce_info', '')}" if job.get('allreduce_info') else ""
+              epoch_progress = f"({step_count % steps_per_epoch}/{steps_per_epoch})"
+              job["current_activity"] = f"Epoch {epoch+1}/{epochs} {epoch_progress}: Step {display_step}/{total_steps}{allreduce_note}"
+              
+              # Calculate and display progress
+              job["progress"] = min(100, int(100 * step_count / max(1, total_steps)))
               
               # Broadcast tới các máy khác
               await broadcast_status()

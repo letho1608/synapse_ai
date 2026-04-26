@@ -1364,6 +1364,95 @@
                             </div>
                         </div>
 
+                        <!-- Warmup Profiling Section (shown when profiling) -->
+                        <div x-show="trainingJob && (trainingJob.status === 'profiling' || trainingJob.current_activity?.includes('Profiling'))" 
+                            style="background:rgba(59, 130, 246, 0.1);border:1px solid #3B82F6;border-radius:var(--radius-lg);padding:20px;margin-bottom:20px">
+                            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+                                <i class="fas fa-spinner fa-spin" style="color:#3B82F6;font-size:20px"></i>
+                                <h3 style="margin:0;color:#3B82F6;font-weight:700">🔍 Warmup Profiling (Đo đạc hiệu năng)</h3>
+                            </div>
+
+                            <p style="font-size:12px;color:var(--text-muted);margin-bottom:16px;line-height:1.6">
+                                Hệ thống đang chạy 8 batches mẫu trên mỗi node để đo thực tế throughput (samples/sec),
+                                sau đó sẽ tự động quyết định phân bổ công việc dựa trên năng lực từng máy.
+                            </p>
+
+                            <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(250px, 1fr));gap:12px;margin-bottom:16px">
+                                <template x-for="node in clusterResources" :key="node.node_id">
+                                    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:12px">
+                                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                                            <span style="font-weight:600;font-size:13px" x-text="node.name"></span>
+                                            <span style="font-size:11px;padding:3px 8px;background:#3B82F6;color:white;border-radius:4px">
+                                                <i class="fas fa-spinner fa-spin" style="margin-right:4px"></i>Profiling...
+                                            </span>
+                                        </div>
+                                        <div style="font-size:12px;color:var(--text-muted)">
+                                            <div>Model: <span x-text="trainingJob?.model"></span></div>
+                                            <div>Batch size: <span x-text="trainingJob?.batch_size"></span></div>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+
+                            <p style="font-size:11px;color:var(--text-muted);margin:0">
+                                💡 Bước này rất quan trọng - nó sẽ quyết định mỗi máy xử lý bao nhiêu % công việc trong training thực tế.
+                            </p>
+                        </div>
+
+                        <!-- Warmup Profiling Results (shown after profiling completes) -->
+                        <div x-show="trainingJob && trainingJob.profiling_results && !trainingJob.current_activity?.includes('Profiling')"
+                            style="background:rgba(34, 197, 94, 0.1);border:1px solid #22C55E;border-radius:var(--radius-lg);padding:20px;margin-bottom:20px">
+                            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+                                <i class="fas fa-check-circle" style="color:#22C55E;font-size:20px"></i>
+                                <h3 style="margin:0;color:#22C55E;font-weight:700">✅ Warmup Profiling Hoàn tất</h3>
+                            </div>
+
+                            <p style="font-size:12px;color:var(--text-muted);margin-bottom:16px">
+                                Kết quả đo đạc từ 8 batches mẫu. Dựa trên kết quả này, mỗi node sẽ được phân bổ công việc phù hợp với năng lực.
+                            </p>
+
+                            <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:12px;margin-bottom:16px">
+                                <template x-for="(node, idx) in clusterResources" :key="node.node_id">
+                                    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:12px">
+                                        <div style="font-weight:600;font-size:13px;margin-bottom:8px" x-text="node.name"></div>
+                                        
+                                        <div style="margin-bottom:8px">
+                                            <div style="font-size:11px;color:var(--text-muted);margin-bottom:3px">Throughput (Warmup):</div>
+                                            <div style="font-size:14px;font-weight:700;color:var(--success);font-family:monospace">
+                                                <span x-text="(node.warmup_throughput || 0).toFixed(1)"></span> samples/sec
+                                            </div>
+                                        </div>
+
+                                        <div style="margin-bottom:8px">
+                                            <div style="font-size:11px;color:var(--text-muted);margin-bottom:3px">Trọng số phân bổ:</div>
+                                            <div style="font-size:14px;font-weight:700;color:var(--info);font-family:monospace">
+                                                <span x-text="(node.share_pct || 0).toFixed(1)"></span> %
+                                            </div>
+                                        </div>
+
+                                        <div style="margin-bottom:0">
+                                            <div style="font-size:11px;color:var(--text-muted);margin-bottom:3px">Dự kiến/batch:</div>
+                                            <div style="font-size:12px;color:var(--text-muted)">
+                                                <span x-text="Math.round((trainingJob.batch_size || 16) * (node.share_pct || 0) / 100)"></span> samples
+                                            </div>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+
+                            <div style="background:rgba(59, 130, 246, 0.05);border-left:3px solid #3B82F6;padding:12px;border-radius:4px;font-size:12px">
+                                <strong style="color:#3B82F6">📊 Kết luận:</strong>
+                                <span style="display:block;margin-top:4px">
+                                    Mỗi batch sẽ được chia: 
+                                    <template x-for="(node, idx) in clusterResources" :key="node.node_id">
+                                        <span>
+                                            <span x-text="node.name"></span> = <span x-text="Math.round((trainingJob.batch_size || 16) * (node.share_pct || 0) / 100)"></span> samples<span x-show="idx < clusterResources.length - 1">, </span>
+                                        </span>
+                                    </template>
+                                </span>
+                            </div>
+                        </div>
+
                         <div class="training-progress-card" x-show="trainingJob">
                             <h3 class="training-section-title">Tiến trình Training</h3>
                             
