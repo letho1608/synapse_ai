@@ -215,12 +215,11 @@ class TailscaleDiscovery(Discovery):
             if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")
             self.known_peers[peer_id] = (new_peer_handle, current_time, current_time)
           else:
-            # [CASE TRÙNG ID] - Chỉ cần cập nhật timestamp và health check
+            # [CASE TRÙNG ID] - Đã là node quen thuộc, chỉ cập nhật timestamp
             handle = self.known_peers[peer_id][0]
-            if not await handle.health_check():
-              if DEBUG >= 1: print(f"Peer {peer_id} at {peer_host}:{peer_port} is not healthy. Removing.")
-              if peer_id in self.known_peers: del self.known_peers[peer_id]
-              continue
+            
+            # Bỏ qua health_check định kỳ theo yêu cầu người dùng
+            # (Chỉ check 1 lần duy nhất khi phát hiện ở khối code phía trên)
             
             # Vẫn cố gắng Resolve UUID nếu node hiện tại vẫn đang dùng hostname
             if not _is_uuid(peer_id):
@@ -325,12 +324,12 @@ class TailscaleDiscovery(Discovery):
 
     try:
       is_connected = await peer_handle.is_connected()
-      health_ok = await peer_handle.health_check()
+      # Bỏ qua health_check định kỳ để giữ trạng thái UI ổn định
     except Exception as e:
       if DEBUG_DISCOVERY >= 2: print(f"Error checking peer {peer_id}: {e}")
       return True
 
-    should_remove = ((not is_connected and current_time - connected_at > self.discovery_timeout) or (current_time - last_seen > self.discovery_timeout) or (not health_ok))
+    should_remove = ((not is_connected and current_time - connected_at > self.discovery_timeout) or (current_time - last_seen > self.discovery_timeout))
     return should_remove
 
   async def get_devices_for_ui(self) -> List[Dict]:
