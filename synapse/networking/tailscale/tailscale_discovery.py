@@ -168,7 +168,7 @@ class TailscaleDiscovery(Discovery):
             logger.info(f"Checking potential Synapse node: {device.name} IP: {peer_host}:{peer_port}")
             new_peer_handle = self.create_peer_handle(peer_id, f"{peer_host}:{peer_port}", "TS", device_capabilities)
             if not await new_peer_handle.health_check():
-              logger.warning(f"Device {device.name} at {peer_host}:{peer_port} failed health check (not a Synapse node?)")
+              # Health check failure is already logged by P2PPeerHandle as ERROR
               continue
 
             if DEBUG >= 1: print(f"Adding {peer_id=} at {peer_host}:{peer_port}. Replace existing peer_id: {peer_id in self.known_peers}")
