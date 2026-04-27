@@ -672,8 +672,8 @@
                             </div>
                         </div>
                         <p class="text-muted" style="font-size:13px;margin-bottom:16px">
-                            Thuật toán <strong>LACP</strong> (Latency-Aware Collaborative Partitioning): phân chia layer
-                            theo latency, memory và TFLOPS fp16.
+                            Thuật toán partitioning hiện tại: <strong x-text="clusterStrategyName"></strong>.
+                            Hệ thống tự động phân chia <strong x-text="clusterTotalLayers"></strong> layer của model theo latency, memory và TFLOPS fp16.
                             Node có GPU mạnh hơn xử lý nhiều layer hơn — tăng tốc inference &amp; training phân tán.
                         </p>
 
@@ -681,7 +681,7 @@
                         <div class="layer-bar-wrap" x-show="clusterResources.length > 0">
                             <template x-for="(node, idx) in clusterResources" :key="node.node_id">
                                 <div class="layer-bar-segment"
-                                    :style="`left:${node.layer_start_pct}%;width:${node.layer_end_pct - node.layer_start_pct}%;background:${idx===0?'var(--primary)':idx===1?'#0EA5E9':idx===2?'#D97706':idx===3?'#7C3AED':'#059669'}`">
+                                    :style="`left:${(node.layer_start / clusterTotalLayers) * 100}%;width:${((node.layer_end - node.layer_start + 1) / clusterTotalLayers) * 100}%;background:${idx===0?'var(--primary)':idx===1?'#0EA5E9':idx===2?'#D97706':idx===3?'#7C3AED':'#059669'}`">
                                     <span x-text="node.name.length>8 ? node.name.slice(0,8)+'…' : node.name"
                                         style="text-shadow:0 1px 3px rgba(0,0,0,.4)"></span>
                                 </div>
@@ -689,7 +689,7 @@
                         </div>
                         <div
                             style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:16px">
-                            <span>Layer 0%</span><span>50%</span><span>100%</span>
+                            <span>Layer 0</span><span x-text="'Total: ' + clusterTotalLayers + ' layers'"></span>
                         </div>
 
                         <!-- Per-node detail bars -->
@@ -744,13 +744,13 @@
                                 <div style="margin-bottom:10px">
                                     <div
                                         style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:3px">
-                                        <span>Layer <strong x-text="node.layer_start_pct + '%'"></strong></span>
-                                        <span>→ <strong x-text="node.layer_end_pct + '%'"></strong> (<span
-                                                x-text="node.share_pct + '% tổng'"></span>)</span>
+                                        <span>Layer <strong x-text="node.layer_start"></strong></span>
+                                        <span>→ <strong x-text="node.layer_end"></strong> (<span
+                                                x-text="node.layer_count + ' layers'"></span>)</span>
                                     </div>
                                     <div class="resource-bar">
                                         <div class="resource-bar-fill bar-layer"
-                                            :style="`margin-left:${node.layer_start_pct}%;width:${node.layer_end_pct - node.layer_start_pct}%`">
+                                            :style="`margin-left:${(node.layer_start / clusterTotalLayers) * 100}%;width:${(node.layer_count / clusterTotalLayers) * 100}%`">
                                         </div>
                                     </div>
                                 </div>
@@ -1444,7 +1444,7 @@
                         <section class="about-highlights">
                             <div class="about-highlights-inner">
                                 <div class="about-highlight-item">
-                                    <span class="about-highlight-num">22</span>
+                                    <span class="about-highlight-num">500+</span>
                                     <span class="about-highlight-label">Model HF</span>
                                 </div>
                                 <div class="about-highlight-item">
@@ -1484,8 +1484,8 @@
                                 <div class="about-goal">
                                     <span class="about-goal-num">3</span>
                                     <div>
-                                        <strong>Quản lý model &amp; data tập trung</strong> — Tải/xóa 22 model từ
-                                        Hugging Face từ giao diện web; quản lý dataset (JSON/JSONL), fine-tune LoRA và
+                                        <strong>Quản lý model &amp; data tập trung</strong> — Tải/xóa 500+ model từ
+                                        Hugging Face trực tiếp từ giao diện; quản lý dataset (JSON/JSONL), fine-tune LoRA và
                                         Chat với Model ngay trên dashboard.
                                     </div>
                                 </div>
@@ -1519,14 +1519,14 @@
                                 <div class="about-feature-card">
                                     <div class="about-feature-icon"><i class="fas fa-cube"></i></div>
                                     <h3 class="about-feature-title">Quản lý mô hình</h3>
-                                    <p>22 model Hugging Face: danh sách đã tải / có thể tải; tải (snapshot_download) và
+                                    <p>500+ model Hugging Face: danh sách đã tải / có thể tải; tải (snapshot_download) và
                                         xóa (HF cache) từ web UI.</p>
                                 </div>
                                 <div class="about-feature-card">
                                     <div class="about-feature-icon"><i class="fas fa-network-wired"></i></div>
                                     <h3 class="about-feature-title">Cluster &amp; Discovery</h3>
-                                    <p>Tailscale, UDP, Manual; thu thập topology (CPU, RAM, FLOPS); partitioning (LACP)
-                                        gán layer theo latency và tài nguyên.</p>
+                                    <p>Tailscale, UDP, Manual; thu thập topology (CPU, RAM, FLOPS); partitioning (LACP 2.0)
+                                        tự động phân bổ layer theo latency và tài nguyên (Largest Remainder).</p>
                                 </div>
                                 <div class="about-feature-card">
                                     <div class="about-feature-icon"><i class="fas fa-database"></i></div>
@@ -1614,7 +1614,7 @@
                                     </tr>
                                     <tr>
                                         <td><code>synapse/model_list.py</code></td>
-                                        <td>22 model (download + UI)</td>
+                                        <td>500+ model (download + UI)</td>
                                     </tr>
                                     <tr>
                                         <td><code>synapse/inference/pytorch_hf_engine.py</code></td>
@@ -1817,8 +1817,9 @@
                 clusterResources: [],
                 clusterLoading: false,
                 clusterTrainingJob: null,
+                clusterStrategyName: '',
+                clusterTotalLayers: 32,
                 _layerChart: null,
-                _flopsChart: null,
                 _flopsChart: null,
                 // === Model filter ===
                 modelSearch: '',
@@ -2432,6 +2433,8 @@
                         const res = await fetch('/v1/cluster/resources');
                         const data = await res.json();
                         this.clusterResources = data.nodes || [];
+                        this.clusterStrategyName = data.strategy_name || 'Unknown';
+                        this.clusterTotalLayers = data.total_layers || 32;
                         this.clusterTrainingJob = data.training_job || null;
                         this.$nextTick(() => this.renderClusterCharts());
                     } catch (e) {
@@ -2456,8 +2459,8 @@
                             data: {
                                 labels: nodes.map(n => n.name),
                                 datasets: [{
-                                    label: 'Layer phân chia (%)',
-                                    data: nodes.map(n => n.share_pct),
+                                    label: 'Số lượng layer',
+                                    data: nodes.map(n => n.layer_count),
                                     backgroundColor: nodes.map((_, i) => COLORS[i % COLORS.length] + 'CC'),
                                     borderColor: nodes.map((_, i) => COLORS[i % COLORS.length]),
                                     borderWidth: 2, borderRadius: 6,
@@ -2471,14 +2474,19 @@
                                         callbacks: {
                                             label: ctx => {
                                                 const n = nodes[ctx.dataIndex];
-                                                return [` Layer: ${n.layer_start_pct}% → ${n.layer_end_pct}%`, ` Tỷ lệ: ${n.share_pct}%`,
+                                                return [` Layers: ${n.layer_start} → ${n.layer_end} (${n.layer_count} layers)`, ` Tỷ lệ: ${n.share_pct}%`,
                                                 n.flops_fp16 > 0 ? ` TFLOPS: ${n.flops_fp16.toFixed(2)}` : ' CPU only'];
                                             }
                                         }
                                     }
                                 },
                                 scales: {
-                                    x: { max: 100, title: { display: true, text: 'Layer (%)' }, grid: { color: 'rgba(0,0,0,0.05)' } },
+                                    x: { 
+                                        max: this.clusterTotalLayers, 
+                                        title: { display: true, text: 'Số lượng Layer' }, 
+                                        grid: { color: 'rgba(0,0,0,0.05)' },
+                                        ticks: { stepSize: 4 }
+                                    },
                                     y: { grid: { display: false } }
                                 }
                             }

@@ -90,14 +90,25 @@ def build_base_shard(model_id: str, inference_engine_classname: str) -> Optional
         model_info = _MODEL_REGISTRY[model_id]
         n_layers = model_info.get("layers", 0)
     elif model_id in HF_MODEL_LAYERS:
-        # Dự phòng từ danh sách động (hf_models.json)
         n_layers = HF_MODEL_LAYERS[model_id]
     else:
-        # Thử tìm kiếm mờ trong HF_MODEL_LAYERS
-        for k, v in HF_MODEL_LAYERS.items():
-            if k.lower() == model_id.lower():
-                n_layers = v
-                break
+        normalized = model_id.lower().replace(":", "-").replace("_", "-")
+        if normalized in HF_MODEL_LAYERS:
+            n_layers = HF_MODEL_LAYERS[normalized]
+        else:
+            for k, v in HF_MODEL_LAYERS.items():
+                if k.lower() == normalized:
+                    n_layers = v
+                    break
+            # Also check registered models with normalized key
+            if n_layers < 1:
+                if normalized in _MODEL_REGISTRY:
+                    n_layers = _MODEL_REGISTRY[normalized].get("layers", 0)
+                else:
+                    for reg_key, reg_info in _MODEL_REGISTRY.items():
+                        if reg_key.lower() == normalized:
+                            n_layers = reg_info.get("layers", 0)
+                            break
     
     if n_layers < 1:
         return None

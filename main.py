@@ -4,6 +4,11 @@ Synapse AI Entry Point
 """
 import os
 import sys
+
+# Disable HuggingFace Hub symlinks on Windows to avoid WinError 1314 without admin/dev mode
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 import asyncio
 import traceback
 import warnings

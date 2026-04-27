@@ -56,10 +56,13 @@ class Topology:
                          for node, conns in self.peer_graph.items())
     return f"Topology(Nodes: {{{nodes_str}}}, Edges: {{{edges_str}}})"
 
-  def to_json(self):
+  def to_dict(self):
     return {
       "nodes": {
-        node_id: capabilities.to_dict()
+        node_id: {
+          **capabilities.to_dict(),
+          "status": "master" if node_id == self.active_node_id else "worker"
+        }
         for node_id, capabilities in self.nodes.items()
       },
       "peer_graph": {
@@ -75,3 +78,27 @@ class Topology:
       },
       "active_node_id": self.active_node_id
     }
+
+  def to_json(self):
+    return self.to_dict()
+
+  @classmethod
+  def from_dict(cls, data: dict) -> "Topology":
+    topology = cls()
+    if not data: return topology
+    
+    nodes_data = data.get("nodes", {})
+    for node_id, cap_data in nodes_data.items():
+        topology.update_node(node_id, DeviceCapabilities.from_dict(cap_data))
+    
+    peer_graph_data = data.get("peer_graph", {})
+    for from_id, conns in peer_graph_data.items():
+        for conn_data in conns:
+            topology.add_edge(
+                conn_data["from_id"], 
+                conn_data["to_id"], 
+                conn_data.get("description")
+            )
+            
+    topology.active_node_id = data.get("active_node_id")
+    return topology

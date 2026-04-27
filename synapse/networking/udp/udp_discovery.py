@@ -3,12 +3,35 @@ import json
 import socket
 import time
 import traceback
+import psutil
 from typing import List, Dict, Callable, Tuple, Coroutine, Optional
 from synapse.networking.discovery import Discovery
 from synapse.networking.peer_handle import PeerHandle
 from synapse.topology.device_capabilities import DeviceCapabilities, device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.helpers import DEBUG, DEBUG_DISCOVERY, get_all_ip_addresses_and_interfaces, get_interface_priority_and_type
 
+
+
+def _get_all_local_ips() -> set:
+    """Get all local IPv4 addresses of this machine for self-announcement detection."""
+    ips = set()
+    try:
+        for _nic, addrs in psutil.net_if_addrs().items():
+            for a in addrs:
+                if getattr(socket, "AF_INET", None) and a.family == socket.AF_INET and a.address:
+                    ips.add(a.address.strip())
+    except Exception:
+        pass
+    if not ips:
+        try:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+        except Exception:
+            pass
+    ips.add("127.0.0.1")
+    return ips
 
 class ListenProtocol(asyncio.DatagramProtocol):
   def __init__(self, on_message: Callable[[bytes, Tuple[str, int]], Coroutine]):
@@ -23,7 +46,7 @@ class ListenProtocol(asyncio.DatagramProtocol):
     asyncio.create_task(self.on_message(data, addr))
 
 
-def get_broadcast_address(ip_addr: str) -> str:
+def _get_broadcast_address(ip_addr: str) -> str:
   try:
     # Split IP into octets and create broadcast address for the subnet
     ip_parts = ip_addr.split('.')
@@ -42,7 +65,7 @@ class BroadcastProtocol(asyncio.DatagramProtocol):
     sock = transport.get_extra_info("socket")
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     # Try both subnet-specific and global broadcast
-    broadcast_addr = get_broadcast_address(self.source_ip)
+    broadcast_addr = _get_broadcast_address(self.source_ip)
     transport.sendto(self.message.encode("utf-8"), (broadcast_addr, self.broadcast_port))
     if broadcast_addr != "255.255.255.255":
       transport.sendto(self.message.encode("utf-8"), ("255.255.255.255", self.broadcast_port))
@@ -76,8 +99,10 @@ class UDPDiscovery(Discovery):
     self.broadcast_task = None
     self.listen_task = None
     self.cleanup_task = None
+    self._local_ips: Optional[set] = None
 
   async def start(self):
+    self._local_ips = _get_all_local_ips()
     self.device_capabilities = await device_capabilities()
     self.broadcast_task = asyncio.create_task(self.task_broadcast_presence())
     self.listen_task = asyncio.create_task(self.task_listen_for_peers())
@@ -202,7 +227,7 @@ class UDPDiscovery(Discovery):
       sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
       sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       try:
-        # SO_REUSEPORT không có trên Windows nhưng có trên Linux, giúp chia sẻ port tốt hơn
+        # SO_REUSEPORT khÃ´ng cÃ³ trÃªn Windows nhÆ°ng cÃ³ trÃªn Linux, giÃºp chia sáº» port tá»‘t hÆ¡n
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
       except AttributeError:
         pass
