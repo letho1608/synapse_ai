@@ -1,14 +1,14 @@
 {
   "version": "1.0",
-  "timestamp": 1777191455.145391,
+  "timestamp": 1777292000.549899,
   "matrix": {
-    "5576db50-fe57-4209-afdb-d236ae680eb6": {
-      "5576db50-fe57-4209-afdb-d236ae680eb6": 0.0,
-      "533701d2-bb6a-4aa7-b93f-f8e9e96b42e2": 50.0
+    "NODE-A": {
+      "NODE-A": 0.0,
+      "NODE-B": 50.0
     },
-    "533701d2-bb6a-4aa7-b93f-f8e9e96b42e2": {
-      "5576db50-fe57-4209-afdb-d236ae680eb6": 50.0,
-      "533701d2-bb6a-4aa7-b93f-f8e9e96b42e2": 0.0
+    "NODE-B": {
+      "NODE-A": 50.0,
+      "NODE-B": 0.0
     }
   }
 }

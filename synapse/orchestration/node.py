@@ -944,34 +944,25 @@ class Node:
 
     next_topology.active_node_id = self.topology.active_node_id
     
-    # --- [TOPOLOGY PRUNING & DEDUPLICATION] ---
-    # 1. Deduplicate by Hardware: Remove entries that match our hardware but have different UUIDs
-    stale_ids = []
-    ours = self.device_capabilities
-    for nid, caps in list(next_topology.nodes.items()):
-      if nid == self.id: continue
-      # If chip, memory, and core count match exactly, it's likely a ghost of Máy này
-      if (caps.chip == ours.chip and 
-          abs(caps.memory - ours.memory) < 10 and 
-          caps.cpu_cores == ours.cpu_cores and
-          caps.gpu_backend == ours.gpu_backend):
-        if DEBUG >= 1: print(f"🧹 [TOPOLOGY] Detected ghost node of self: {nid}. Removing.")
-        stale_ids.append(nid)
-    
-    for sid in stale_ids:
-      if sid in next_topology.nodes: del next_topology.nodes[sid]
-      if sid in next_topology.peer_graph: del next_topology.peer_graph[sid]
-      # Clean up incoming edges to this ghost
-      for src_id in next_topology.peer_graph:
-        next_topology.peer_graph[src_id] = {c for c in next_topology.peer_graph[src_id] if c.to_id != sid}
-    
-    # 2. Prune by reachability: Only keep nodes that are actually mentioned in visited
-    # (prevents stale nodes reported by long-running peers from polluting the topology)
+    # --- [TOPOLOGY PRUNING] ---
+    # Keep only nodes that are reachable in the current discovery graph.
+    # Do not deduplicate by hardware signature: homogeneous clusters are valid.
     final_nodes = {}
     for nid, caps in next_topology.nodes.items():
       if nid in visited or nid == self.id:
         final_nodes[nid] = caps
     next_topology.nodes = final_nodes
+
+    # Keep edge list consistent with the filtered node set.
+    allowed_ids = set(next_topology.nodes.keys())
+    filtered_peer_graph = {}
+    for src_id, connections in next_topology.peer_graph.items():
+      if src_id not in allowed_ids:
+        continue
+      valid_connections = {c for c in connections if c.to_id in allowed_ids}
+      if valid_connections:
+        filtered_peer_graph[src_id] = valid_connections
+    next_topology.peer_graph = filtered_peer_graph
     # ------------------------------------------
 
     self.topology = next_topology

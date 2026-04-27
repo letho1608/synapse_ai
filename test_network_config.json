@@ -1,0 +1,46 @@
+{
+  "peers": {
+    "node-a": {
+      "address": "127.0.0.1",
+      "port": 50051,
+      "device_capabilities": {
+        "model": "Laptop CPU",
+        "chip": "Intel Core i7",
+        "memory": 8192,
+        "flops": {
+          "fp32": 50.0,
+          "fp16": 100.0,
+          "int8": 200.0
+        },
+        "cpu_cores": 8,
+        "disk_gb": 256,
+        "system_ram_mb": 16384,
+        "gpu_backend": "CPU (x86)",
+        "unified_memory": false,
+        "gpu_count": 0,
+        "total_gpu_vram_mb": 0
+      }
+    },
+    "node-b": {
+      "address": "127.0.0.1",
+      "port": 50052,
+      "device_capabilities": {
+        "model": "Laptop CPU",
+        "chip": "Intel Core i7",
+        "memory": 8192,
+        "flops": {
+          "fp32": 50.0,
+          "fp16": 100.0,
+          "int8": 200.0
+        },
+        "cpu_cores": 8,
+        "disk_gb": 256,
+        "system_ram_mb": 16384,
+        "gpu_backend": "CPU (x86)",
+        "unified_memory": false,
+        "gpu_count": 0,
+        "total_gpu_vram_mb": 0
+      }
+    }
+  }
+}
