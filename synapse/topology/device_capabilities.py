@@ -57,6 +57,11 @@ class DeviceFlops(BaseModel):
         return self.model_dump()
 
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "DeviceFlops":
+        return cls(**data)
+
+
 class DeviceCapabilities(BaseModel):
     model: str
     chip: str
@@ -97,6 +102,13 @@ class DeviceCapabilities(BaseModel):
             "gpu_count": self.gpu_count,
             "total_gpu_vram_mb": self.total_gpu_vram_mb,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DeviceCapabilities":
+        # Handle recursive conversion for flops
+        if "flops" in data and isinstance(data["flops"], dict):
+            data["flops"] = DeviceFlops.from_dict(data["flops"])
+        return cls(**data)
 
 
 UNKNOWN_DEVICE_CAPABILITIES = DeviceCapabilities(
@@ -201,6 +213,15 @@ async def device_capabilities() -> DeviceCapabilities:
     Detect hardware capabilities. This replaces the old windows_device_capabilities().
     Uses the full cross-platform detection logic ported from llmit.
     """
+    # Mocking for testing (LACP heterogeneous cluster tests)
+    mock_caps_env = os.getenv("SYNAPSE_MOCK_CAPABILITIES")
+    if mock_caps_env:
+        try:
+            import json
+            return DeviceCapabilities.from_dict(json.loads(mock_caps_env))
+        except Exception:
+            pass
+
     import psutil
 
     try:
@@ -326,6 +347,60 @@ CHIP_FLOPS = {
     "NVIDIA RTX A5000": DeviceFlops(fp32=27.8*TFLOPS, fp16=27.8*TFLOPS, int8=111.2*TFLOPS),
     "NVIDIA RTX A4000": DeviceFlops(fp32=19.17*TFLOPS, fp16=19.17*TFLOPS, int8=76.68*TFLOPS),
     "NVIDIA RTX A2000": DeviceFlops(fp32=7.99*TFLOPS, fp16=7.99*TFLOPS, int8=31.91*TFLOPS),
+    # NVIDIA H100/H200/B-series
+    "NVIDIA H200": DeviceFlops(fp32=67.0*TFLOPS, fp16=990.0*TFLOPS, int8=1980.0*TFLOPS),
+    "NVIDIA H100": DeviceFlops(fp32=60.0*TFLOPS, fp16=756.0*TFLOPS, int8=1512.0*TFLOPS),
+    "NVIDIA H100 80GB HBM3": DeviceFlops(fp32=60.0*TFLOPS, fp16=756.0*TFLOPS, int8=1512.0*TFLOPS),
+    "NVIDIA H100 PCIE": DeviceFlops(fp32=51.0*TFLOPS, fp16=756.0*TFLOPS, int8=1512.0*TFLOPS),
+    "NVIDIA H800": DeviceFlops(fp32=60.0*TFLOPS, fp16=756.0*TFLOPS, int8=1512.0*TFLOPS),
+    "NVIDIA B200": DeviceFlops(fp32=90.0*TFLOPS, fp16=2250.0*TFLOPS, int8=4500.0*TFLOPS),
+    "NVIDIA B100": DeviceFlops(fp32=75.0*TFLOPS, fp16=1750.0*TFLOPS, int8=3500.0*TFLOPS),
+    # NVIDIA L-series / T4 / V100
+    "NVIDIA L40S": DeviceFlops(fp32=91.6*TFLOPS, fp16=183.2*TFLOPS, int8=366.4*TFLOPS),
+    "NVIDIA L40": DeviceFlops(fp32=90.5*TFLOPS, fp16=181.0*TFLOPS, int8=362.0*TFLOPS),
+    "NVIDIA L4": DeviceFlops(fp32=30.3*TFLOPS, fp16=60.6*TFLOPS, int8=121.2*TFLOPS),
+    "NVIDIA A40": DeviceFlops(fp32=37.4*TFLOPS, fp16=149.7*TFLOPS, int8=299.4*TFLOPS),
+    "NVIDIA A30": DeviceFlops(fp32=14.5*TFLOPS, fp16=58.0*TFLOPS, int8=116.0*TFLOPS),
+    "NVIDIA A10": DeviceFlops(fp32=31.2*TFLOPS, fp16=62.5*TFLOPS, int8=125.0*TFLOPS),
+    "NVIDIA A2": DeviceFlops(fp32=4.5*TFLOPS, fp16=18.0*TFLOPS, int8=36.0*TFLOPS),
+    "NVIDIA T4": DeviceFlops(fp32=8.1*TFLOPS, fp16=65.0*TFLOPS, int8=130.0*TFLOPS),
+    "NVIDIA TESLA V100": DeviceFlops(fp32=14.0*TFLOPS, fp16=112.0*TFLOPS, int8=224.0*TFLOPS),
+    "NVIDIA V100": DeviceFlops(fp32=14.0*TFLOPS, fp16=112.0*TFLOPS, int8=224.0*TFLOPS),
+    # NVIDIA RTX Ada Generation
+    "NVIDIA RTX 6000 ADA GENERATION": DeviceFlops(fp32=91.1*TFLOPS, fp16=182.2*TFLOPS, int8=364.4*TFLOPS),
+    "NVIDIA RTX 5000 ADA GENERATION": DeviceFlops(fp32=65.3*TFLOPS, fp16=130.6*TFLOPS, int8=261.2*TFLOPS),
+    "NVIDIA RTX 4500 ADA GENERATION": DeviceFlops(fp32=46.5*TFLOPS, fp16=93.0*TFLOPS, int8=186.0*TFLOPS),
+    "NVIDIA RTX 4000 ADA GENERATION": DeviceFlops(fp32=30.3*TFLOPS, fp16=60.6*TFLOPS, int8=121.2*TFLOPS),
+    # Intel Arc series
+    "INTEL ARC A770": DeviceFlops(fp32=19.5*TFLOPS, fp16=39.0*TFLOPS, int8=78.0*TFLOPS),
+    "INTEL ARC A750": DeviceFlops(fp32=16.3*TFLOPS, fp16=32.6*TFLOPS, int8=65.2*TFLOPS),
+    "INTEL ARC A580": DeviceFlops(fp32=12.0*TFLOPS, fp16=24.0*TFLOPS, int8=48.0*TFLOPS),
+    "INTEL ARC A380": DeviceFlops(fp32=3.5*TFLOPS, fp16=7.0*TFLOPS, int8=14.0*TFLOPS),
+    "INTEL ARC B580": DeviceFlops(fp32=13.2*TFLOPS, fp16=26.4*TFLOPS, int8=52.8*TFLOPS),
+    # AMD Instinct series
+    "AMD INSTINCT MI300X": DeviceFlops(fp32=81.7*TFLOPS, fp16=1300.0*TFLOPS, int8=2600.0*TFLOPS),
+    "AMD INSTINCT MI300A": DeviceFlops(fp32=61.3*TFLOPS, fp16=980.0*TFLOPS, int8=1960.0*TFLOPS),
+    "AMD INSTINCT MI250X": DeviceFlops(fp32=47.9*TFLOPS, fp16=383.0*TFLOPS, int8=766.0*TFLOPS),
+    "AMD INSTINCT MI250": DeviceFlops(fp32=45.3*TFLOPS, fp16=362.0*TFLOPS, int8=724.0*TFLOPS),
+    "AMD INSTINCT MI210": DeviceFlops(fp32=22.6*TFLOPS, fp16=181.0*TFLOPS, int8=362.0*TFLOPS),
+    "AMD INSTINCT MI100": DeviceFlops(fp32=21.3*TFLOPS, fp16=170.0*TFLOPS, int8=340.0*TFLOPS),
+    # AMD Radeon RX 7000 series
+    "AMD RADEON RX 7900 XTX": DeviceFlops(fp32=61.4*TFLOPS, fp16=122.8*TFLOPS, int8=245.6*TFLOPS),
+    "AMD RADEON RX 7900 XT": DeviceFlops(fp32=51.6*TFLOPS, fp16=103.2*TFLOPS, int8=206.4*TFLOPS),
+    "AMD RADEON RX 7900 GRE": DeviceFlops(fp32=46.0*TFLOPS, fp16=92.0*TFLOPS, int8=184.0*TFLOPS),
+    "AMD RADEON RX 7800 XT": DeviceFlops(fp32=37.3*TFLOPS, fp16=74.6*TFLOPS, int8=149.2*TFLOPS),
+    "AMD RADEON RX 7700 XT": DeviceFlops(fp32=28.0*TFLOPS, fp16=56.0*TFLOPS, int8=112.0*TFLOPS),
+    "AMD RADEON RX 7600 XT": DeviceFlops(fp32=21.0*TFLOPS, fp16=42.0*TFLOPS, int8=84.0*TFLOPS),
+    "AMD RADEON RX 7600": DeviceFlops(fp32=17.0*TFLOPS, fp16=34.0*TFLOPS, int8=68.0*TFLOPS),
+    # Apple Silicon
+    "APPLE M4 ULTRA": DeviceFlops(fp32=18.0*TFLOPS, fp16=36.0*TFLOPS, int8=72.0*TFLOPS),
+    "APPLE M4 MAX": DeviceFlops(fp32=15.0*TFLOPS, fp16=30.0*TFLOPS, int8=60.0*TFLOPS),
+    "APPLE M4 PRO": DeviceFlops(fp32=10.0*TFLOPS, fp16=20.0*TFLOPS, int8=40.0*TFLOPS),
+    "APPLE M3 ULTRA": DeviceFlops(fp32=14.0*TFLOPS, fp16=28.0*TFLOPS, int8=56.0*TFLOPS),
+    "APPLE M3 MAX": DeviceFlops(fp32=10.0*TFLOPS, fp16=20.0*TFLOPS, int8=40.0*TFLOPS),
+    "APPLE M2 ULTRA": DeviceFlops(fp32=6.5*TFLOPS, fp16=13.0*TFLOPS, int8=26.0*TFLOPS),
+    "APPLE M2 MAX": DeviceFlops(fp32=4.5*TFLOPS, fp16=9.0*TFLOPS, int8=18.0*TFLOPS),
+    "APPLE M1 ULTRA": DeviceFlops(fp32=5.0*TFLOPS, fp16=10.0*TFLOPS, int8=20.0*TFLOPS),
 }
 
 
@@ -351,7 +426,14 @@ def _lookup_flops(gpu_name: str) -> DeviceFlops:
     if name in CHIP_FLOPS:
         return CHIP_FLOPS[name]
     for key in sorted(CHIP_FLOPS.keys(), key=len, reverse=True):
-        if key in name or name.startswith(key) or name in key:
+        # Stricter match: key must appear as whole word/token
+        if key in name:
+            idx = name.find(key)
+            before_ok = idx == 0 or name[idx - 1] in " /-"
+            after_ok = idx + len(key) == len(name) or name[idx + len(key)] in " /-("
+            if before_ok and after_ok:
+                return CHIP_FLOPS[key]
+        elif name.startswith(key) or name in key:
             return CHIP_FLOPS[key]
     return DeviceFlops(fp32=0, fp16=0, int8=0)
 
@@ -948,8 +1030,39 @@ def estimate_vram_from_name(name: str) -> float:
     if "6700" in lower: return 12.0
     if "6600" in lower: return 8.0
     if "6500" in lower: return 4.0
+    # NVIDIA H/B-series
+    if "h200" in lower: return 141.0
+    if "h800" in lower: return 80.0
+    if "b200" in lower: return 192.0
+    if "b100" in lower: return 128.0
+    # NVIDIA Ada workstation
+    if "rtx 6000 ada" in lower: return 48.0
+    if "rtx 5000 ada" in lower: return 32.0
+    if "rtx 4500 ada" in lower: return 24.0
+    if "rtx 4000 ada" in lower: return 20.0
+    # Intel Arc
+    if "arc a770" in lower: return 16.0
+    if "arc a750" in lower: return 8.0
+    if "arc a580" in lower: return 8.0
+    if "arc a380" in lower: return 6.0
+    if "arc b580" in lower: return 12.0
+    # AMD Instinct
+    if "mi300" in lower: return 192.0
+    if "mi250" in lower: return 128.0
+    if "mi210" in lower: return 64.0
+    if "mi100" in lower: return 32.0
+    # Apple Silicon
+    if "m4 ultra" in lower: return 128.0
+    if "m4 max" in lower: return 64.0
+    if "m4 pro" in lower: return 32.0
+    if "m3 ultra" in lower: return 96.0
+    if "m3 max" in lower: return 48.0
+    if "m2 ultra" in lower: return 64.0
+    if "m2 max" in lower: return 32.0
+    if "m1 ultra" in lower: return 48.0
     # Generic fallbacks
     if "rtx" in lower: return 8.0
     if "gtx" in lower: return 4.0
     if "rx " in lower or "radeon" in lower: return 8.0
+    if "arc" in lower: return 8.0
     return 0.0

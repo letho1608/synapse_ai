@@ -10,13 +10,10 @@ import uuid
 import numpy as np
 from tqdm import tqdm
 from synapse.train.dataset import load_dataset, iterate_batches
-from synapse.networking.manual.manual_discovery import ManualDiscovery
 from synapse.orchestration.node import Node
-from synapse.networking.grpc.grpc_server import GRPCServer
-from synapse.networking.udp.udp_discovery import UDPDiscovery
-from synapse.networking.tailscale.tailscale_discovery import TailscaleDiscovery
-from synapse.networking.grpc.grpc_peer_handle import GRPCPeerHandle
-from synapse.topology.lacp_partitioning import LACPPartitioningStrategy
+from synapse.routing import EventRouter
+from synapse.routing.libp2p_node import Libp2pNode
+from synapse.topology.largest_remainder import LargestRemainderPartitioningStrategy
 from synapse.api import ChatGPTAPI
 # REFACTORED IMPORTS
 from synapse.loading import ShardDownloader, RepoProgressEvent, create_local_model_loader, get_models_dir
@@ -26,12 +23,20 @@ from synapse.inference.inference_engine import get_inference_engine
 from synapse.inference.tokenizers import resolve_tokenizer
 from synapse.models import build_base_shard, get_repo
 from synapse.viz.topology_viz import TopologyViz
+from synapse.networking.udp.udp_discovery import UDPDiscovery
+from synapse.networking.tailscale.tailscale_discovery import TailscaleDiscovery
+from synapse.networking.manual.manual_discovery import ManualDiscovery
+from synapse.networking.p2p_peer_handle import P2PPeerHandle
+from synapse.topology.device_capabilities import DeviceCapabilities, device_capabilities
 import concurrent.futures
 import psutil
 
 os.environ["GRPC_VERBOSITY"] = "error"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+# Disable HuggingFace Hub symlinks on Windows to avoid WinError 1314 without admin/dev mode
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 # Configure event loop for Windows
 def configure_event_loop():
@@ -53,7 +58,7 @@ parser.add_argument("--resume-checkpoint", type=str, default=None, help="Path to
 parser.add_argument("--save-checkpoint-dir", type=str, default="checkpoints", help="Path to a folder where checkpoints are stored")
 parser.add_argument("--node-id", type=str, default=None, help="Node ID")
 parser.add_argument("--node-host", type=str, default="0.0.0.0", help="Node host")
-parser.add_argument("--node-port", type=int, default=None, help="Node port")
+parser.add_argument("--node-port", type=int, default=50051, help="Node port")
 parser.add_argument("--models-seed-dir", type=str, default=None, help="Model seed directory")
 parser.add_argument("--listen-port", type=int, default=5678, help="Listening port for discovery")
 parser.add_argument("--download-quick-check", action="store_true", help="Quick check local path for model shards download")
@@ -71,14 +76,20 @@ parser.add_argument("--disable-tui", action=argparse.BooleanOptionalAction, defa
 parser.add_argument("--run-model", type=str, help="Specify a model to run directly")
 parser.add_argument("--prompt", type=str, help="Prompt for the model when using --run-model", default="")
 parser.add_argument("--default-temp", type=float, help="Default token sampling temperature", default=0.7)
-# Tailscale API key: Provide your API key here
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Tailscale API key: Provide your API key here (loaded from .env)
 # Can be overridden with --tailscale-api-key
-TAILSCALE_API_KEY_DEFAULT = "tskey-api-kZkPWrVyM311CNTRL-91psFey7AHYgSzXpLr7GJYKZm43RZkXVD"
-parser.add_argument("--tailscale-api-key", type=str, default=TAILSCALE_API_KEY_DEFAULT, help="Tailscale API key (defaults to hardcoded value)")
-# Tailnet name: Provide your tailnet name here
+TAILSCALE_API_KEY_DEFAULT = os.getenv("TAILSCALE_API_KEY", "")
+parser.add_argument("--tailscale-api-key", type=str, default=TAILSCALE_API_KEY_DEFAULT, help="Tailscale API key (from .env or passed as arg)")
+# Tailnet name: Provide your tailnet name here (loaded from .env)
 # Can be overridden with --tailnet-name
-TAILNET_NAME_DEFAULT = "testdoki925@gmail.com"
-parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (defaults to hardcoded value)")
+TAILNET_NAME_DEFAULT = os.getenv("TAILNET_NAME", "")
+parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (from .env or passed as arg)")
 parser.add_argument("--node-id-filter", type=str, default=None, help="Comma separated list of allowed node IDs (only for UDP and Tailscale discovery)")
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
 parser.add_argument("--system-prompt", type=str, default="Bạn là trợ lý Synapse AI. Hãy luôn trả lời bằng tiếng Việt một cách hữu ích và chính xác.", help="System prompt for the ChatGPT API")
@@ -91,9 +102,8 @@ inference_engine_name = args.inference_engine if hasattr(args, "inference_engine
 inference_engine = get_inference_engine(inference_engine_name, None)
 shard_downloader: ShardDownloader = inference_engine.shard_downloader
 
-if args.node_port is None:
-  args.node_port = find_available_port(args.node_host)
-  if DEBUG >= 1: print(f"Using available port: {args.node_port}")
+# node_port is now defaulted to 5678 in argparse
+if DEBUG >= 1: print(f"Using node port: {args.node_port}")
 
 args.node_id = args.node_id or get_or_create_node_id()
 chatgpt_api_endpoints = [f"http://{ip}:{args.chatgpt_api_port}/v1/chat/completions" for ip, _ in get_all_ip_addresses_and_interfaces()]
@@ -103,58 +113,59 @@ web_chat_urls = [f"http://{ip}:{args.chatgpt_api_port}" for ip, _ in get_all_ip_
 allowed_node_ids = args.node_id_filter.split(',') if args.node_id_filter else None
 allowed_interface_types = args.interface_type_filter.split(',') if args.interface_type_filter else None
 
-if args.discovery_module == "udp":
-  discovery = UDPDiscovery(
-    args.node_id,
-    args.node_port,
-    args.listen_port,
-    args.broadcast_port,
-    lambda peer_id, address, description, device_capabilities: GRPCPeerHandle(peer_id, address, description, device_capabilities),
-    discovery_timeout=args.discovery_timeout,
-    allowed_node_ids=allowed_node_ids,
-    allowed_interface_types=allowed_interface_types
-  )
-elif args.discovery_module == "tailscale":
-  # Sử dụng giá trị từ command line argument (nếu có), nếu không thì dùng giá trị hardcode
-  tailscale_api_key = args.tailscale_api_key
-  tailnet_name = args.tailnet_name
-  
-  if not tailscale_api_key or tailscale_api_key == "tskey-api-xxxxx-xxxxx":
-    raise ValueError("Tailscale API key is required. Please provide it via TAILSCALE_API_KEY_DEFAULT or --tailscale-api-key")
-  if not tailnet_name or tailnet_name == "your-org":
-    raise ValueError("Tailnet name is required. Please provide it via TAILNET_NAME_DEFAULT or --tailnet-name")
-  
-  discovery = TailscaleDiscovery(
-    args.node_id,
-    args.node_port,
-    lambda peer_id, address, description, device_capabilities: GRPCPeerHandle(peer_id, address, description, device_capabilities),
-    discovery_timeout=args.discovery_timeout,
-    tailscale_api_key=tailscale_api_key,
-    tailnet=tailnet_name,
-    allowed_node_ids=allowed_node_ids
-  )
-elif args.discovery_module == "manual":
-  if not args.discovery_config_path:
-    raise ValueError(f"--discovery-config-path is required when using manual discovery. Please provide a path to a config json file.")
-  discovery = ManualDiscovery(args.discovery_config_path, args.node_id, create_peer_handle=lambda peer_id, address, description, device_capabilities: GRPCPeerHandle(peer_id, address, description, device_capabilities))
+# Initialize P2P Infrastructure
+event_router = EventRouter()
+libp2p_node = Libp2pNode(args.node_id, args.node_port or 5678, event_router)
+
 topology_viz = TopologyViz(chatgpt_api_endpoints=chatgpt_api_endpoints, web_chat_urls=web_chat_urls) if not args.disable_tui else None
-# Use LACP partitioning strategy
-partitioning_strategy = LACPPartitioningStrategy()
-if DEBUG >= 1: print("Using LACP partitioning strategy")
+# Use LACP 2.0 partitioning strategy
+partitioning_strategy = LargestRemainderPartitioningStrategy()
+if DEBUG >= 1: print("Using LACP 2.0 (Largest Remainder) partitioning strategy")
+
+def create_peer_handle(node_id: str, address: str, desc: str, dev_caps: DeviceCapabilities):
+    return P2PPeerHandle(node_id, address, desc, dev_caps, event_router, libp2p_node)
+
+# Initialize Discovery Module
+discovery = None
+if args.discovery_module == "udp":
+    discovery = UDPDiscovery(
+        args.node_id, 
+        args.node_port or 5678,
+        args.listen_port,
+        args.broadcast_port,
+        create_peer_handle,
+        allowed_node_ids=allowed_node_ids,
+        allowed_interface_types=allowed_interface_types
+    )
+elif args.discovery_module == "tailscale":
+    discovery = TailscaleDiscovery(
+        args.node_id,
+        args.node_port or 5678,
+        create_peer_handle,
+        tailscale_api_key=args.tailscale_api_key,
+        tailnet=args.tailnet_name,
+        allowed_node_ids=allowed_node_ids
+    )
+elif args.discovery_module == "manual":
+    discovery = ManualDiscovery(
+        args.discovery_config_path or "cluster_config.json",
+        args.node_id,
+        create_peer_handle
+    )
 
 node = Node(
     args.node_id,
-    None,
+    event_router,
+    libp2p_node,
     inference_engine,
-    discovery,
     shard_downloader,
     partitioning_strategy=partitioning_strategy,
     max_generate_tokens=args.max_generate_tokens,
     topology_viz=topology_viz,
     default_sample_temperature=args.default_temp
 )
-server = GRPCServer(node, args.node_host, args.node_port)
-node.server = server
+node.discovery = discovery
+# No redundant GRPCServer anymore
 default_model = args.default_model or "qwen2.5:1.5b"
 api = ChatGPTAPI(
   node,
@@ -193,7 +204,8 @@ def update_topology_viz(req_id, tokens, is_finished):
       traceback.print_exc()
     # Still update with empty string to show something
     topology_viz.update_prompt_output(req_id, "")
-node.on_token.register("update_topology_viz").on_next(update_topology_viz)
+# Subscribe UI updates to P2P events
+event_router.subscribe(f"synapse/inference/result/{node.id}", lambda ev: update_topology_viz(ev.data.get("request_id"), ev.data.get("tokens"), ev.data.get("is_finished")))
 def update_prompt_viz(request_id, opaque_status: str):
   if not topology_viz: return
   try:
@@ -204,7 +216,7 @@ def update_prompt_viz(request_id, opaque_status: str):
     if DEBUG >= 2:
       print(f"Failed to update prompt viz: {e}")
       traceback.print_exc()
-node.on_opaque_status.register("update_prompt_viz").on_next(update_prompt_viz)
+event_router.subscribe("synapse/cluster/status", lambda ev: update_prompt_viz("", ev.data))
 
 def preemptively_load_shard(request_id: str, opaque_status: str):
   try:
@@ -217,7 +229,7 @@ def preemptively_load_shard(request_id: str, opaque_status: str):
     if DEBUG >= 2:
       print(f"Failed to preemptively start download: {e}")
       traceback.print_exc()
-node.on_opaque_status.register("preemptively_load_shard").on_next(preemptively_load_shard)
+event_router.subscribe("synapse/cluster/status", lambda ev: preemptively_load_shard("", ev.data))
 
 last_events: dict[str, tuple[float, RepoProgressEvent]] = {}
 def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
@@ -228,39 +240,60 @@ def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
   if last_event and last_event[1].status == "complete" and event.status == "complete": return
   if last_event and last_event[0] == event.status and current_time - last_event[0] < 0.2: return
   last_events[shard.model_id] = (current_time, event)
-  asyncio.create_task(node.broadcast_opaque_status("", json.dumps({"type": "download_progress", "node_id": node.id, "progress": event.to_dict()})))
+  asyncio.create_task(event_router.publish("synapse/cluster/status", json.dumps({"type": "download_progress", "node_id": node.id, "progress": event.to_dict()})))
 shard_downloader.on_progress.register("broadcast").on_next(throttled_broadcast)
 
 async def run_model_cli(node: Node, model_name: str, prompt: str):
   inference_class = node.inference_engine.__class__.__name__
   shard = build_base_shard(model_name, inference_class)
   if not shard:
-    print(f"Error: Unsupported model '{model_name}' for inference engine {inference_class}")
+    print(f"[ERROR] Unsupported model '{model_name}'")
     return
+  
   tokenizer = await resolve_tokenizer(get_repo(shard.model_id, inference_class))
   request_id = str(uuid.uuid4())
-  callback_id = f"cli-wait-response-{request_id}"
-  callback = node.on_token.register(callback_id)
+  
   if topology_viz:
     topology_viz.update_prompt(request_id, prompt)
+    
   try:
     if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
       prompt = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
   except (ValueError, AttributeError):
     pass
+    
+  print(f"\n[CLI] Processing prompt: {prompt[:100]}...")
+  
+  # Setup result collection
+  tokens_received = []
+  finished_event = asyncio.Event()
+
+  def on_token_callback(rid, tokens, is_finished):
+      if rid == request_id:
+          if tokens:
+              tokens_received.extend(tokens)
+              # Stream tokens to console if desired
+              print(tokenizer.decode(tokens), end="", flush=True)
+          if is_finished:
+              finished_event.set()
+
+  # Register callback
+  callback_id = f"cli_{request_id}"
+  node.on_token.register(callback_id).on_next(on_token_callback)
+  
   try:
-    print(f"Processing prompt: {prompt}")
+    print("[CLI] Response: ", end="", flush=True)
     await node.process_prompt(shard, prompt, request_id=request_id)
-    tokens = []
-    def on_token(_request_id, _tokens, _is_finished):
-      tokens.extend(_tokens)
-      return _request_id == request_id and _is_finished
-    await callback.wait(on_token, timeout=300)
-    print("\nGenerated response:")
-    print(tokenizer.decode(tokens))
+    
+    # Wait for completion via the callback
+    await asyncio.wait_for(finished_event.wait(), timeout=300)
+    
+    print("\n\n[CLI] Generation complete.")
+  except asyncio.TimeoutError:
+    print("\n[CLI] Error: Request timed out (300s)")
   except Exception as e:
-    print(f"Error processing prompt: {str(e)}")
-    traceback.print_exc()
+    print(f"\n[CLI] Error: {str(e)}")
+    if DEBUG >= 1: traceback.print_exc()
   finally:
     node.on_token.deregister(callback_id)
 
@@ -342,84 +375,56 @@ async def main():
 
   # Use a more direct approach to handle signals
   def handle_exit():
-    asyncio.ensure_future(shutdown(signal.SIGTERM, loop, node.server))
+    # Stop the node and all components
+    asyncio.ensure_future(node.stop())
 
   await node.start(wait_for_peers=args.wait_for_peers)
 
   # Always start API server (unless disabled)
   if True:
     try:
-      if DEBUG >= 1: print(f"Starting API server on port {args.chatgpt_api_port}...")
-      api_task = asyncio.create_task(api.run(port=args.chatgpt_api_port))  # Start the API server as a non-blocking task
-      api_task_global = api_task  # Lưu reference để cleanup sau
+      if DEBUG >= 1: print(f"[SERVER] Starting ChatGPT API on port {args.chatgpt_api_port}...")
+      api_task = asyncio.create_task(api.run(port=args.chatgpt_api_port))
+      api_task_global = api_task
       
       def api_task_done(task):
         try:
-          task.result()  # This will raise exception if task failed
+          task.result()
         except asyncio.CancelledError:
-          if DEBUG >= 2: print(f"[INFO] API server task cancelled (normal shutdown)")
+          pass
         except Exception as e:
-          print(f"[ERROR] API server task failed: {e}")
-          if DEBUG >= 1:
-            traceback.print_exc()
+          print(f"[ERROR] API server failed: {e}")
       api_task.add_done_callback(api_task_done)
-      if DEBUG >= 1: print(f"API server started at http://127.0.0.1:{args.chatgpt_api_port}")
     except Exception as e:
-      print(f"[ERROR] Error starting API server: {e}")
-      if DEBUG >= 1:
-        traceback.print_exc()
+      print(f"[ERROR] Failed to start API: {e}")
       raise
 
     if args.command == "run" or args.run_model:
       model_name = args.model_name or args.run_model
       if not model_name:
-        print("Error: Model name is required when using 'run' command or --run-model")
+        print("[ERROR] Model name is required")
         return
 
-      # === Auto Hardware + Model Fit Check (ported from llmit) ===
       check_model_hardware_fit(model_name)
-      # ===========================================================
 
-      # Only run CLI inference if a prompt is provided
       if args.prompt:
-        asyncio.create_task(run_model_cli(node, model_name, args.prompt))
+        # Run CLI and then exit
+        await run_model_cli(node, model_name, args.prompt)
+        await node.stop()
+        return
       else:
-        if DEBUG >= 1: print(f"Model '{model_name}' selected. Waiting for API requests...")
-        # Optionally pre-load the model here if needed, but API will handle it on first request
+        if DEBUG >= 1: print(f"[INFO] Model '{model_name}' ready. Waiting for API requests...")
       
-      # Keep the program running so API server stays alive
       try:
         await asyncio.Event().wait()
-      except Exception as e:
-        if DEBUG >= 1:
-          print(f"Error in main event loop: {e}")
-          traceback.print_exc()
-        raise
-    elif args.command == "eval" or args.command == 'train':
-      model_name = args.model_name
-      dataloader = lambda tok: load_dataset(args.data, preprocess=lambda item: tok(item)
-                                                   , loadline=lambda line: json.loads(line).get("text",""))
-      if args.command == 'eval':
-        if not model_name:
-          print("Error: Model name is required for evaluation")
-          return
-        await eval_model_cli(node, model_name, dataloader, args.batch_size)
-      else:
-        if not model_name:
-          print("Error: Model name is required for training")
-          return
-        await train_model_cli(node, model_name, dataloader, args.batch_size, args.iters, save_interval=args.save_every, checkpoint_dir=args.save_checkpoint_dir)
-
+      except (asyncio.CancelledError, KeyboardInterrupt):
+        await node.stop()
     else:
-      # If no command specified, just wait (API server already started above)
       try:
-        if DEBUG >= 1: print("Server running. Waiting for requests...")
+        if DEBUG >= 1: print("[SERVER] System running. Listening for requests...")
         await asyncio.Event().wait()
-      except Exception as e:
-        if DEBUG >= 1:
-          print(f"Error in main event loop: {e}")
-          traceback.print_exc()
-        raise
+      except (asyncio.CancelledError, KeyboardInterrupt):
+        await node.stop()
 
   if args.wait_for_peers > 0:
     print("Cooldown to allow peers to exit gracefully")

@@ -72,6 +72,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self._model = None
         self._model_id: Optional[str] = None
         self._device = "cuda" if self._has_cuda() else "cpu"
+        self._kv_caches: Dict[str, Any] = {} # request_id -> list of past_key_values per layer
         # Cache kết quả nhận diện phần cứng để không phải phát hiện lại nhiều lần
         self._hw_profile: Optional[Dict[str, Any]] = None
 
@@ -83,24 +84,29 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         except Exception:
             return False
 
-    def _detect_hardware_profile(self) -> Dict[str, Any]:
+    @staticmethod
+    def _has_directml() -> bool:
+        try:
+            import torch_directml
+            return torch_directml.is_available()
+        except Exception:
+            return False
+
+    def _detect_hardware_profile(self, model_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Nhận diện cấu hình phần cứng của node hiện tại và trả về một profile
         để định hướng cách nạp mô hình một cách tối ưu nhất.
 
         Returns dict với các key:
-            - device (str): 'cuda' hoặc 'cpu'
+            - device (str): 'cuda' hoặc 'cpu' (hoặc 'dml')
             - torch_dtype: dtype tối ưu nhất
             - attn_implementation (str): 'sdpa', hoặc 'eager'
-            - load_in_4bit (bool): True nếu VRAM cực thấp (<= 6GB)
-            - load_in_8bit (bool): True nếu VRAM thấp trung bình (6-10GB)
-            - device_map (str|None): 'auto' nếu có CUDA
+            - load_in_4bit (bool): True nếu VRAM quá nhỏ so với size model
+            - load_in_8bit (bool): True nếu VRAM hơi thọt so với size model
+            - device_map (str|None): 'auto' nếu tự động phân mảng
             - vram_gb (float): VRAM khả dụng (0 nếu CPU-only)
             - supports_bf16 (bool): True nếu GPU hỗ trợ BFloat16
         """
-        if self._hw_profile is not None:
-            return self._hw_profile
-
         import torch
 
         profile: Dict[str, Any] = {
@@ -114,23 +120,29 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             "supports_bf16": False,
         }
 
-        if not self._has_cuda():
-            # CPU-only node: ưu tiên eager để tránh SDPA + sliding-window attention cho Qwen
+        if self._has_cuda():
+            profile["device"] = "cuda"
+        elif self._has_directml():
+            import torch_directml
+            profile["device"] = "dml"
+            profile["torch_dtype"] = torch.float16
+            import psutil
+            # Estimate roughly for shared GPU memory
+            profile["vram_gb"] = (psutil.virtual_memory().total / (1024 ** 3)) * 0.5 
+            if DEBUG >= 1: print("[PyTorchHF][HW] DirectML detected. Using 'dml' device.")
+            self._hw_profile = profile
+            return profile
+        else:
             profile["torch_dtype"] = "auto"
             profile["attn_implementation"] = "eager"
-                
-            if DEBUG >= 1:
-                print(f"[PyTorchHF][HW] CPU-only node → Dtype: auto | Attn: {profile['attn_implementation']}")
+            if DEBUG >= 1: print(f"[PyTorchHF][HW] CPU-only node → Dtype: auto | Attn: eager")
             self._hw_profile = profile
             return profile
 
-        # --- Node có CUDA ---
-        profile["device"] = "cuda"
-        
+        # --- CUDA branch ---
         try:
             dev = torch.cuda.current_device()
             total_vram_gb = torch.cuda.get_device_properties(dev).total_memory / (1024 ** 3)
-            # Dùng VRAM khả dụng (trừ đi phần đã dùng)
             vram_gb = total_vram_gb - (torch.cuda.memory_allocated(dev) / (1024 ** 3))
             profile["vram_gb"] = vram_gb
 
@@ -139,13 +151,38 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             profile["supports_bf16"] = supports_bf16
             profile["torch_dtype"] = torch.bfloat16 if supports_bf16 else torch.float16
 
-            # SDPA mặc định cho PyTorch 2.0+
             if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
                 profile["attn_implementation"] = "sdpa"
 
-            # CHỈ BẬT QUANTIZATION KHI THỰC SỰ CẦN THIẾT (Nếu VRAM < 10GB)
-            # Nếu máy người dùng xịn (> 10GB), chạy float16/bf16 cho NHANH nhất.
-            if total_vram_gb <= 12.0:
+            required_vram = 0.0
+            if model_id:
+                from synapse.model_list import HF_MODEL_PARAMS, HF_MODELS
+                param_str = HF_MODEL_PARAMS.get(model_id)
+                if not param_str:
+                    for name, repo_id in HF_MODELS.items():
+                        if repo_id == model_id:
+                            param_str = HF_MODEL_PARAMS.get(name)
+                            break
+                            
+                if param_str:
+                    try:
+                        p = float(param_str.lower().replace('b', '').replace('m', ''))
+                        if 'm' in param_str.lower(): p = p / 1000.0
+                        required_vram = p * 2.0 # FP16 ~ 2 bytes per param
+                    except Exception:
+                        pass
+                        
+            # Auto-quantization logic replacing simple cut-offs
+            if required_vram > 0 and total_vram_gb < (required_vram * 1.2):
+                try:
+                    import bitsandbytes
+                    if total_vram_gb < (required_vram * 0.7):
+                        profile["load_in_4bit"] = True
+                    else:
+                        profile["load_in_8bit"] = True
+                except ImportError:
+                    pass
+            elif required_vram == 0.0 and total_vram_gb <= 12.0:
                 try:
                     import bitsandbytes
                     if total_vram_gb <= 6.0:
@@ -157,10 +194,10 @@ class PyTorchHFInferenceEngine(InferenceEngine):
 
             if DEBUG >= 1:
                 quant = "4bit" if profile["load_in_4bit"] else ("8bit" if profile["load_in_8bit"] else "none")
-                print(f"[PyTorchHF][HW] Detected: {total_vram_gb:.1f}GB VRAM | Dtype: {profile['torch_dtype']} | Quant: {quant} | Attn: {profile['attn_implementation']}")
+                print(f"[PyTorchHF][HW] CUDA: {total_vram_gb:.1f}GB (Req: {required_vram:.1f}GB) | Quant: {quant} | Attn: {profile['attn_implementation']}")
 
         except Exception as e:
-            if DEBUG >= 1: print(f"[PyTorchHF][HW] CUDA Probe Error: {e}")
+            if DEBUG >= 1: print(f"[PyTorchHF][HW] CUDA Error: {e}")
             profile["torch_dtype"] = torch.float16
 
         self._hw_profile = profile
@@ -231,7 +268,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         out = rotary_emb(hidden_states, position_ids)
         return out
 
-    def _call_transformer_block(self, block, hidden_states, attention_mask=None, position_ids=None, position_embeddings=None):
+    def _call_transformer_block(self, block, hidden_states, attention_mask=None, position_ids=None, position_embeddings=None, past_key_value=None, cache_position=None):
         # Gọi theo chữ ký thật của layer thay vì thử nhiều fallback.
         params = inspect.signature(block.forward).parameters
         kwargs: Dict[str, Any] = {}
@@ -242,8 +279,12 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             kwargs["position_ids"] = position_ids
         if "position_embeddings" in params and position_embeddings is not None:
             kwargs["position_embeddings"] = position_embeddings
+        if "past_key_value" in params:
+            kwargs["past_key_value"] = past_key_value
+        if "cache_position" in params and cache_position is not None:
+            kwargs["cache_position"] = cache_position
         if "use_cache" in params:
-            kwargs["use_cache"] = False
+            kwargs["use_cache"] = True
         if "output_attentions" in params:
             kwargs["output_attentions"] = False
 
@@ -255,7 +296,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             return output.last_hidden_state
         return output
 
-    def _forward_transformer_range(self, shard: Shard, input_data: np.ndarray):
+    def _forward_transformer_range(self, shard: Shard, input_data: np.ndarray, request_id: Optional[str] = None):
         import torch
 
         components = self._get_transformer_components()
@@ -269,10 +310,12 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             )
 
         device = next(self._model.parameters()).device
+        dtype = next(self._model.parameters()).dtype
+
         if np.issubdtype(input_data.dtype, np.floating):
             if input_data.ndim == 2:
                 input_data = input_data[np.newaxis, :]
-            hidden_states = torch.from_numpy(input_data).to(device=device, dtype=next(self._model.parameters()).dtype)
+            hidden_states = torch.from_numpy(input_data).to(device=device, dtype=dtype)
         else:
             input_ids = torch.from_numpy(input_data.astype(np.int64)).to(device)
             if input_ids.dim() == 1:
@@ -282,22 +325,74 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 raise RuntimeError(f"Model {shard.model_id} does not expose input embeddings")
             hidden_states = embed(input_ids)
 
-        # Không truyền mask 2D thủ công: một số bản transformers (Qwen eager path)
-        # kỳ vọng causal mask 4D và sẽ tự dựng bên trong khi attention_mask=None.
-        attention_mask = None
+        # ---------------------------------------------------------------------
+        # KV Cache & Position ID Management
+        # ---------------------------------------------------------------------
+        request_id = request_id or "default"
+        if request_id not in self._kv_caches:
+            self._kv_caches[request_id] = {}
+        
+        # Determine sequence length and offset
+        # We look at the cache of the first layer in our shard to see how many tokens we've seen
+        cache = self._kv_caches[request_id]
+        past_len = 0
+        if shard.start_layer in cache and cache[shard.start_layer] is not None:
+            # past_key_value format: (key, value) or tuple(tuple...)
+            # We assume (batch, num_heads, seq_len, head_dim) for most HF models
+            k = cache[shard.start_layer][0]
+            past_len = k.shape[-2]
+
         seq_len = hidden_states.shape[1]
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(hidden_states.shape[0], -1)
+        
+        # position_ids must start from past_len
+        position_ids = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=device).unsqueeze(0)
+        
+        # Some newer models use cache_position
+        cache_position = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=device)
+
+        # Build position embeddings (RoPE)
         position_embeddings = self._build_position_embeddings(hidden_states, position_ids)
+
+        # Prepare attention mask (optional, eager path might need it if not None but usually None is causal)
+        attention_mask = None
 
         with torch.no_grad():
             for layer_index in range(shard.start_layer, shard.end_layer + 1):
-                hidden_states = self._call_transformer_block(
-                    layers[layer_index],
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    position_embeddings=position_embeddings,
-                )
+                layer_cache = cache.get(layer_index)
+                
+                # Forward pass for a single layer block
+                # Output might be (hidden_states, next_kv_cache, ...)
+                # But since use_cache=True, we expect a tuple back.
+                block = layers[layer_index]
+                
+                # Our helper _call_transformer_block will call the block and return JUST hidden_states
+                # We need to manually capture the KV cache if it's returned.
+                # Let's override the block call here to capture KV cache.
+                
+                params = inspect.signature(block.forward).parameters
+                kwargs: Dict[str, Any] = {
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "position_embeddings": position_embeddings,
+                    "past_key_value": layer_cache,
+                    "use_cache": True,
+                }
+                if "cache_position" in params:
+                    kwargs["cache_position"] = cache_position
+                
+                # Actual block call
+                output = block(hidden_states, **kwargs)
+                
+                if isinstance(output, tuple):
+                    hidden_states = output[0]
+                    if len(output) > 1:
+                        cache[layer_index] = output[1]
+                elif hasattr(output, "last_hidden_state"):
+                    hidden_states = output.last_hidden_state
+                    if hasattr(output, "past_key_value"):
+                        cache[layer_index] = output.past_key_value
+                else:
+                    hidden_states = output
 
             if not shard.is_last_layer():
                 return hidden_states.float().cpu().numpy()
@@ -312,6 +407,14 @@ class PyTorchHFInferenceEngine(InferenceEngine):
 
             logits = lm_head(hidden_states)
             return logits.float().cpu().numpy()
+
+    def clear_cache(self, request_id: Optional[str] = None):
+        if request_id:
+            self._kv_caches.pop(request_id, None)
+            if DEBUG >= 2: print(f"[PyTorchHF] Cleared KV cache for request: {request_id}")
+        else:
+            self._kv_caches.clear()
+            if DEBUG >= 1: print("[PyTorchHF] Cleared all KV caches")
 
     async def ensure_shard(self, shard: Shard) -> None:
         if self._model_id == shard.model_id and self._model is not None:
@@ -363,7 +466,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 raise RuntimeError(f"PyTorchHF load vision {hf_id}: {e}") from e
 
         # --- Nhận diện phần cứng ---
-        hw = self._detect_hardware_profile()
+        hw = self._detect_hardware_profile(shard.model_id)
         load_model_kw: Dict[str, Any] = {
             "trust_remote_code": True,
             "attn_implementation": hw["attn_implementation"],
@@ -396,6 +499,25 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 self.tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True, local_files_only=True)
                 self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw, local_files_only=True)
             except (OSError, ValueError):
+                # --- [P2P LAN Cache Sync] ---
+                try:
+                    import aiohttp
+                    node_ref = getattr(self, "node", None)
+                    if node_ref:
+                        nodes = await node_ref.get_tailscale_nodes()
+                        from synapse.networking.tailscale.tailscale_helpers import get_synapse_api_urls_from_node_list
+                        from synapse.helpers import get_all_ip_addresses_and_interfaces
+                        self_ips = set(ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip)
+                        urls = get_synapse_api_urls_from_node_list(nodes, api_port=52415, only_synapse_nodes=True, exclude_ips=self_ips)
+                        if urls:
+                            master_url = urls[0] # Node cao điểm nhất (Election Master)
+                            if DEBUG >= 1: print(f"[PyTorchHF] Requesting P2P LAN Cache sync from: {master_url}...")
+                            # Trong thực tế: Dùng aiohttp_client để scan `repo_files` và tải đè local_dir.
+                            # Tạm thời dùng fallback gốc vì thay đổi HF_HOME/blob hash rất dễ gây lỗi nạp (Corrupt file).
+                except Exception as e:
+                    if DEBUG >= 2: print(f"[P2P Sync Exception]: {e}")
+                
+                # Fallback to direct HF download
                 self.tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
                 self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw)
 
@@ -534,7 +656,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             if self._model is None:
                 vocab_size = 32000
                 return np.zeros((1, 0, vocab_size), dtype=np.float32), inference_state
-            output = self._forward_transformer_range(shard, input_data)
+            output = self._forward_transformer_range(shard, input_data, request_id=request_id)
             return output, inference_state
         except Exception as e:
             if DEBUG >= 1:

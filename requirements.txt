@@ -39,6 +39,11 @@ torch
 peft
 datasets
 accelerate
+anyio
+# py-libp2p removed - not available on PyPI, project uses custom P2PSocketBridge instead
+torch-directml
+loguru
+
 bitsandbytes
 
 # LACP Dependencies

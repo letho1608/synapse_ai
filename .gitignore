@@ -2,10 +2,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
-.env
 checkpoints/
 logs/
 data/models/
 *.log
 .vscode/
 .idea/
+.pytest_cache/
+.roo/
+.code-graph-review/
+test_logs/

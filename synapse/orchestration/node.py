@@ -5,38 +5,46 @@ import uuid
 import time
 import traceback
 from typing import List, Dict, Optional, Tuple, Union, Set, Any
-from synapse.networking import Discovery, PeerHandle, Server
 from synapse.inference.inference_engine import InferenceEngine, Shard, get_inference_engine
 from synapse.topology.topology import Topology
 from synapse.topology.device_capabilities import device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.topology.partitioning_strategy import Partition, PartitioningStrategy, map_partitions_to_shards
+from synapse.topology.largest_remainder import LargestRemainderPartitioningStrategy
 from synapse import DEBUG
 from synapse.helpers import AsyncCallbackSystem
-from synapse.viz.topology_viz import TopologyViz
-from synapse.loading import RepoProgressEvent, ShardDownloader
+from synapse.loading import RepoProgressEvent
+from synapse.inference.pytorch_hf_engine import HFShardDownloader as ShardDownloader
+from synapse.routing import EventRouter, Event
+from synapse.routing.libp2p_node import Libp2pNode
+from synapse.orchestration.election import ElectionManager
+from synapse.networking.peer_handle import PeerHandle
 
 class Node:
   def __init__(
     self,
     _id: str,
-    server: Server,
+    event_router: EventRouter,
+    libp2p_node: Libp2pNode,
     inference_engine: InferenceEngine,
-    discovery: Discovery,
     shard_downloader: ShardDownloader,
     partitioning_strategy: PartitioningStrategy = None,
     max_generate_tokens: int = 1024,
     default_sample_temperature: float = 0.0,
-    topology_viz: Optional[TopologyViz] = None,
+    max_concurrent_requests: int = 32,
+    topology_viz: Optional[Any] = None,
   ):
     self.id = _id
     self.inference_engine = inference_engine
-    self.server = server
-    self.discovery = discovery
+    self.event_router = event_router
+    self.libp2p_node = libp2p_node
     self.shard_downloader = shard_downloader
-    self.partitioning_strategy = partitioning_strategy
-    self.peers: List[PeerHandle] = {}
+    self.partitioning_strategy = partitioning_strategy or LargestRemainderPartitioningStrategy()
     self.topology: Topology = Topology()
     self.device_capabilities = UNKNOWN_DEVICE_CAPABILITIES
+    
+    # Initialize Election Manager
+    self.election_manager = ElectionManager(self.id, self.event_router)
+
     self.buffered_token_output: Dict[str, Tuple[List[int], bool]] = {}
     self._prompt_token_ids: Dict[str, np.ndarray] = {}
     self.buffered_logits: Dict[str, List[np.ndarray]] = {}
@@ -47,13 +55,25 @@ class Node:
     self.max_generate_tokens = max_generate_tokens
     self.topology_viz = topology_viz
     self.default_sample_temperature = default_sample_temperature
-    self._on_token = AsyncCallbackSystem[str, Tuple[str, List[int], bool]]()
-    self._on_opaque_status = AsyncCallbackSystem[str, Tuple[str, str]]()
-    self._on_opaque_status.register("node_status").on_next(self.on_node_status)
+    
+    self.peers = []
+    
+    self.event_router.subscribe("synapse/cluster/cache/clear", self.on_p2p_clear_cache)
+    self.event_router.subscribe("synapse/cluster/status", self.on_p2p_status)
+    self.event_router.subscribe(f"synapse/inference/tensor/{self.id}", self.on_p2p_tensor)
+    self.event_router.subscribe(f"synapse/inference/prompt/{self.id}", self.on_p2p_prompt)
+    self.event_router.subscribe(f"synapse/inference/result/{self.id}", self.on_p2p_result)
+    self._setup_p2p_rpc_handlers()
+
     self.node_download_progress: Dict[str, RepoProgressEvent] = {}
     self.topology_inference_engines_pool: List[List[str]] = []
     self.outstanding_requests = {}
     self._background_tasks: Set[asyncio.Task] = set()
+
+    self._on_token = AsyncCallbackSystem()
+    self._request_semaphore = asyncio.Semaphore(max_concurrent_requests)
+    self.max_concurrent_requests = max_concurrent_requests
+    self._on_opaque_status = AsyncCallbackSystem()
 
     # Register internal callback for token synchronization in distributed mode
     self.on_token.register("internal_token_sync").on_next(self._on_token_received)
@@ -79,16 +99,19 @@ class Node:
     if DEBUG >= 1: print("Starting node: Getting device capabilities...")
     self.device_capabilities = await device_capabilities()
     
-    if DEBUG >= 1: print("Starting node: Starting gRPC server...")
-    await self.server.start()
-    if DEBUG >= 1: print("gRPC server started")
+    if DEBUG >= 1: print("Starting node: Starting Event Router and P2P Mesh...")
+    await self.event_router.start()
+    await self.libp2p_node.start()
+    await self.election_manager.start()
+    self._setup_p2p_rpc_handlers()
     
-    if DEBUG >= 1: print("Starting node: Starting discovery...")
-    await self.discovery.start()
-    if DEBUG >= 1: print("Discovery started")
+    if hasattr(self, "discovery") and self.discovery:
+        if DEBUG >= 1: print(f"Starting discovery module: {type(self.discovery).__name__}")
+        await self.discovery.start()
     
-    if DEBUG >= 1: print(f"Starting node: Updating peers (wait_for_peers={wait_for_peers})...")
-    await self.update_peers(wait_for_peers)
+    if DEBUG >= 1: print(f"P2P Node started. Waiting for {wait_for_peers} peers (simulated)...")
+    if wait_for_peers > 0:
+        await asyncio.sleep(2.0) # Grace period for P2P connection
     if DEBUG >= 1: print(f"Peers updated: {len(self.peers)} peers")
     
     if DEBUG >= 1: print("Starting node: Collecting topology...")
@@ -98,48 +121,183 @@ class Node:
     self._schedule_task(self.periodic_topology_collection(2.0), "periodic_topology_collection")
 
   async def stop(self) -> None:
-    await self.discovery.stop()
-    await self.server.stop()
+    if DEBUG >= 1: print("Stopping node: Cleaning up components...")
+    
+    # Cancel background tasks
+    for task in self._background_tasks:
+        task.cancel()
+    if self._background_tasks:
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+    
+    # Stop election manager
+    if hasattr(self, "election_manager") and self.election_manager:
+        await self.election_manager.stop()
+        
+    # Stop discovery
+    if hasattr(self, "discovery") and self.discovery:
+        await self.discovery.stop()
+        
+    # Stop libp2p and event router
+    if hasattr(self, "libp2p_node") and self.libp2p_node:
+        await self.libp2p_node.stop()
+        
+    if hasattr(self, "event_router") and self.event_router:
+        await self.event_router.stop()
 
-  async def get_tailscale_nodes(self) -> List[Dict]:
-    """Danh sách node Tailscale cho Web UI giám sát (chỉ có khi discovery là TailscaleDiscovery)."""
-    if hasattr(self.discovery, "get_devices_for_ui"):
-      return await self.discovery.get_devices_for_ui()
-    return []
+  async def on_p2p_status(self, event: Event):
+    """Handle opaque status updates from other nodes via P2P."""
+    self.on_node_status("", event.data)
 
-  def on_node_status(self, request_id, opaque_status):
+  async def on_p2p_clear_cache(self, event: Event):
+    """Xử lý lệnh xóa KV cache từ các node khác trong cluster."""
     try:
-      status_data = json.loads(opaque_status)
+        data = event.data
+        if isinstance(data, str):
+            import json
+            data = json.loads(data)
+        request_id = data.get("request_id")
+        if request_id:
+            if hasattr(self.inference_engine, "clear_cache"):
+                self.inference_engine.clear_cache(request_id)
+    except Exception:
+        pass
+
+  def on_node_status(self, request_id: str, data: str) -> None:
+    """EXO-INSPIRED: Handle node status updates for cluster health monitoring and topology visualization."""
+    try:
+      if isinstance(data, str):
+        status_data = json.loads(data)
+      else:
+        status_data = data
+      
       status_type = status_data.get("type", "")
-      if status_type == "supported_inference_engines":
+      
+      # Health and Fault Tolerance logic
+      if status_type == "node_status":
         node_id = status_data.get("node_id")
+        status_val = status_data.get("status", "")
+        if DEBUG >= 2: print(f"[FAULT_TOLERANCE] Received status update from node: {node_id} - {status_val}")
+        
+        # UI/Topology visualization updates
+        if status_val.startswith("start_"):
+          self.topology.active_node_id = status_data.get("node_id")
+        elif status_val.startswith("end_"):
+          if status_data.get("node_id") == self.topology.active_node_id:
+            self.topology.active_node_id = None
+            
+      elif status_type == "supported_inference_engines":
         engines = status_data.get("engines", [])
         self.topology_inference_engines_pool.append(engines)
-      elif status_type == "node_status":
-        if status_data.get("status", "").startswith("start_"):
-          self.current_topology.active_node_id = status_data.get("node_id")
-        elif status_data.get("status", "").startswith("end_"):
-          if status_data.get("node_id") == self.current_topology.active_node_id:
-            self.current_topology.active_node_id = None
-
-      download_progress = None
-      if status_type == "download_progress":
+        
+      elif status_type == "download_progress":
         if DEBUG >= 8: print(f"Download progress from {status_data.get('node_id')}: {status_data.get('progress')}")
-        download_progress = RepoProgressEvent.from_dict(status_data.get('progress'))
-        self.node_download_progress[status_data.get('node_id')] = download_progress
+        progress = RepoProgressEvent.from_dict(status_data.get('progress'))
+        self.node_download_progress[status_data.get('node_id')] = progress
 
       if self.topology_viz:
         self.topology_viz.update_visualization(self.topology, self.partitioning_strategy.partition(self.topology), self.id, self.node_download_progress)
+        
     except Exception as e:
-      if DEBUG >= 1: print(f"Error on_node_status: {e}")
-      if DEBUG >= 1: traceback.print_exc()
+      if DEBUG >= 1: print(f"Error in on_node_status: {e}")
+      if DEBUG >= 2: traceback.print_exc()
+
+  async def check_fault_tolerance(self) -> None:
+    """EXO-INSPIRED: Dynamic Fault Tolerance. Watchdog for stuck requests (>10s)."""
+    current_time = time.time()
+    stuck_requests = []
+    for request_id, req_info in list(self.outstanding_requests.items()):
+      # Support both legacy string status and refactored dict status
+      if isinstance(req_info, dict):
+          start_time = req_info.get("start_time", 0)
+      else:
+          # If it's a string, we don't have a start_time to check for timeout
+          start_time = 0
+          
+      if start_time and (current_time - start_time) > 10.0:
+        stuck_requests.append(request_id)
+    
+    if stuck_requests:
+      if DEBUG >= 1: print(f"!!! [FAULT_TOLERANCE] Found {len(stuck_requests)} stuck requests. Triggering topology refresh.")
+      await self.collect_topology(set())
+      # In a real system, we would trigger re-sharding or notify the API client to retry
+
+  async def on_p2p_tensor(self, event: Event):
+    """Handle incoming tensor for inference via P2P."""
+    data = event.data
+    request_id = data.get("request_id")
+    tensor_data = np.array(data.get("tensor"))
+    shard_dict = data.get("shard")
+    shard = Shard.from_dict(shard_dict)
+    inference_state = data.get("inference_state")
+    
+    await self.process_tensor(shard, tensor_data, request_id, inference_state)
+
+  async def on_p2p_prompt(self, event: Event):
+    """Handle incoming prompt for inference via P2P."""
+    data = event.data
+    request_id = data.get("request_id")
+    prompt = data.get("prompt")
+    shard_dict = data.get("shard")
+    shard = Shard.from_dict(shard_dict)
+    inference_state = data.get("inference_state")
+    
+    await self.process_prompt(shard, prompt, request_id, inference_state)
+
+  async def on_p2p_result(self, event: Event):
+    """Handle incoming inference results/tokens via P2P."""
+    data = event.data
+    request_id = data.get("request_id")
+    tokens = data.get("tokens", [])
+    is_finished = data.get("is_finished", False)
+    
+    self._on_token_received(request_id, tokens, is_finished)
+
+  async def get_tailscale_nodes(self) -> List[Dict]:
+    """Lấy danh sách thiết bị từ mạng Tailscale."""
+    from synapse.networking.tailscale.tailscale_discovery import TailscaleDiscovery
+    from synapse.networking.tailscale.tailscale_helpers import get_tailscale_devices
+    
+    api_key = None
+    tailnet = None
+    
+    # Ưu tiên lấy từ module discovery đang chạy
+    if hasattr(self, "discovery") and isinstance(self.discovery, TailscaleDiscovery):
+      api_key = self.discovery.tailscale_api_key
+      tailnet = self.discovery.tailnet
+    
+    # Fallback nếu không có discovery hoặc discovery không phải Tailscale
+    if not api_key:
+      api_key = os.getenv("TS_API_KEY") or os.getenv("TAILSCALE_API_KEY")
+    if not tailnet:
+      tailnet = os.getenv("TS_TAILNET") or os.getenv("TAILSCALE_TAILNET")
+      
+    # Tailscale credentials must be set via environment variables
+    if not api_key or not tailnet:
+      print("Tailscale API key and tailnet are required. Set TS_API_KEY and TS_TAILNET environment variables.")
+
+    try:
+      devices_dict = await get_tailscale_devices(api_key, tailnet)
+      results = []
+      for name, dev in devices_dict.items():
+        results.append({
+          "device_id": dev.device_id,
+          "name": dev.name,
+          "addresses": dev.addresses,
+          "last_seen": dev.last_seen.isoformat() if dev.last_seen else None,
+          "is_self": False # Sẽ được đánh dấu ở API handler nếu cần
+        })
+      return results
+    except Exception as e:
+      if DEBUG >= 1: print(f"Error fetching tailscale nodes: {e}")
+      return []
+
 
   def get_supported_inference_engines(self):
     return ["pytorch"]
 
   async def broadcast_supported_engines(self, supported_engines_names: List[str]):
     status_message = json.dumps({"type": "supported_inference_engines", "node_id": self.id, "engines": supported_engines_names})
-    await self.broadcast_opaque_status("", status_message)
+    await self.event_router.publish("synapse/cluster/status", status_message)
 
   def get_topology_inference_engines(self) -> List[List[str]]:
     return self.topology_inference_engines_pool
@@ -280,7 +438,12 @@ class Node:
       self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
       
       if intermediate_result or is_finished:
-        self._schedule_task(self.broadcast_result(request_id, intermediate_result, is_finished), name=f"broadcast_{request_id}")
+        # Broadcast result to the topic for this request_id listener
+        await self.event_router.publish(f"synapse/inference/result/{request_id}", {
+            "request_id": request_id,
+            "tokens": intermediate_result,
+            "is_finished": is_finished
+        })
     
       if is_finished:
         if request_id in self.buffered_token_output:
@@ -375,14 +538,22 @@ class Node:
             # yield to allow callback processing
             await asyncio.sleep(0.1) # Throttled wait
             
-            # Watchdog: if we've been waiting too long without any progress
-            if time.perf_counter() - wait_start > 60.0:
+            # Dynamic Fault Tolerance: Nếu 10s không nhận được trả lời (Node sập/Đứt mạng)
+            if time.perf_counter() - wait_start > 10.0:
               if DEBUG >= 1: 
-                print(f"[{request_id}] Generation watchdog triggered: no progress in 60s. State: {self.outstanding_requests.get(request_id)}")
+                print(f"[{request_id}] [Watchdog] Generation stalled for 10s. Triggers Dynamic Fault Tolerance (Reroute)!")
               
-              # If we are waiting for a remote node, maybe try to nudge it?
-              # For now, just continue waiting but log the stall
-              wait_start = time.perf_counter() # Reset watchdog to log again in 60s
+              # 1. Heartbeat của ElectionManager (đang chạy ngầm) đã/sẽ loại bỏ node sập khỏi mesh
+              # 2. Ta chỉ cần GỬI LẠI last_token, P2P Router sẽ tự đẩy task cho một Node khỏe (mới được bầu lên).
+              last_token_for_retry = np.array([[buffered_tokens[-1]]]) if len(buffered_tokens) > 0 else prompt_ids
+              if len(buffered_tokens) > 0:
+                  await self.process_tensor(base_shard, last_token_for_retry, request_id, inference_state)
+              else: # Retry from process_prompt
+                  # Lỗi ngay từ token đầu, encode lại prompt
+                  await self.process_tensor(base_shard, prompt_ids, request_id, inference_state)
+                  
+              wait_start = time.perf_counter() # Reset watchdog
+
               
             continue
             
@@ -407,6 +578,8 @@ class Node:
           self.trigger_on_token_callbacks(request_id, [], True)
         self.outstanding_requests.pop(request_id, None)
         self._prompt_token_ids.pop(request_id, None)
+        # Broadcast clear cache to cluster
+        self._schedule_task(self.event_router.publish("synapse/cluster/cache/clear", json.dumps({"request_id": request_id})))
         return latest_result if latest_result is not None else result
       except Exception as e:
         # CRITICAL FIX: If exception occurs, ensure API is notified
@@ -414,6 +587,8 @@ class Node:
           print(f"[{request_id}] Error in _process_prompt: {e}")
           import traceback
           traceback.print_exc()
+        # Broadcast clear cache on error too
+        self._schedule_task(self.event_router.publish("synapse/cluster/cache/clear", json.dumps({"request_id": request_id})))
         # Trigger callback with error state so API doesn't hang
         if shard.is_last_layer():
           if DEBUG >= 1:
@@ -645,15 +820,15 @@ class Node:
       next_shard = self.get_current_shard(base_shard, target_index)
       if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. next shard: {next_shard}")
       if target_id == self.id:
-          # FIX: When target is self, call _process_prompt directly to avoid infinite loop
-          # process_prompt -> _process_prompt -> forward_prompt -> process_prompt loop
           await self._process_prompt(next_shard, prompt, request_id, inference_state)
       else:
-          target_peer = next((p for p in self.peers if p.id() == target_id), None)
-          if not target_peer:
-              raise ValueError(f"Peer for {target_index} not found")
-          if DEBUG >= 1: print(f"Sending prompt to {target_peer.id()}: {prompt}")
-          await target_peer.send_prompt(next_shard, prompt, request_id=request_id, inference_state=inference_state)
+          logger.info(f"[P2P_MESH] Publishing prompt to Node: {target_id}")
+          await self.event_router.publish(f"synapse/inference/prompt/{target_id}", {
+              "request_id": request_id,
+              "shard": next_shard.to_dict(),
+              "prompt": prompt,
+              "inference_state": inference_state
+          })
   
   async def forward_tensor(
     self,
@@ -670,23 +845,14 @@ class Node:
     if target_id == self.id:
       return await self.process_tensor(target_shard, tensor, request_id, inference_state)
     else:
-      target_peer = next((p for p in self.peers if p.id() == target_id), None)
-      if not target_peer:
-        raise ValueError(f"Peer for {target_index} not found")
-      if DEBUG >= 1: print(f"Sending tensor to {target_peer.id()}: {tensor}")
-      # HIỆN THÔNG BÁO PHÂN TÁN RÕ RÀNG
-      print(f"[DISTRIBUTED] Forwarding workload to Node: {target_id}")
-      # Add a safety watchdog to prevent infinite hangs in forwarding
-      result = await asyncio.wait_for(
-        target_peer.send_tensor(
-          target_shard,
-          tensor,
-          request_id=request_id,
-          inference_state=inference_state,
-        ),
-        timeout=300.0 # Extreme safety margin
-      )
-      return result
+      logger.info(f"[P2P_MESH] Publishing work to Node: {target_id}")
+      await self.event_router.publish(f"synapse/inference/tensor/{target_id}", {
+        "request_id": request_id,
+        "shard": target_shard.to_dict(),
+        "tensor": tensor.tolist(), # Convert to list for JSON serialization
+        "inference_state": inference_state
+      })
+      return None # In P2P, we don't wait for return. Results come via result topic.
 
   def get_partition_index(self, offset: int = 0, base_shard: Optional[Shard] = None):
     if not self.partitioning_strategy:
@@ -695,7 +861,8 @@ class Node:
     partitions = self.partitioning_strategy.partition(self.topology, base_shard)
     current_partition_index = next((i for i, p in enumerate(partitions) if p.node_id == self.id), None)
     if current_partition_index is None:
-      raise ValueError(f"No current partition found for node: {self.id}")
+      if DEBUG >= 1: print(f"Node {self.id} not found in partitions — may have departed or topology changed")
+      return 0  # Fall back to first partition instead of crashing
     return (current_partition_index + offset) % len(partitions)
 
   def get_current_shard(self, base_shard: Shard, index: Optional[int] = None) -> Shard:
@@ -706,7 +873,7 @@ class Node:
     return shards[index]
 
   async def update_peers(self, wait_for_peers: int = 0) -> bool:
-    next_peers = await self.discovery.discover_peers(wait_for_peers)
+    next_peers = await self.discovery.discover_peers(wait_for_peers) if hasattr(self, "discovery") else []
     current_peer_ids = {peer.id() for peer in self.peers}
     next_peer_ids = {peer.id() for peer in next_peers}
     peers_added = [peer for peer in next_peers if peer.id() not in current_peer_ids]
@@ -716,11 +883,12 @@ class Node:
     peers_to_disconnect = [peer for peer in peers_removed if await peer.is_connected()]
     peers_to_connect = [peer for peer in peers_added + peers_updated + peers_unchanged if not await peer.is_connected()]
 
-    def _pretty(peers: List[PeerHandle]) -> List[str]:
-      return [f"{peer.id()}@{peer.addr()}" for peer in peers]
+    if DEBUG >= 1:
+      print(f"update_peers (Node {self.id}): discovery={type(self.discovery).__name__ if hasattr(self, 'discovery') and self.discovery else 'None'}")
+      print(f"  next_peers IDs: {next_peer_ids}")
 
     if DEBUG >= 3:
-      print(f"update_peers: added={peers_added} removed={peers_removed} updated={peers_updated} unchanged={peers_unchanged} to_disconnect={peers_to_disconnect} to_connect={peers_to_connect}")
+      print(f"update_peers details: added={[p.id() for p in peers_added]} removed={[p.id() for p in peers_removed]}")
 
     async def disconnect_with_timeout(peer, timeout=5):
       try:
@@ -768,12 +936,16 @@ class Node:
       try:
         did_peers_change = await self.update_peers()
         if DEBUG >= 3: print(f"{did_peers_change=}")
+        
+        # EXO-INSPIRED: Dynamic Fault Tolerance check
+        await self.check_fault_tolerance()
+        
         await self.collect_topology(set())
         if did_peers_change:
           await self.select_best_inference_engine()
       except Exception as e:
-        print(f"Error collecting topology: {e}")
-        traceback.print_exc()
+        print(f"Error in periodic_topology_collection: {e}")
+        if DEBUG >= 2: traceback.print_exc()
 
   async def collect_topology(self, visited: set[str], max_depth: int = 4) -> Topology:
     next_topology = Topology()
@@ -816,7 +988,7 @@ class Node:
         else:
           print(f"Error collecting topology from {peer.id()}: {type(e).__name__}: {e}")
 
-    next_topology.active_node_id = self.topology.active_node_id
+    next_topology.active_node_id = self.election_manager.current_master_id
     self.topology = next_topology
     if self.topology_viz:
       self.topology_viz.update_visualization(self.topology, self.partitioning_strategy.partition(self.topology), self.id)
@@ -872,6 +1044,102 @@ class Node:
     await asyncio.gather(*[send_status_to_peer(peer) for peer in self.peers], return_exceptions=True)
     # in the case of opaque status, we also want to receive our own opaque statuses
     self.on_opaque_status.trigger_all(request_id, status)
+
+  def _setup_p2p_rpc_handlers(self):
+    """Setup listeners for P2P RPC requests (Health, Topology)."""
+    self.event_router.subscribe(f"synapse/rpc/health/request/{self.id}", self.on_p2p_health_request)
+    self.event_router.subscribe(f"synapse/rpc/topology/request/{self.id}", self.on_p2p_topology_request)
+
+  async def on_p2p_health_request(self, event: Event):
+    try:
+        response_topic = event.data.get("_response_topic")
+        if response_topic:
+            await self.event_router.publish(response_topic, {"status": "ok"}, origin=self.id)
+    except Exception as e:
+        logger.error(f"Error in on_p2p_health_request: {e}")
+
+  async def on_p2p_topology_request(self, event: Event):
+    try:
+        response_topic = event.data.get("_response_topic")
+        if response_topic:
+            await self.event_router.publish(response_topic, {"topology": self.topology.to_dict()}, origin=self.id)
+    except Exception as e:
+        logger.error(f"Error in on_p2p_topology_request: {e}")
+        traceback.print_exc()
+
+  async def on_p2p_status(self, event: Event):
+    """Update local view of the cluster based on status broadcasts."""
+    try:
+        data = event.data
+        if isinstance(data, str):
+            data = json.loads(data)
+        
+        if data.get("type") == "node_status":
+            node_id = data.get("node_id")
+            # Update node in topology if we have its basic info
+            if node_id and node_id != self.id:
+                # We expect the full topology update via collect_topology, 
+                # but we can track simple status here.
+                pass
+    except Exception as e:
+        if DEBUG >= 2: logger.error(f"Error in on_p2p_status: {e}")
+
+  async def on_p2p_tensor(self, event: Event):
+    """Handle incoming tensor from P2P Mesh."""
+    data = event.data
+    try:
+        ack_topic = data.get("_ack_topic")
+        if ack_topic:
+            asyncio.create_task(self.event_router.publish(ack_topic, {"status": "received"}, origin=self.id))
+        request_id = data.get("request_id")
+        shard = Shard.from_dict(data.get("shard"))
+
+        # Deserialize tensor
+        tensor_bytes = data.get("tensor_data")
+        shape = data.get("shape")
+        dtype = data.get("dtype")
+        
+        if tensor_bytes is not None:
+            tensor = np.frombuffer(tensor_bytes, dtype=dtype).reshape(shape)
+        else:
+            # Fallback for list-based JSON serialization if bytes are missing
+            tensor = np.array(data.get("tensor"), dtype=dtype)
+
+        await self.process_tensor(shard, tensor, request_id)
+    except Exception as e:
+        logger.error(f"Error in on_p2p_tensor: {e}")
+        traceback.print_exc()
+
+  async def on_p2p_prompt(self, event: Event):
+    """Handle incoming prompt from P2P Mesh."""
+    data = event.data
+    try:
+        ack_topic = data.get("_ack_topic")
+        if ack_topic:
+            asyncio.create_task(self.event_router.publish(ack_topic, {"status": "received"}, origin=self.id))
+        request_id = data.get("request_id")
+        shard = Shard.from_dict(data.get("shard"))
+        prompt = data.get("prompt")
+        inference_state = data.get("inference_state")
+        
+        await self._process_prompt(shard, prompt, request_id, inference_state)
+    except Exception as e:
+        logger.error(f"Error in on_p2p_prompt: {e}")
+        traceback.print_exc()
+
+  async def on_p2p_result(self, event: Event):
+    """Handle incoming inference result from P2P Mesh."""
+    data = event.data
+    try:
+        request_id = data.get("request_id")
+        result = data.get("result", [])
+        is_finished = data.get("is_finished", False)
+        
+        # Update local buffer and trigger callbacks
+        self._on_token_received(request_id, result, is_finished)
+        self.trigger_on_token_callbacks(request_id, result, is_finished)
+    except Exception as e:
+        logger.error(f"Error in on_p2p_result: {e}")
 
   def _on_token_received(self, request_id: str, tokens: List[int], is_finished: bool) -> None:
     """Internal callback to synchronize buffered tokens on orchestrator node."""
