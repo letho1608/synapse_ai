@@ -156,6 +156,16 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     result = list(result)
     if len(img.tensor_data) > 0:
       result = np.frombuffer(img.tensor_data, dtype=np.dtype(img.dtype)).reshape(img.shape)
+
+    # FIX: Directly set Future if it exists (for forward_prompt/forward_tensor waiting)
+    if hasattr(self.node, '_result_futures') and request_id in self.node._result_futures:
+      future = self.node._result_futures[request_id]
+      if not future.done():
+        if DEBUG >= 1: print(f"[{request_id}] Setting result future from SendResult")
+        future.set_result(result)
+      # Clean up after setting result
+      del self.node._result_futures[request_id]
+
     self.node.on_token.trigger_all(request_id, result, is_finished)
     return node_service_pb2.Empty()
 
