@@ -65,10 +65,11 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     inference_state = None if request.inference_state is None else self.deserialize_inference_state(request.inference_state)
     # HIỆN THÔNG BÁO NHẬN TẢI
     print(f"[DISTRIBUTED] Receiving PROMPT workload from remote peer for Request: {request_id[:8]}")
-    result = await self.node.process_prompt(shard, prompt, request_id, inference_state)
-    if DEBUG >= 5: print(f"SendPrompt {shard=} {prompt=} {request_id=} result: {result}")
-    tensor_data = result.tobytes() if result is not None else None
-    return node_service_pb2.Tensor(tensor_data=tensor_data, shape=result.shape, dtype=str(result.dtype)) if result is not None else node_service_pb2.Tensor()
+    # FIX: Process asynchronously - result comes via broadcast_result -> on_token callbacks
+    asyncio.create_task(self.node.process_prompt(shard, prompt, request_id, inference_state))
+    if DEBUG >= 5: print(f"SendPrompt {shard=} {prompt=} {request_id=} - processing async")
+    # Return immediately - actual result will be sent via broadcast
+    return node_service_pb2.Tensor()
 
   async def SendTensor(self, request, context):
     shard = Shard(
@@ -82,12 +83,12 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
 
     inference_state = None if request.inference_state is None else self.deserialize_inference_state(request.inference_state)
 
-    result = await self.node.process_tensor(shard, tensor, request_id, inference_state)
-    # HIỆN THÔNG BÁO NHẬN TẢI
+    # FIX: Process asynchronously - result comes via broadcast_result -> on_token callbacks
+    asyncio.create_task(self.node.process_tensor(shard, tensor, request_id, inference_state))
     print(f"📥 [DISTRIBUTED] Receiving workload from remote peer for Request: {request_id[:8]}")
-    if DEBUG >= 5: print(f"SendTensor tensor {shard=} {tensor=} {request_id=} result: {result}")
-    tensor_data = result.tobytes() if result is not None else None
-    return node_service_pb2.Tensor(tensor_data=tensor_data, shape=result.shape, dtype=str(result.dtype)) if result is not None else node_service_pb2.Tensor()
+    if DEBUG >= 5: print(f"SendTensor tensor {shard=} {tensor=} {request_id=} - processing async")
+    # Return immediately - actual result will be sent via broadcast
+    return node_service_pb2.Tensor()
 
   async def SendExample(self, request, context):
     shard = Shard(

@@ -55,6 +55,7 @@ class Node:
     self.topology_inference_engines_pool: List[List[str]] = []
     self.outstanding_requests = {}
     self._background_tasks: Set[asyncio.Task] = set()
+    self._result_futures: Dict[str, asyncio.Future] = {}  # Track futures for distributed results
 
     # Register internal callback for token synchronization in distributed mode
     self.on_token.register("internal_token_sync").on_next(self._on_token_received)
@@ -771,15 +772,41 @@ class Node:
       next_shard = self.get_current_shard(base_shard, target_index)
       if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. next shard: {next_shard}")
       if target_id == self.id:
-          # FIX: When target is self, call _process_prompt directly to avoid infinite loop
-          # process_prompt -> _process_prompt -> forward_prompt -> process_prompt loop
+          # When target is self, call _process_prompt directly
           await self._process_prompt(next_shard, prompt, request_id, inference_state)
       else:
           target_peer = next((p for p in self.peers if p.id() == target_id), None)
           if not target_peer:
               raise ValueError(f"Peer for {target_index} not found")
-          if DEBUG >= 1: print(f"Sending prompt to {target_peer.id()}: {prompt}")
-          await target_peer.send_prompt(next_shard, prompt, request_id=request_id, inference_state=inference_state)
+
+          # FIX: Use Future to wait for result from remote node
+          loop = asyncio.get_running_loop()
+          result_future = loop.create_future()
+          self._result_futures[request_id] = result_future
+
+          # Register callback to capture result when finished
+          def on_result(req_id, tokens, is_finished):
+              if req_id == request_id and is_finished:
+                  if not result_future.done():
+                      result_future.set_result(tokens)
+
+          callback_id = f"forward_prompt_{request_id}"
+          self.on_token.register(callback_id).on_next(on_result)
+
+          try:
+              if DEBUG >= 1: print(f"Sending prompt to {target_peer.id()}: {prompt}")
+              await target_peer.send_prompt(next_shard, prompt, request_id=request_id, inference_state=inference_state)
+
+              # Wait for result with timeout
+              if DEBUG >= 1: print(f"[{request_id}] Waiting for result from remote node...")
+              await asyncio.wait_for(result_future, timeout=300.0)
+              if DEBUG >= 1: print(f"[{request_id}] Received result from remote node")
+          except asyncio.TimeoutError:
+              print(f"[{request_id}] Timeout waiting for result from {target_peer.id()}")
+              raise
+          finally:
+              self.on_token.deregister(callback_id)
+              self._result_futures.pop(request_id, None)
   
   async def forward_tensor(
     self,
@@ -799,20 +826,41 @@ class Node:
       target_peer = next((p for p in self.peers if p.id() == target_id), None)
       if not target_peer:
         raise ValueError(f"Peer for {target_index} not found")
-      if DEBUG >= 1: print(f"Sending tensor to {target_peer.id()}: {tensor}")
-      # HIỆN THÔNG BÁO PHÂN TÁN RÕ RÀNG
-      print(f"[DISTRIBUTED] Forwarding workload to Node: {target_id}")
-      # Add a safety watchdog to prevent infinite hangs in forwarding
-      result = await asyncio.wait_for(
-        target_peer.send_tensor(
-          target_shard,
-          tensor,
-          request_id=request_id,
-          inference_state=inference_state,
-        ),
-        timeout=300.0 # Extreme safety margin
-      )
-      return result
+
+      # FIX: Use Future to wait for result from remote node
+      loop = asyncio.get_running_loop()
+      result_future = loop.create_future()
+      self._result_futures[request_id] = result_future
+
+      # Register callback to capture result when finished
+      def on_result(req_id, tokens, is_finished):
+          if req_id == request_id and is_finished:
+              if not result_future.done():
+                  result_future.set_result(tokens)
+
+      callback_id = f"forward_tensor_{request_id}"
+      self.on_token.register(callback_id).on_next(on_result)
+
+      try:
+          if DEBUG >= 1: print(f"Sending tensor to {target_peer.id()}: {tensor}")
+          print(f"[DISTRIBUTED] Forwarding workload to Node: {target_id}")
+          await target_peer.send_tensor(
+            target_shard,
+            tensor,
+            request_id=request_id,
+            inference_state=inference_state,
+          )
+
+          # Wait for result with timeout
+          if DEBUG >= 1: print(f"[{request_id}] Waiting for result from remote node...")
+          await asyncio.wait_for(result_future, timeout=300.0)
+          if DEBUG >= 1: print(f"[{request_id}] Received result from remote node")
+      except asyncio.TimeoutError:
+          print(f"[{request_id}] Timeout waiting for result from {target_peer.id()}")
+          raise
+      finally:
+          self.on_token.deregister(callback_id)
+          self._result_futures.pop(request_id, None)
 
   def get_partition_index(self, offset: int = 0, base_shard: Optional[Shard] = None):
     if not self.partitioning_strategy:

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile synapse/networking/grpc/grpc_server.py)",
+      "Bash(python -m py_compile synapse/orchestration/node.py)",
+      "Bash(py -c \"import py_compile; py_compile.compile\\('synapse/orchestration/node.py', doraiseok=True\\)\")"
+    ]
+  }
+}

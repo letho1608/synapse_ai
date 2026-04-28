@@ -220,16 +220,13 @@ class GRPCPeerHandle(PeerHandle):
       request_id=request_id,
       inference_state=None if inference_state is None else self.serialize_inference_state(inference_state)
     )
-    response = await self._rpc_with_retry(
+    await self._rpc_with_retry(
       "SendTensor",
       lambda: self.stub.SendTensor(request),
       timeout=120.0 # Tensor processing is even slower
     )
-
-    if not response.tensor_data or not response.shape or not response.dtype:
-      return None
-
-    return np.frombuffer(response.tensor_data, dtype=np.dtype(response.dtype)).reshape(response.shape)
+    # Result will come via broadcast_result -> on_token callbacks
+    return None
 
   async def send_example(self, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, train: bool, request_id: Optional[str] = None) -> Optional[np.array]:
     request = node_service_pb2.ExampleRequest(
