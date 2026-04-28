@@ -9,7 +9,9 @@
       "Bash(set PYTHONIOENCODING=utf-8)",
       "Bash(py tests/test_cluster.py --prompt \"Xin chào\" --startup-timeout 300 --inference-timeout 600)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(python *)",
+      "Bash(/c/Users/DELL/AppData/Local/Programs/Python/Python310/python.exe *)"
     ]
   }
 }

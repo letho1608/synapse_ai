@@ -666,9 +666,27 @@ class Node:
 
     target_shard = self.get_current_shard(base_shard, target_index)
     if DEBUG >= 2: print(f"computed target from: {base_shard} {target_index}, {self.topology}. target shard: {target_shard}")
-    target_peer = next((p for p in self.peers if p.id() == target_id), None)
+    # Retry logic for peer lookup (handles race condition during topology sync)
+    target_peer = None
+    for retry in range(5):
+      target_peer = next((p for p in self.peers if p.id() == target_id), None)
+      if target_peer:
+        break
+      if DEBUG >= 1:
+        print(f"[{request_id}] Peer {target_id} not found (retry {retry+1}/5). Current peers: {[p.id() for p in self.peers]}")
+      await asyncio.sleep(1.0)
+      await self.update_peers()
+
     if not target_peer:
-      raise ValueError(f"peer for {target_index} not found")
+        # Log detailed state for debugging
+        partitions = self.partitioning_strategy.partition(self.topology, base_shard)
+        print(f"[ERROR] Peer {target_id} not found after 5 retries.")
+        print(f"  target_index: {target_index}")
+        print(f"  partitions: {[(p.node_id, p.start, p.end) for p in partitions]}")
+        print(f"  current node: {self.id}")
+        print(f"  current peers: {[p.id() for p in self.peers]}")
+        print(f"  topology nodes: {list(self.topology.nodes.keys())}")
+        raise ValueError(f"peer for {target_index} not found")
     if DEBUG >= 1: print(f"sending example to {target_peer.id()}: {step} => {target} ({length})")
 
     # ─── DISTRIBUTED TRAINING DETECTION ─────────────────────────────
@@ -775,8 +793,26 @@ class Node:
           # When target is self, call _process_prompt directly
           await self._process_prompt(next_shard, prompt, request_id, inference_state)
       else:
-          target_peer = next((p for p in self.peers if p.id() == target_id), None)
+          # Retry logic for peer lookup (handles race condition during topology sync)
+          target_peer = None
+          for retry in range(5):
+            target_peer = next((p for p in self.peers if p.id() == target_id), None)
+            if target_peer:
+                break
+            if DEBUG >= 1:
+                print(f"[{request_id}] Peer {target_id} not found (retry {retry+1}/5). Current peers: {[p.id() for p in self.peers]}")
+            await asyncio.sleep(1.0)
+            await self.update_peers()
+
           if not target_peer:
+              # Log detailed state for debugging
+              partitions = self.partitioning_strategy.partition(self.topology, base_shard)
+              print(f"[ERROR] Peer {target_id} not found after 5 retries.")
+              print(f"  target_index: {target_index}")
+              print(f"  partitions: {[(p.node_id, p.start, p.end) for p in partitions]}")
+              print(f"  current node: {self.id}")
+              print(f"  current peers: {[p.id() for p in self.peers]}")
+              print(f"  topology nodes: {list(self.topology.nodes.keys())}")
               raise ValueError(f"Peer for {target_index} not found")
 
           # FIX: Use Future to wait for result from remote node
@@ -823,9 +859,27 @@ class Node:
     if target_id == self.id:
       return await self.process_tensor(target_shard, tensor, request_id, inference_state)
     else:
-      target_peer = next((p for p in self.peers if p.id() == target_id), None)
+      # Retry logic for peer lookup (handles race condition during topology sync)
+      target_peer = None
+      for retry in range(5):
+        target_peer = next((p for p in self.peers if p.id() == target_id), None)
+        if target_peer:
+            break
+        if DEBUG >= 1:
+            print(f"[{request_id}] Peer {target_id} not found (retry {retry+1}/5). Current peers: {[p.id() for p in self.peers]}")
+        await asyncio.sleep(1.0)
+        await self.update_peers()
+
       if not target_peer:
-        raise ValueError(f"Peer for {target_index} not found")
+          # Log detailed state for debugging
+          partitions = self.partitioning_strategy.partition(self.topology, base_shard)
+          print(f"[ERROR] Peer {target_id} not found after 5 retries.")
+          print(f"  target_index: {target_index}")
+          print(f"  partitions: {[(p.node_id, p.start, p.end) for p in partitions]}")
+          print(f"  current node: {self.id}")
+          print(f"  current peers: {[p.id() for p in self.peers]}")
+          print(f"  topology nodes: {list(self.topology.nodes.keys())}")
+          raise ValueError(f"Peer for {target_index} not found")
 
       # FIX: Use Future to wait for result from remote node
       loop = asyncio.get_running_loop()
