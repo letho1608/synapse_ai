@@ -24,7 +24,7 @@ def test_imports():
     from synapse.inference.inference_engine import get_inference_engine, InferenceEngine
     from synapse.inference.shard import Shard
     from synapse.models import build_base_shard, get_repo
-    assert len(HF_MODELS) == 23
+    assert len(HF_MODELS) == 544
     assert resolve_hf_id("qwen2.5:1.5b") == "Qwen/Qwen2.5-1.5B-Instruct"
     print("  [OK] test_imports")
 
@@ -32,18 +32,15 @@ def test_imports():
 def test_model_list():
     """Model list: resolve_hf_id, so luong, layers."""
     from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id
-    assert len(HF_MODELS) == 23
-    assert len(HF_MODEL_LAYERS) == 23
+    assert len(HF_MODELS) == 544
+    assert len(HF_MODEL_LAYERS) == 544
     assert resolve_hf_id("qwen2.5:1.5b") == "Qwen/Qwen2.5-1.5B-Instruct"
     assert resolve_hf_id("llama3.2:3b") == "meta-llama/Llama-3.2-3B-Instruct"
     assert resolve_hf_id("phi3:mini") == "microsoft/Phi-3-mini-4k-instruct"
-    assert resolve_hf_id("") or resolve_hf_id("x")  # fallback co gia tri
+    assert resolve_hf_id("") or resolve_hf_id("x")
     assert "qwen2.5:0.5b" in HF_MODELS
     assert HF_MODEL_LAYERS.get("qwen2.5:1.5b") == 28
     print("  [OK] test_model_list")
-
-
-def test_build_base_shard():
     """Build base shard cho engine PyTorch (can dang ky model truoc)."""
     from synapse.inference.inference_engine import get_inference_engine
     from synapse.models import build_base_shard

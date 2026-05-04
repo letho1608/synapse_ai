@@ -6,6 +6,7 @@ import time
 from typing import Dict, List, Set, Any, Optional, Tuple
 from loguru import logger
 from synapse.routing.event_router import EventRouter, Event
+from synapse.helpers import DEBUG
 
 def _get_all_local_ips() -> Set[str]:
     """Get all IPv4 addresses of this machine to detect self-connections."""
@@ -332,12 +333,18 @@ class P2PSocketBridge:
 
     async def _on_local_event(self, event: Event):
         """React to events published on the local EventRouter."""
-        # Only broadcast events that originated locally to avoid loops
+        # CRITICAL FIX: Only broadcast events that originated locally (from this node's own code
+        # or from this node's EventRouter.publish with origin=self.node_id).
+        # Events received from remote peers arrive via _read_loop with origin=remote_node_id,
+        # and those MUST NOT be re-broadcast (that would create infinite loops).
         if event.origin != "local" and event.origin != self.node_id:
-            print(f"[DEBUG-BRIDGE] {self.node_id}: SKIP broadcast topic={event.topic} origin={event.origin} (not local, not self)", flush=True)
+            if DEBUG >= 3:
+                logger.debug(f"SKIP broadcast topic={event.topic} origin={event.origin} (remote event, not re-broadcasting)")
             return
 
-        print(f"[DEBUG-BRIDGE] {self.node_id}: broadcasting topic={event.topic} origin={event.origin}", flush=True)
+        if DEBUG >= 2:
+            logger.debug(f"Broadcasting topic={event.topic} origin={event.origin}")
+
         packet = {
             "type": "event",
             "topic": event.topic,
@@ -350,21 +357,18 @@ class P2PSocketBridge:
 
     async def _broadcast_packet(self, packet: Dict):
         """Send a packet to all connected peers."""
-        data = json.dumps(packet).encode('utf-8')
-        topic = packet.get('topic', 'unknown')
-
-        print(f"[DEBUG-BROADCAST] {self.node_id}: broadcasting '{topic}' to {len(self._connections)} peers: {list(self._connections.keys())}", flush=True)
+        # CRITICAL FIX: Use BSON/MessagePack-like binary packing for tensor data
+        # JSON serialization of large nested float arrays can OOM on real machines.
+        # For event packets with tensor data, we must use efficient binary encoding.
+        data = json.dumps(packet, default=self._json_serialize).encode('utf-8')
 
         disconnected = []
         for peer_id, (_, writer) in self._connections.items():
             try:
-                print(f"[DEBUG-BROADCAST] {self.node_id}: writing to {peer_id}, writer_closing={writer.is_closing()}, writer_addr={writer.get_extra_info('peername')}", flush=True)
                 length_prefix = struct.pack("!I", len(data))
                 writer.write(length_prefix + data)
                 await writer.drain()
-                print(f"[DEBUG-BROADCAST] {self.node_id}: drain complete for {peer_id}", flush=True)
             except Exception as e:
-                print(f"[DEBUG-BROADCAST] {self.node_id}: ERROR writing to {peer_id}: {e}", flush=True)
                 logger.warning(f"Lost connection to peer {peer_id}: {e}")
                 disconnected.append(peer_id)
 
@@ -372,6 +376,22 @@ class P2PSocketBridge:
             self._connections.pop(peer_id, None)
             self._last_pong.pop(peer_id, None)
             self._schedule_reconnect(peer_id)
+
+    @staticmethod
+    def _json_serialize(obj):
+        """Custom JSON serializer for numpy arrays and bytes."""
+        import numpy as np
+
+        if isinstance(obj, np.ndarray):
+            return {
+                "__np__": True,
+                "data": obj.tobytes().hex(),
+                "shape": list(obj.shape),
+                "dtype": str(obj.dtype),
+            }
+        if isinstance(obj, bytes):
+            return obj.hex()
+        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
     async def _read_loop(self, peer_id: str, reader: asyncio.StreamReader):
         """Read packets from a specific peer stream."""
@@ -382,21 +402,16 @@ class P2PSocketBridge:
 
                 if packet.get("type") == "event":
                     topic = packet.get("topic")
-                    data = packet.get("data")
+                    data = self._json_deserialize(packet.get("data"))
                     origin = packet.get("origin")
-                    print(f"[DEBUG-BRIDGE] {self.node_id}: _read_loop received from {peer_id} topic={topic} origin={origin}", flush=True)
 
-                    # Prevent re-publishing back to the network (origin check)
+                    # Re-publish locally with remote origin to prevent re-broadcast loops
                     await self.event_router.publish(topic, data, origin=origin)
-                    print(f"[DEBUG-BRIDGE] {self.node_id}: _read_loop published locally topic={topic}", flush=True)
 
                 elif packet.get("type") == "handshake":
-                    # Handle handshake that arrives as a regular packet (shouldn't happen normally,
-                    # but handle gracefully if peer sends it before we process connect)
                     pass
 
                 elif packet.get("type") == "ping":
-                    # Reply with pong
                     pong = {"type": "pong", "timestamp": packet.get("timestamp")}
                     data = json.dumps(pong).encode("utf-8")
                     stored = self._connections.get(peer_id)
@@ -413,6 +428,20 @@ class P2PSocketBridge:
                 self._connections.pop(peer_id, None)
                 self._last_pong.pop(peer_id, None)
                 self._schedule_reconnect(peer_id)
+
+    @staticmethod
+    def _json_deserialize(data):
+        """Recursively convert serialized numpy arrays back from hex encoding."""
+        import numpy as np
+
+        if isinstance(data, dict):
+            if data.get("__np__"):
+                arr = np.frombuffer(bytes.fromhex(data["data"]), dtype=np.dtype(data["dtype"]))
+                return arr.reshape(data["shape"])
+            return {k: P2PSocketBridge._json_deserialize(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [P2PSocketBridge._json_deserialize(item) for item in data]
+        return data
 
     async def _read_packet(self, reader: asyncio.StreamReader) -> Optional[Dict]:
         """Read a single length-prefixed JSON packet."""

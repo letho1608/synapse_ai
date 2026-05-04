@@ -553,7 +553,14 @@ class ChatGPTAPI:
     return "N/A"
 
   def _get_gpu_utilization(self) -> Optional[int]:
-    """Lấy % sử dụng GPU (nvidia-smi utilization.gpu). Trả về None nếu không có GPU hoặc lỗi."""
+    """Lay % su dung GPU tu realtime monitor (cache), fallback to nvidia-smi."""
+    try:
+        if hasattr(self, "node") and self.node and hasattr(self.node, "monitor"):
+            metrics = self.node._current_metrics
+            if metrics.gpu_util_pct > 0:
+                return int(metrics.gpu_util_pct)
+    except Exception:
+        pass
     try:
       out = subprocess.run(
         ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
@@ -1373,9 +1380,9 @@ class ChatGPTAPI:
   def _get_partitions_count(self) -> int:
     """Số partition (node) trong topology; 1 = chỉ máy này."""
     try:
-      if not self.node.partitioning_strategy or not self.node.topology:
+      if not self.node.topology or not self.node.topology.nodes:
         return 1
-      partitions = self.node.partitioning_strategy.partition(self.node.topology)
+      partitions = self.node._compute_lacp_partition()
       return len(partitions) if partitions else 1
     except Exception:
       return 1
@@ -1408,8 +1415,18 @@ class ChatGPTAPI:
 
   async def handle_get_system_stats(self, request):
     try:
-      cpu_percent = psutil.cpu_percent()
-      memory = psutil.virtual_memory()
+      if hasattr(self, "node") and self.node and self.node._current_metrics:
+        m = self.node._current_metrics
+        cpu_percent = m.cpu_util_pct
+        memory_percent = m.ram_util_pct
+        memory_used_gb = round(m.ram_used_mb / 1024, 2)
+        memory_total_gb = round(m.ram_total_mb / 1024, 2)
+      else:
+        cpu_percent = psutil.cpu_percent()
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent
+        memory_used_gb = round(memory.used / (1024**3), 2)
+        memory_total_gb = round(memory.total / (1024**3), 2)
       uptime = time.time() - psutil.boot_time()
 
       # Format uptime
@@ -1441,9 +1458,9 @@ class ChatGPTAPI:
 
       return web.json_response({
         "cpu": cpu_percent,
-        "memory": memory.percent,
-        "memory_used_gb": round(memory.used / (1024**3), 2),
-        "memory_total_gb": round(memory.total / (1024**3), 2),
+        "memory": memory_percent,
+        "memory_used_gb": memory_used_gb,
+        "memory_total_gb": memory_total_gb,
         "uptime": uptime_str,
         "gpu": gpu_info_str,         # legacy string for old UI elements
         "gpu_name": gpu_name,        # structured — new UI
@@ -1451,6 +1468,9 @@ class ChatGPTAPI:
         "unified_memory": unified_memory,
         "gpu_utilization": gpu_utilization,
         "models_count": models_count,
+        "gpu_vram_used_mb": self.node._current_metrics.gpu_vram_used_mb if hasattr(self, "node") and self.node else 0,
+        "gpu_power_w": self.node._current_metrics.gpu_power_w if hasattr(self, "node") and self.node else 0,
+        "gpu_temp_c": self.node._current_metrics.gpu_temp_c if hasattr(self, "node") and self.node else 0,
       })
     except Exception as e:
       return web.json_response({"detail": str(e)}, status=500)
@@ -2531,16 +2551,10 @@ class ChatGPTAPI:
       except Exception:
         pass
 
-      strategy_name = "Manual / Unknown"
-      if topology and self.node.partitioning_strategy:
+      strategy_name = "LACP 3.0 (Multi-Resource + Latency Clustering)"
+      if topology and self.node.topology.nodes:
         try:
-          partitions = self.node.partitioning_strategy.partition(topology)
-          strategy_name = self.node.partitioning_strategy.__class__.__name__
-          # Đổi tên hiển thị cho đẹp
-          if "LargestRemainder" in strategy_name:
-            strategy_name = "LACP 2.0 (Largest Remainder)"
-          elif "LACP" in strategy_name:
-            strategy_name = "LACP 2.0 (Latency-Aware)"
+          partitions = self.node._compute_lacp_partition()
         except Exception:
           partitions = []
 

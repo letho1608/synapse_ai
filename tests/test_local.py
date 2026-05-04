@@ -19,7 +19,7 @@ synapse.DEBUG = 1
 from synapse.orchestration.node import Node
 from synapse.inference.inference_engine import get_inference_engine
 from synapse.inference.shard import Shard
-from synapse.topology.lacp_partitioning import LACPPartitioningStrategy
+
 from synapse.models import build_full_shard, get_repo
 from synapse.inference.tokenizers import resolve_tokenizer
 from synapse.loading import ShardDownloader
@@ -80,15 +80,13 @@ async def run_benchmark(model_name, prompt, max_tokens=50):
     
     # Discovery giả lập
     discovery = MockDiscovery("local-tester") 
-    partitioning_strategy = LACPPartitioningStrategy()
     
     node = Node(
         "local-tester",
         None, 
+        None,
         inference_engine,
-        discovery,
         shard_downloader,
-        partitioning_strategy=partitioning_strategy,
         max_generate_tokens=max_tokens
     )
     # Nhiệt độ vừa phải để giữ ổn định nhưng không bị cứng đầu ra.

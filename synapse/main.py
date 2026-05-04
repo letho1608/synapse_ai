@@ -13,7 +13,7 @@ from synapse.train.dataset import load_dataset, iterate_batches
 from synapse.orchestration.node import Node
 from synapse.routing import EventRouter
 from synapse.routing.libp2p_node import Libp2pNode
-from synapse.topology.largest_remainder import LargestRemainderPartitioningStrategy
+
 from synapse.api import ChatGPTAPI
 # REFACTORED IMPORTS
 from synapse.loading import ShardDownloader, RepoProgressEvent, create_local_model_loader, get_models_dir
@@ -118,9 +118,8 @@ event_router = EventRouter()
 libp2p_node = Libp2pNode(args.node_id, args.node_port or 5678, event_router)
 
 topology_viz = TopologyViz(chatgpt_api_endpoints=chatgpt_api_endpoints, web_chat_urls=web_chat_urls) if not args.disable_tui else None
-# Use LACP 2.0 partitioning strategy
-partitioning_strategy = LargestRemainderPartitioningStrategy()
-if DEBUG >= 1: print("Using LACP 2.0 (Largest Remainder) partitioning strategy")
+# LACP 3.0 multi-resource partitioning is built into Node via compute_partition()
+if DEBUG >= 1: print("Using LACP 3.0 (Multi-Resource + Latency Clustering) partitioning strategy")
 
 def create_peer_handle(node_id: str, address: str, desc: str, dev_caps: DeviceCapabilities):
     return P2PPeerHandle(node_id, address, desc, dev_caps, event_router, libp2p_node)
@@ -159,7 +158,6 @@ node = Node(
     libp2p_node,
     inference_engine,
     shard_downloader,
-    partitioning_strategy=partitioning_strategy,
     max_generate_tokens=args.max_generate_tokens,
     topology_viz=topology_viz,
     default_sample_temperature=args.default_temp

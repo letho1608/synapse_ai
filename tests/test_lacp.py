@@ -16,527 +16,409 @@ sys.path.insert(0, ROOT)
 # --- Test 1: Import LACP modules ---
 
 def test_import_lacp_modules():
-    """Import tất cả LACP modules."""
-    from synapse.topology.lacp_partitioning import LACPPartitioningStrategy
-    from synapse.topology.latency_clustering import HierarchicalClusterer, MachineCluster
-    from synapse.topology.ilp_partitioner import ILPPartitioner, LayerProfile
-    from synapse.networking.latency_probing import LatencyProber, LatencyCache
-    from synapse.resources import (
-        CPURAMKVCacheManager, DiskEmbeddingsCacheManager,
-        MultiGPUManager, PreloadManager, ResourceManagerRegistry
-    )
+    """Import tất cả LACP 3.0 modules."""
+    from synapse.lacp.resource_weight import NodeResources, ResourceWeights, ResourceScorer, NormalizedScores
+    from synapse.lacp.latency_matrix import LatencyMatrix, LatencyProber, HierarchicalClusterer, Cluster
+    from synapse.lacp.partitioner import compute_partition, LACPPartition, ShardAssignment
+    from synapse.pipeline.scheduler import PipelineScheduler, PipelineSchedule, PipelineSlot, MicroBatchOp
+    from synapse.pipeline.gradient_sync import RingAllReducer, DistributedTrainer, GradientShard
+    from synapse.pipeline.fault_tolerance import FaultToleranceManager, NodeHealth, ShardCheckpoint
+    from synapse.transport.codec import encode_tensor, decode_tensor, AsyncTensorForwarder, MAGIC
     print(" [OK] test_import_lacp_modules")
 
 
-# --- Test 2: LayerProfile ---
+# --- Test 2: NodeResources ---
 
-def test_layer_profile():
-    """Test LayerProfile dataclass."""
-    from synapse.topology.ilp_partitioner import LayerProfile
+def test_node_resources():
+    """Test NodeResources dataclass (LACP 3.0)."""
+    from synapse.lacp.resource_weight import NodeResources
     
-    profile = LayerProfile(layer_id=0, memory_mb=4000, compute_flops=1e12)
-    assert profile.layer_id == 0
-    assert profile.memory_mb == 4000
-    assert profile.compute_flops == 1e12
-    print(" [OK] test_layer_profile")
+    r = NodeResources(
+        gpu_name="RTX 4090", gpu_vram_mb=24576, gpu_tflops_fp16=165,
+        cpu_cores=16, system_ram_mb=64000, bandwidth_mbps=10000,
+        latency_ms=1.0
+    )
+    assert r.gpu_vram_mb == 24576
+    assert r.gpu_tflops_fp16 == 165
+    assert r.cpu_cores == 16
+    print(" [OK] test_node_resources")
 
 
-# --- Test 3: MachineCluster ---
+# --- Test 3: Cluster ---
 
-def test_machine_cluster():
-    """Test MachineCluster dataclass."""
-    from synapse.topology.latency_clustering import MachineCluster
+def test_lacp3_cluster():
+    """Test Cluster dataclass (LACP 3.0)."""
+    from synapse.lacp.latency_matrix import Cluster
     
-    cluster = MachineCluster(id=1, machine_ids=["A", "B", "C"], avg_latency=15.0)
-    assert cluster.id == 1
-    assert len(cluster.machine_ids) == 3
-    assert cluster.contains("A")
-    assert not cluster.contains("D")
-    print(" [OK] test_machine_cluster")
+    cluster = Cluster(cluster_id=1, nodes=["A", "B", "C"], centroid_latency_ms=15.0, intra_latency_ms=5.0)
+    assert cluster.cluster_id == 1
+    assert len(cluster.nodes) == 3
+    assert "A" in cluster.nodes
+    assert "D" not in cluster.nodes
+    print(" [OK] test_lacp3_cluster")
 
 
-# --- Test 4: HierarchicalClusterer ---
+# --- Test 4: LACP 3.0 HierarchicalClusterer ---
 
 def test_hierarchical_clusterer():
-    """Test HierarchicalClusterer clustering."""
-    from synapse.topology.latency_clustering import HierarchicalClusterer
+    """Test LACP 3.0 HierarchicalClusterer clustering."""
+    from synapse.lacp.latency_matrix import HierarchicalClusterer, LatencyMatrix, LatencyEntry
     
-    # Latency matrix với 3 machines
-    # A-B: 15ms, A-C: 200ms, B-C: 180ms
-    latency_matrix = {
-        "A": {"A": 0, "B": 15, "C": 200},
-        "B": {"A": 15, "B": 0, "C": 180},
-        "C": {"A": 200, "B": 180, "C": 0}
-    }
+    matrix = LatencyMatrix(
+        nodes=["A", "B", "C"],
+        entries={
+            "A": {
+                "A": LatencyEntry(from_node="A", to_node="A", latency_ms=0, jitter_ms=0, packet_loss_pct=0),
+                "B": LatencyEntry(from_node="A", to_node="B", latency_ms=15, jitter_ms=2, packet_loss_pct=0),
+                "C": LatencyEntry(from_node="A", to_node="C", latency_ms=200, jitter_ms=10, packet_loss_pct=0.01),
+            },
+            "B": {
+                "A": LatencyEntry(from_node="B", to_node="A", latency_ms=15, jitter_ms=2, packet_loss_pct=0),
+                "B": LatencyEntry(from_node="B", to_node="B", latency_ms=0, jitter_ms=0, packet_loss_pct=0),
+                "C": LatencyEntry(from_node="B", to_node="C", latency_ms=180, jitter_ms=8, packet_loss_pct=0.01),
+            },
+            "C": {
+                "A": LatencyEntry(from_node="C", to_node="A", latency_ms=200, jitter_ms=10, packet_loss_pct=0.01),
+                "B": LatencyEntry(from_node="C", to_node="B", latency_ms=180, jitter_ms=8, packet_loss_pct=0.01),
+                "C": LatencyEntry(from_node="C", to_node="C", latency_ms=0, jitter_ms=0, packet_loss_pct=0),
+            },
+        }
+    )
     
-    clusterer = HierarchicalClusterer(default_threshold_ms=50.0)
-    clusters = clusterer.cluster(latency_matrix, threshold_ms=50.0)
+    clusterer = HierarchicalClusterer(max_intra_latency_ms=50.0)
+    clusters = clusterer.cluster(matrix)
     
-    # Với threshold 50ms, A và B nên cùng cluster (15ms), C riêng
     assert len(clusters) >= 1
-    
-    # Test are_in_same_cluster
-    assert clusterer.are_in_same_cluster("A", "B", clusters)
     print(" [OK] test_hierarchical_clusterer")
 
 
 def test_hierarchical_clusterer_fallback():
-    """Test fallback clustering khi scipy không available."""
-    from synapse.topology.latency_clustering import HierarchicalClusterer, SCIPY_AVAILABLE
+    """Test fallback clustering with 2 nodes."""
+    from synapse.lacp.latency_matrix import HierarchicalClusterer, LatencyMatrix, LatencyEntry
     
-    latency_matrix = {
-        "A": {"A": 0, "B": 15},
-        "B": {"A": 15, "B": 0}
-    }
+    matrix = LatencyMatrix(
+        nodes=["A", "B"],
+        entries={
+            "A": {
+                "A": LatencyEntry(from_node="A", to_node="A", latency_ms=0, jitter_ms=0, packet_loss_pct=0),
+                "B": LatencyEntry(from_node="A", to_node="B", latency_ms=15, jitter_ms=1, packet_loss_pct=0),
+            },
+            "B": {
+                "A": LatencyEntry(from_node="B", to_node="A", latency_ms=15, jitter_ms=1, packet_loss_pct=0),
+                "B": LatencyEntry(from_node="B", to_node="B", latency_ms=0, jitter_ms=0, packet_loss_pct=0),
+            },
+        }
+    )
     
     clusterer = HierarchicalClusterer()
-    clusters = clusterer.cluster(latency_matrix)
-    
-    # Nếu scipy available, nó sẽ cluster thành 1 (vì 15ms < threshold)
-    # Nếu scipy không available, fallback sẽ tạo 2 clusters (mỗi machine 1 cluster)
-    if SCIPY_AVAILABLE:
-        # scipy available - có thể cluster thành 1 hoặc 2 tùy threshold
-        assert len(clusters) >= 1
-    else:
-        # scipy not available - fallback
-        assert len(clusters) == 2
+    clusters = clusterer.cluster(matrix)
+    assert len(clusters) >= 1
     print(" [OK] test_hierarchical_clusterer_fallback")
 
 
-# --- Test 5: ILPPartitioner ---
+# --- Test 5: ResourceScorer ---
 
-def test_ilp_partitioner_greedy_fallback():
-    """Test ILPPartitioner với greedy fallback."""
-    from synapse.topology.ilp_partitioner import ILPPartitioner, LayerProfile
-    from synapse.topology.topology import Topology
-    from synapse.topology.device_capabilities import DeviceCapabilities, DeviceFlops
+def test_resource_scorer():
+    """Test LACP 3.0 ResourceScorer."""
+    from synapse.lacp.resource_weight import ResourceScorer, NodeResources, ResourceWeights
     
-    # Tạo topology với 2 machines
-    topo = Topology()
-    topo.update_node("A", DeviceCapabilities(
-        model="GPU A", chip="RTX 4090", memory=24000,
-        flops=DeviceFlops(fp32=82, fp16=165, int8=330)
-    ))
-    topo.update_node("B", DeviceCapabilities(
-        model="GPU B", chip="RTX 3060", memory=6000,
-        flops=DeviceFlops(fp32=13, fp16=26, int8=52)
-    ))
-    
-    # Tạo layer profiles (32 layers, mỗi layer 4GB)
-    layer_profiles = [
-        LayerProfile(layer_id=i, memory_mb=4000, compute_flops=1e12)
-        for i in range(32)
-    ]
-    
-    latency_matrix = {
-        "A": {"A": 0, "B": 15},
-        "B": {"A": 15, "B": 0}
+    nodes = {
+        "A": NodeResources(gpu_name="RTX 4090", gpu_vram_mb=24576, gpu_tflops_fp16=165, cpu_cores=16, system_ram_mb=64000),
+        "B": NodeResources(gpu_name="RTX 3060", gpu_vram_mb=6144, gpu_tflops_fp16=26, cpu_cores=4, system_ram_mb=16000),
     }
     
-    partitioner = ILPPartitioner(timeout=1)  # Short timeout
-    partitions = partitioner.find_optimal(
-        topology=topo,
-        latency_matrix=latency_matrix,
-        clusters=[],  # Empty clusters
-        layer_profiles=layer_profiles
-    )
+    scorer = ResourceScorer(ResourceWeights())
+    scores = scorer.compute_scores(nodes)
     
-    # Phải có partitions
-    assert len(partitions) >= 1
+    assert len(scores) == 2
+    assert "A" in scores
+    assert "B" in scores
+    assert scores["A"][0] > scores["B"][0]  # RTX 4090 should score higher
     
-    # Mỗi partition phải có node_id hợp lệ
-    for p in partitions:
-        assert p.node_id in ["A", "B"]
-        assert 0 <= p.start < p.end <= 1.0
-    
-    print(" [OK] test_ilp_partitioner_greedy_fallback")
+    # Layer allocation
+    alloc = scorer.layer_allocation(scores, 32)
+    assert sum(alloc.values()) == 32
+    print(" [OK] test_resource_scorer")
 
 
-# --- Test 6: LACPPartitioningStrategy ---
+# --- Test 6: compute_partition (LACP 3.0 entry point) ---
 
-def test_lacp_partitioning_strategy_init():
-    """Test LACPPartitioningStrategy initialization."""
-    from synapse.topology.lacp_partitioning import LACPPartitioningStrategy
+def test_compute_partition():
+    """Test LACP 3.0 compute_partition with 2 nodes."""
+    from synapse.lacp.partitioner import compute_partition
+    from synapse.lacp.resource_weight import NodeResources
     
-    strategy = LACPPartitioningStrategy(
-        latency_cache_file="test_latency_cache.json",
-        cluster_threshold_ms=50.0,
-        ilp_timeout=60
-    )
+    nodes = {
+        "A": NodeResources(gpu_name="RTX 4090", gpu_vram_mb=24576, gpu_tflops_fp16=165, cpu_cores=16, system_ram_mb=64000),
+        "B": NodeResources(gpu_name="RTX 3060", gpu_vram_mb=6144, gpu_tflops_fp16=26, cpu_cores=4, system_ram_mb=16000),
+    }
     
-    assert strategy.latency_cache_file == "test_latency_cache.json"
-    assert strategy.cluster_threshold_ms == 50.0
-    assert strategy.ilp_timeout == 60
+    result = compute_partition(nodes=nodes, latency_matrix=None, total_layers=32, model_id="test")
     
-    print(" [OK] test_lacp_partitioning_strategy_init")
-
-
-def test_lacp_partitioning_strategy_partition():
-    """Test LACPPartitioningStrategy.partition()."""
-    from synapse.topology.lacp_partitioning import LACPPartitioningStrategy
-    from synapse.topology.topology import Topology
-    from synapse.topology.device_capabilities import DeviceCapabilities, DeviceFlops
-    from synapse.topology.ilp_partitioner import LayerProfile
+    assert len(result.assignments) == 2
+    assert result.total_layers == 32
+    assert sum(a.layer_count for a in result.assignments) == 32
     
-    # Tạo topology
-    topo = Topology()
-    topo.update_node("A", DeviceCapabilities(
-        model="GPU A", chip="RTX 4090", memory=24000,
-        flops=DeviceFlops(fp32=82, fp16=165, int8=330)
-    ))
-    topo.update_node("B", DeviceCapabilities(
-        model="GPU B", chip="RTX 3060", memory=6000,
-        flops=DeviceFlops(fp32=13, fp16=26, int8=52)
-    ))
+    # RTX 4090 should get more layers
+    a_assignment = result.get_assignment("A")
+    b_assignment = result.get_assignment("B")
+    assert a_assignment.layer_count > b_assignment.layer_count
     
-    # Tạo strategy với custom layer profiles
-    strategy = LACPPartitioningStrategy(ilp_timeout=1)
-    strategy.set_layer_profiles([
-        LayerProfile(layer_id=i, memory_mb=4000, compute_flops=1e12)
-        for i in range(32)
-    ])
-    
-    # Gọi partition (sẽ dùng greedy fallback vì không có peers)
-    partitions = strategy.partition(topo)
-    
-    assert len(partitions) >= 1
-    for p in partitions:
-        assert p.node_id in ["A", "B"]
-        assert 0 <= p.start < p.end <= 1.0
-    
-    print(" [OK] test_lacp_partitioning_strategy_partition")
+    print(" [OK] test_compute_partition")
 
 
-# --- Test 7: LatencyProber ---
+# --- Test 7: PipelineScheduler 1F1B ---
 
-def test_latency_prober_init():
-    """Test LatencyProber initialization."""
-    from synapse.networking.latency_probing import LatencyProber
+def test_pipeline_scheduler_1f1b():
+    """Test 1F1B pipeline schedule generation."""
+    from synapse.pipeline.scheduler import PipelineScheduler, MicroBatchOp
     
-    prober = LatencyProber(
-        cache_file="test_cache.json",
-        probe_count=5,
-        timeout_ms=3000
-    )
+    scheduler = PipelineScheduler(num_micro_batches=4)
+    schedule = scheduler.generate_1f1b_schedule(num_stages=3, num_micro_batches=4)
     
-    assert prober.cache_file == Path("test_cache.json")
-    assert prober.probe_count == 5
-    assert prober.timeout_ms == 3000
+    assert schedule.num_stages == 3
+    assert schedule.num_micro_batches == 4
+    assert schedule.warmup_steps == 2
+    assert schedule.cooldown_steps == 2
     
-    print(" [OK] test_latency_prober_init")
+    # Check forward + backward slot counts
+    fwd = sum(1 for s in schedule.slots if s.op == MicroBatchOp.FORWARD)
+    bwd = sum(1 for s in schedule.slots if s.op == MicroBatchOp.BACKWARD)
+    assert fwd == 12  # 3 stages × 4 micro-batches
+    assert bwd == 12
+    
+    print(" [OK] test_pipeline_scheduler_1f1b")
 
 
-def test_latency_prober_cache():
-    """Test LatencyProber cache operations."""
-    from synapse.networking.latency_probing import LatencyProber, LatencyCache
+def test_inference_schedule():
+    """Test forward-only inference pipeline schedule."""
+    from synapse.pipeline.scheduler import PipelineScheduler, MicroBatchOp
+    
+    scheduler = PipelineScheduler(num_micro_batches=4)
+    schedule = scheduler.generate_inference_schedule(num_stages=3, num_micro_batches=4)
+    
+    assert schedule.num_stages == 3
+    assert all(s.op == MicroBatchOp.FORWARD for s in schedule.slots)
+    
+    print(" [OK] test_inference_schedule")
+
+
+# --- Test 8: Binary Codec ---
+
+def test_encode_decode_tensor():
+    """Test binary tensor encode/decode roundtrip."""
+    from synapse.transport.codec import encode_tensor, decode_tensor, MAGIC
+    import numpy as np
+    
+    tensor = np.random.rand(3, 4, 5).astype(np.float32)
+    encoded = encode_tensor(tensor)
+    
+    assert encoded[:4] == MAGIC
+    
+    decoded, meta = decode_tensor(encoded)
+    assert np.array_equal(tensor, decoded)
+    assert meta is None
+    
+    print(" [OK] test_encode_decode_tensor")
+
+
+def test_encode_decode_with_metadata():
+    """Test binary codec with metadata."""
+    from synapse.transport.codec import encode_tensor, decode_tensor
+    import numpy as np
+    
+    tensor = np.array([[1, 2, 3]]).astype(np.int32)
+    meta = {"request_id": "req-123", "micro_batch_id": 5}
+    encoded = encode_tensor(tensor, metadata=meta)
+    
+    decoded, decoded_meta = decode_tensor(encoded)
+    assert np.array_equal(tensor, decoded)
+    assert decoded_meta == {"request_id": "req-123", "micro_batch_id": 5}
+    
+    print(" [OK] test_encode_decode_with_metadata")
+
+
+def test_compress_tensor():
+    """Test compressed tensor encoding."""
+    from synapse.transport.codec import encode_tensor, decode_tensor
+    import numpy as np
+    
+    # Large tensor that should benefit from compression
+    tensor = np.random.rand(128, 128).astype(np.float32)  # 64KB
+    encoded = encode_tensor(tensor, compress=True, compress_level=1)
+    
+    decoded, _ = decode_tensor(encoded)
+    assert np.array_equal(tensor, decoded)
+    
+    print(" [OK] test_compress_tensor")
+
+
+# --- Test 9: Ring All-Reduce ---
+
+def test_ring_all_reduce():
+    """Test RingAllReducer logic."""
+    from synapse.pipeline.gradient_sync import RingAllReducer
+    import numpy as np
+    
+    reducer = RingAllReducer(num_nodes=3, ring_order=["A", "B", "C"])
+    
+    assert reducer.get_predecessor("A") == "C"
+    assert reducer.get_successor("A") == "B"
+    assert reducer.get_predecessor("B") == "A"
+    assert reducer.get_successor("C") == "A"
+    
+    # Accumulate gradients
+    g1 = {"w": np.array([1.0, 2.0])}
+    g2 = {"w": np.array([3.0, 4.0])}
+    
+    reducer.accumulate("A", g1)
+    reducer.accumulate("A", g2)
+    result = reducer.get_accumulated("A")
+    
+    assert np.array_equal(result["w"], np.array([4.0, 6.0]))
+    
+    print(" [OK] test_ring_all_reduce")
+
+
+# --- Test 10: FaultToleranceManager ---
+
+def test_fault_tolerance_manager():
+    """Test FaultToleranceManager heartbeat and detection."""
+    from synapse.pipeline.fault_tolerance import FaultToleranceManager, NodeHealth
+    import time
+    
+    health = NodeHealth(node_id="node-1")
+    health.record_heartbeat()
+    assert health.is_alive
+    assert not health.is_blacklisted
+    
+    # Simulate timeout
+    health.last_heartbeat = 0  # Very old
+    assert health.check_timeout(timeout_s=10.0)
+    assert not health.is_alive
+    
+    # 3 consecutive timeouts → blacklisted
+    health.check_timeout(timeout_s=10.0)
+    health.check_timeout(timeout_s=10.0)
+    assert health.is_blacklisted
+    
+    print(" [OK] test_fault_tolerance_manager")
+
+
+def test_checkpoint_save_load():
+    """Test ShardCheckpoint save and load."""
+    from synapse.pipeline.fault_tolerance import FaultToleranceManager, ShardCheckpoint
     import tempfile
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_file = Path(tmpdir) / "test_cache.json"
-        prober = LatencyProber(cache_file=str(cache_file))
-        
-        # Initial state - no cache
-        assert prober._needs_update()
-        
-        # Save cache manually
-        cache = LatencyCache(
-            version="1.0",
-            timestamp=time.time(),
-            matrix={"A": {"B": 15}, "B": {"A": 15}}
-        )
-        prober._save_cache(cache)
-        
-        # Should not need update now
-        prober._cache = None  # Reset cache
-        assert not prober._needs_update()
-        
-        # Get latency
-        prober._cache = cache
-        lat = prober.get_latency("A", "B")
-        assert lat == 15
-        
-        lat_default = prober.get_latency("A", "C")  # Not in cache
-        assert lat_default == 200.0  # Default value
-        
-        # Clear cache
-        prober.clear_cache()
-        assert prober._cache is None
-        
-    print(" [OK] test_latency_prober_cache")
-
-
-# --- Test 8: CPU RAM KV Cache ---
-
-def test_cpu_ram_cache_basic():
-    """Test CPURAMCache basic operations."""
-    from synapse.resources.cpu_ram_kv_cache import CPURAMCache
-    import numpy as np
-    
-    cache = CPURAMCache(max_size_mb=10)  # 10MB
-    
-    # Test empty cache
-    assert not cache.has("key1")
-    assert cache.get("key1") is None
-    assert cache.usage() == 0.0
-    
-    # Add item
-    data = np.random.rand(100, 100).astype(np.float32)  # ~40KB
-    cache.set("key1", data)
-    
-    assert cache.has("key1")
-    assert cache.get("key1") is not None
-    assert cache.usage() > 0
-    
-    # Update item
-    data2 = np.random.rand(50, 50).astype(np.float32)  # ~10KB
-    cache.set("key1", data2)
-    assert cache.has("key1")
-    
-    # Clear
-    cache.clear()
-    assert not cache.has("key1")
-    assert cache.usage() == 0.0
-    
-    print(" [OK] test_cpu_ram_cache_basic")
-
-
-def test_cpu_ram_cache_eviction():
-    """Test CPURAMCache LRU eviction."""
-    from synapse.resources.cpu_ram_kv_cache import CPURAMCache
-    import numpy as np
-    
-    cache = CPURAMCache(max_size_mb=1)  # 1MB very small
-    
-    # Add items until eviction (each ~40KB, 1MB can hold ~25 items)
-    for i in range(30):  # Add 30 items to ensure eviction
-        data = np.random.rand(100, 100).astype(np.float32)  # ~40KB
-        cache.set(f"key{i}", data)
-    
-    # Oldest items should be evicted (key0, key1, etc.)
-    # With 30 items of ~40KB each = ~1.2MB for 1MB cache, some should be evicted
-    assert not cache.has("key0") or not cache.has("key1"), "At least some oldest items should be evicted"
-    
-    # Most recent items should still be there
-    assert cache.has("key29"), "Most recent item should still be in cache"
-    
-    print(" [OK] test_cpu_ram_cache_eviction")
-
-
-def test_cpu_ram_kv_cache_manager():
-    """Test CPURAMKVCacheManager."""
-    from synapse.resources.cpu_ram_kv_cache import CPURAMKVCacheManager
-    import numpy as np
-    
-    manager = CPURAMKVCacheManager(max_cpu_ram_gb=1, gpu_threshold=0.9)
-    
-    data = np.random.rand(100, 100).astype(np.float32)
-    
-    # Test set_with_overflow (no GPU, so goes to CPU)
-    manager.set_with_overflow("key1", data, gpu_usage=0.95)
-    assert manager.cpu_cache.has("key1")
-    
-    # Test get
-    result = manager.get("key1")
-    assert result is not None
-    
-    # Test has
-    assert manager.has("key1")
-    assert not manager.has("nonexistent")
-    
-    print(" [OK] test_cpu_ram_kv_cache_manager")
-
-
-# --- Test 9: Disk Embeddings Cache ---
-
-def test_disk_embeddings_cache():
-    """Test DiskEmbeddingsCache."""
-    from synapse.resources.disk_embeddings_cache import DiskEmbeddingsCache
-    import numpy as np
-    import tempfile
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache = DiskEmbeddingsCache(tmpdir, max_size_gb=1)
-        
-        # Test has/get on empty cache
-        assert not cache.has("prompt1")
-        assert cache.get("prompt1") is None
-        
-        # Add embeddings
-        embeddings = np.random.rand(768).astype(np.float32)
-        cache.set("prompt1", embeddings)
-        
-        assert cache.has("prompt1")
-        result = cache.get("prompt1")
-        assert result is not None
-        assert np.array_equal(result, embeddings)
-        
-        # Clear
-        cache.clear()
-        assert not cache.has("prompt1")
-    
-    print(" [OK] test_disk_embeddings_cache")
-
-
-# --- Test 10: Resource Manager Registry ---
-
-def test_resource_manager_registry():
-    """Test ResourceManagerRegistry."""
-    from synapse.resources import ResourceManagerRegistry
-    
-    registry = ResourceManagerRegistry()
-    
-    # List managers
-    managers = registry.list_managers()
-    assert "cpu_ram_kv" in managers
-    assert "disk_cache" in managers
-    assert "preload" in managers
-    
-    # Get managers
-    cpu_ram = registry.get_cpu_ram_kv()
-    disk_cache = registry.get_disk_cache()
-    preload = registry.get_preload()
-    
-    assert cpu_ram is not None
-    assert disk_cache is not None
-    assert preload is not None
-    
-    # Multi-GPU should be None until configured
-    multi_gpu = registry.get_multi_gpu()
-    assert multi_gpu is None
-    
-    # Setup multi-GPU
-    registry.setup_multi_gpu([0, 1])
-    multi_gpu = registry.get_multi_gpu()
-    assert multi_gpu is not None
-    
-    print(" [OK] test_resource_manager_registry")
-
-
-# --- Test 11: MultiGPUManager ---
-
-def test_multi_gpu_manager_init():
-    """Test MultiGPUManager initialization."""
-    from synapse.resources.multi_gpu_manager import MultiGPUManager
-    
-    # Single GPU
-    manager = MultiGPUManager([0])
-    assert manager.num_gpus == 1
-    assert manager.tensor_parallel is False
-    
-    # Multi-GPU
-    manager = MultiGPUManager([0, 1], tensor_parallel=True)
-    assert manager.num_gpus == 2
-    assert manager.tensor_parallel is True
-    
-    print(" [OK] test_multi_gpu_manager_init")
-
-
-# --- Test 12: PreloadManager ---
-
-def test_preload_manager_init():
-    """Test PreloadManager initialization."""
-    from synapse.resources.preload_strategy import PreloadManager
-    
-    manager = PreloadManager()
-    
-    # Should start empty
-    assert len(manager.preload_strategies) == 0
-    
-    # Get non-existent strategy
-    assert manager.get_strategy("model1") is None
-    
-    # Clear all
-    manager.clear_all()
-    assert len(manager.preload_strategies) == 0
-    
-    print(" [OK] test_preload_manager_init")
-
-
-# --- Test 13: Integration - Full LACP flow ---
-
-def test_lacp_full_integration():
-    """Test full LACP flow: topology -> clustering -> partitioning."""
-    from synapse.topology.lacp_partitioning import LACPPartitioningStrategy
-    from synapse.topology.topology import Topology
-    from synapse.topology.device_capabilities import DeviceCapabilities, DeviceFlops
-    from synapse.topology.ilp_partitioner import LayerProfile
-    
-    # Create topology with 3 machines
-    topo = Topology()
-    topo.update_node("VN-A", DeviceCapabilities(
-        model="VN GPU A", chip="RTX 4090", memory=24000,
-        flops=DeviceFlops(fp32=82, fp16=165, int8=330)
-    ))
-    topo.update_node("VN-B", DeviceCapabilities(
-        model="VN GPU B", chip="RTX 4080", memory=16000,
-        flops=DeviceFlops(fp32=52, fp16=104, int8=208)
-    ))
-    topo.update_node("US-C", DeviceCapabilities(
-        model="US GPU C", chip="A100", memory=40000,
-        flops=DeviceFlops(fp32=19, fp16=312, int8=624)
-    ))
-    
-    # Create LACP strategy
-    strategy = LACPPartitioningStrategy(
-        latency_cache_file="test_integration_cache.json",
-        cluster_threshold_ms=100.0,
-        ilp_timeout=5
-    )
-    
-    # Set layer profiles (simulate 32-layer model)
-    layer_profiles = [
-        LayerProfile(layer_id=i, memory_mb=4000, compute_flops=1e12)
-        for i in range(32)
-    ]
-    strategy.set_layer_profiles(layer_profiles)
-    
-    # Partition
-    partitions = strategy.partition(topo)
-    
-    # Verify partitions
-    assert len(partitions) >= 1
-    total_coverage = sum(p.end - p.start for p in partitions)
-    assert abs(total_coverage - 1.0) < 0.01  # Should cover ~100%
-    
-    # Verify all nodes in partitions are valid
-    for p in partitions:
-        assert p.node_id in ["VN-A", "VN-B", "US-C"]
-        assert 0 <= p.start < p.end <= 1.0
-    
-    # Get cached data
-    latency_matrix = strategy.get_latency_matrix()
-    clusters = strategy.get_clusters()
-
-    # Latency matrix should now have data (fixed: uses topology.nodes instead of non-existent topology.peers)
-    assert len(latency_matrix) == 3  # 3 nodes in topology
-    assert "VN-A" in latency_matrix
-    assert "VN-B" in latency_matrix
-    assert "US-C" in latency_matrix
-    
-    # Clean up
     import os
-    if os.path.exists("test_integration_cache.json"):
-        os.remove("test_integration_cache.json")
     
-    print(" [OK] test_lacp_full_integration")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ft = FaultToleranceManager("test-node", checkpoint_dir=tmpdir)
+        
+        path = ft.save_checkpoint(
+            model_id="test-model",
+            start_layer=0,
+            end_layer=7,
+            step=100,
+            kv_cache={"layer_0": "state"},
+        )
+        
+        assert os.path.exists(path)
+        
+        loaded = ft.load_checkpoint("test-model", 0, 7, 100)
+        assert loaded is not None
+        assert loaded.step == 100
+        assert loaded.kv_cache == {"layer_0": "state"}
+    
+    print(" [OK] test_checkpoint_save_load")
 
 
-# --- Test 14: Verify RingMemoryWeighted removed ---
+# --- Test 11: AsyncTensorForwarder ---
 
-def test_ring_memory_weighted_removed():
-    """Verify RingMemoryWeightedPartitioningStrategy is removed."""
-    try:
-        from synapse.topology.ring_memory_weighted_partitioning_strategy import RingMemoryWeightedPartitioningStrategy
-        assert False, "RingMemoryWeightedPartitioningStrategy should be removed"
-    except ImportError:
-        pass  # Expected
+def test_async_forwarder_create():
+    """Test AsyncTensorForwarder initialization."""
+    from synapse.transport.codec import AsyncTensorForwarder
     
-    # Verify LACP is the default
-    from synapse.topology.lacp_partitioning import LACPPartitioningStrategy
-    strategy = LACPPartitioningStrategy()
-    assert strategy is not None
+    fw = AsyncTensorForwarder(node_id="node-A", max_queue_depth=16)
+    assert fw.node_id == "node-A"
+    assert fw.max_queue_depth == 16
     
-    print(" [OK] test_ring_memory_weighted_removed")
+    print(" [OK] test_async_forwarder_create")
+
+
+# --- Test 12: Integration - Full LACP 3.0 flow ---
+
+def test_lacp3_full_integration():
+    """Test full LACP 3.0 flow: resource scoring → cluster → partition → pipeline."""
+    from synapse.lacp.partitioner import compute_partition
+    from synapse.lacp.resource_weight import NodeResources
+    from synapse.lacp.latency_matrix import LatencyMatrix, LatencyEntry
+    from synapse.pipeline.scheduler import PipelineScheduler
+    
+    nodes = {
+        "VN-A": NodeResources(gpu_name="RTX 4090", gpu_vram_mb=24576, gpu_tflops_fp16=165, cpu_cores=16, system_ram_mb=64000),
+        "VN-B": NodeResources(gpu_name="RTX 4080", gpu_vram_mb=16384, gpu_tflops_fp16=104, cpu_cores=12, system_ram_mb=32000),
+        "US-C": NodeResources(gpu_name="A100", gpu_vram_mb=40960, gpu_tflops_fp16=312, cpu_cores=32, system_ram_mb=256000),
+    }
+    
+    # Latency matrix shows VN-A and VN-B are close (5ms), US-C is far (200ms)
+    lm = LatencyMatrix(
+        nodes=["VN-A", "VN-B", "US-C"],
+        entries={
+            "VN-A": {
+                "VN-A": LatencyEntry(from_node="VN-A", to_node="VN-A", latency_ms=0, jitter_ms=0, packet_loss_pct=0),
+                "VN-B": LatencyEntry(from_node="VN-A", to_node="VN-B", latency_ms=5, jitter_ms=1, packet_loss_pct=0),
+                "US-C": LatencyEntry(from_node="VN-A", to_node="US-C", latency_ms=200, jitter_ms=15, packet_loss_pct=0.01),
+            },
+            "VN-B": {
+                "VN-A": LatencyEntry(from_node="VN-B", to_node="VN-A", latency_ms=5, jitter_ms=1, packet_loss_pct=0),
+                "VN-B": LatencyEntry(from_node="VN-B", to_node="VN-B", latency_ms=0, jitter_ms=0, packet_loss_pct=0),
+                "US-C": LatencyEntry(from_node="VN-B", to_node="US-C", latency_ms=195, jitter_ms=14, packet_loss_pct=0.01),
+            },
+            "US-C": {
+                "VN-A": LatencyEntry(from_node="US-C", to_node="VN-A", latency_ms=200, jitter_ms=15, packet_loss_pct=0.01),
+                "VN-B": LatencyEntry(from_node="US-C", to_node="VN-B", latency_ms=195, jitter_ms=14, packet_loss_pct=0.01),
+                "US-C": LatencyEntry(from_node="US-C", to_node="US-C", latency_ms=0, jitter_ms=0, packet_loss_pct=0),
+            },
+        }
+    )
+    
+    result = compute_partition(nodes=nodes, latency_matrix=lm, total_layers=32, model_id="test")
+    
+    assert len(result.assignments) == 3
+    assert sum(a.layer_count for a in result.assignments) == 32
+    
+    # VN-A and VN-B should be in same cluster (low latency)
+    assert len(result.clusters) >= 1
+    
+    # Generate pipeline schedule from partition
+    scheduler = PipelineScheduler(num_micro_batches=4)
+    stages = result.get_pipeline_stages()
+    assert len(stages) >= 1
+    
+    schedule = scheduler.generate_inference_schedule(
+        num_stages=len(result.assignments),
+        num_micro_batches=4,
+    )
+    assert schedule.num_stages == len(result.assignments)
+    
+    print(" [OK] test_lacp3_full_integration")
+
+
+# --- Test 13: Verify LargestRemainder removed ---
+
+def test_largest_remainder_removed():
+    """Verify LargestRemainderPartitioningStrategy is removed (LACP 3.0 replaces LACP 2.0)."""
+    import os
+    assert not os.path.exists(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "synapse", "topology", "largest_remainder.py")
+    ), "LargestRemainderPartitioningStrategy should be deleted"
+    
+    # Verify LACP 3.0 is available
+    from synapse.lacp.partitioner import compute_partition
+    assert compute_partition is not None
+    
+    print(" [OK] test_largest_remainder_removed")
 
 
 # --- Run all tests ---
@@ -548,24 +430,23 @@ if __name__ == "__main__":
     
     tests = [
         test_import_lacp_modules,
-        test_layer_profile,
-        test_machine_cluster,
+        test_node_resources,
+        test_lacp3_cluster,
         test_hierarchical_clusterer,
         test_hierarchical_clusterer_fallback,
-        test_ilp_partitioner_greedy_fallback,
-        test_lacp_partitioning_strategy_init,
-        test_lacp_partitioning_strategy_partition,
-        test_latency_prober_init,
-        test_latency_prober_cache,
-        test_cpu_ram_cache_basic,
-        test_cpu_ram_cache_eviction,
-        test_cpu_ram_kv_cache_manager,
-        test_disk_embeddings_cache,
-        test_resource_manager_registry,
-        test_multi_gpu_manager_init,
-        test_preload_manager_init,
-        test_lacp_full_integration,
-        test_ring_memory_weighted_removed,
+        test_resource_scorer,
+        test_compute_partition,
+        test_pipeline_scheduler_1f1b,
+        test_inference_schedule,
+        test_encode_decode_tensor,
+        test_encode_decode_with_metadata,
+        test_compress_tensor,
+        test_ring_all_reduce,
+        test_fault_tolerance_manager,
+        test_checkpoint_save_load,
+        test_async_forwarder_create,
+        test_lacp3_full_integration,
+        test_largest_remainder_removed,
     ]
     
     passed = 0

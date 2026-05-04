@@ -3,13 +3,16 @@ import json
 import asyncio
 import uuid
 import time
+import os
 import traceback
 from typing import List, Dict, Optional, Tuple, Union, Set, Any
+from loguru import logger
 from synapse.inference.inference_engine import InferenceEngine, Shard, get_inference_engine
 from synapse.topology.topology import Topology
 from synapse.topology.device_capabilities import device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
-from synapse.topology.partitioning_strategy import Partition, PartitioningStrategy, map_partitions_to_shards
-from synapse.topology.largest_remainder import LargestRemainderPartitioningStrategy
+from synapse.topology.partitioning_strategy import Partition, map_partitions_to_shards
+from synapse.lacp.partitioner import compute_partition, LACPPartition, ShardAssignment
+from synapse.lacp.resource_weight import NodeResources
 from synapse import DEBUG
 from synapse.helpers import AsyncCallbackSystem
 from synapse.loading import RepoProgressEvent
@@ -18,6 +21,7 @@ from synapse.routing import EventRouter, Event
 from synapse.routing.libp2p_node import Libp2pNode
 from synapse.orchestration.election import ElectionManager
 from synapse.networking.peer_handle import PeerHandle
+from synapse.monitoring.realtime import RealtimeMonitor, NodeMetrics
 
 class Node:
   def __init__(
@@ -27,7 +31,6 @@ class Node:
     libp2p_node: Libp2pNode,
     inference_engine: InferenceEngine,
     shard_downloader: ShardDownloader,
-    partitioning_strategy: PartitioningStrategy = None,
     max_generate_tokens: int = 1024,
     default_sample_temperature: float = 0.0,
     max_concurrent_requests: int = 32,
@@ -38,12 +41,17 @@ class Node:
     self.event_router = event_router
     self.libp2p_node = libp2p_node
     self.shard_downloader = shard_downloader
-    self.partitioning_strategy = partitioning_strategy or LargestRemainderPartitioningStrategy()
     self.topology: Topology = Topology()
     self.device_capabilities = UNKNOWN_DEVICE_CAPABILITIES
     
     # Initialize Election Manager
     self.election_manager = ElectionManager(self.id, self.event_router)
+
+    # LACP 3.0 Distributed Pipeline Extension
+    self._distributed_pipeline = None
+
+    # LACP 3.0 Fault Tolerance Manager
+    self.fault_tolerance = None
 
     self.buffered_token_output: Dict[str, Tuple[List[int], bool]] = {}
     self._prompt_token_ids: Dict[str, np.ndarray] = {}
@@ -62,21 +70,55 @@ class Node:
     self.event_router.subscribe("synapse/cluster/status", self.on_p2p_status)
     self.event_router.subscribe(f"synapse/inference/tensor/{self.id}", self.on_p2p_tensor)
     self.event_router.subscribe(f"synapse/inference/prompt/{self.id}", self.on_p2p_prompt)
+    # CRITICAL FIX: Subscribe to BOTH request_id and node_id result topics.
+    # The last-layer node publishes to result/{self.id}, but also
+    # publishes to result/{orchestrator_id}. We need to listen on our own ID
+    # to receive results when WE are the orchestrator.
     self.event_router.subscribe(f"synapse/inference/result/{self.id}", self.on_p2p_result)
+    # CRITICAL FIX: Subscribe to authoritative topology broadcasts from the master node.
+    # This ensures all nodes use the SAME topology for partition calculations.
+    self.event_router.subscribe("synapse/cluster/topology", self.on_p2p_topology_broadcast)
+    # CRITICAL FIX: Subscribe to authoritative partition broadcasts from master.
+    self.event_router.subscribe("synapse/cluster/partition", self.on_p2p_partition_broadcast)
     self._setup_p2p_rpc_handlers()
 
     self.node_download_progress: Dict[str, RepoProgressEvent] = {}
     self.topology_inference_engines_pool: List[List[str]] = []
     self.outstanding_requests = {}
     self._background_tasks: Set[asyncio.Task] = set()
+    # CRITICAL FIX: Map request_id -> orchestrator node_id for result routing
+    self._request_orchestrator_map: Dict[str, str] = {}
+    # CRITICAL FIX: Authoritative partition from master node for consistent shard assignment
+    self._authoritative_partitions: Optional[List[Partition]] = None
+    self._authoritative_base_shard: Optional[Shard] = None
 
     self._on_token = AsyncCallbackSystem()
     self._request_semaphore = asyncio.Semaphore(max_concurrent_requests)
     self.max_concurrent_requests = max_concurrent_requests
     self._on_opaque_status = AsyncCallbackSystem()
 
+    self.monitor = RealtimeMonitor()
+    self._current_metrics: NodeMetrics = NodeMetrics()
+
     # Register internal callback for token synchronization in distributed mode
     self.on_token.register("internal_token_sync").on_next(self._on_token_received)
+
+  @property
+  def distributed_pipeline(self):
+    """LACP 3.0 Distributed Pipeline Extension — lazy-initialized."""
+    if self._distributed_pipeline is None:
+      from synapse.pipeline.node_extension import DistributedPipelineExtension
+      self._distributed_pipeline = DistributedPipelineExtension(self)
+    return self._distributed_pipeline
+
+  def _lazy_init_fault_tolerance(self):
+    """LACP 3.0 Fault Tolerance Manager — lazy-initialized."""
+    if self.fault_tolerance is None:
+      from synapse.pipeline.fault_tolerance import FaultToleranceManager
+      self.fault_tolerance = FaultToleranceManager(self.id)
+      # Pre-register known nodes from topology
+      for nid in self.topology.nodes:
+        self.fault_tolerance.register_node(nid)
 
   def _log_task_exception(self, task: asyncio.Task, name: str) -> None:
     self._background_tasks.discard(task)
@@ -103,7 +145,11 @@ class Node:
     await self.event_router.start()
     await self.libp2p_node.start()
     await self.election_manager.start()
+    self.election_manager.set_monitor(self.monitor)
     self._setup_p2p_rpc_handlers()
+
+    await self.monitor.start()
+    self._schedule_task(self._metrics_update_loop(), "realtime_metrics")
     
     if hasattr(self, "discovery") and self.discovery:
         if DEBUG >= 1: print(f"Starting discovery module: {type(self.discovery).__name__}")
@@ -120,9 +166,26 @@ class Node:
     if DEBUG >= 1: print("Node started successfully!")
     self._schedule_task(self.periodic_topology_collection(2.0), "periodic_topology_collection")
 
+    # Start distributed pipeline extension
+    if self._distributed_pipeline:
+        await self._distributed_pipeline.start()
+
+    # Start fault tolerance manager
+    self._lazy_init_fault_tolerance()
+    if self.fault_tolerance:
+        await self.fault_tolerance.start()
+
   async def stop(self) -> None:
     if DEBUG >= 1: print("Stopping node: Cleaning up components...")
-    
+
+    # Stop fault tolerance manager
+    if self.fault_tolerance:
+        await self.fault_tolerance.stop()
+
+    # Stop distributed pipeline extension
+    if self._distributed_pipeline:
+        await self._distributed_pipeline.stop()
+
     # Cancel background tasks
     for task in self._background_tasks:
         task.cancel()
@@ -132,6 +195,8 @@ class Node:
     # Stop election manager
     if hasattr(self, "election_manager") and self.election_manager:
         await self.election_manager.stop()
+
+    await self.monitor.stop()
         
     # Stop discovery
     if hasattr(self, "discovery") and self.discovery:
@@ -195,42 +260,100 @@ class Node:
         self.node_download_progress[status_data.get('node_id')] = progress
 
       if self.topology_viz:
-        self.topology_viz.update_visualization(self.topology, self.partitioning_strategy.partition(self.topology), self.id, self.node_download_progress)
+        self.topology_viz.update_visualization(self.topology, self._compute_lacp_partition(), self.id, self.node_download_progress)
         
     except Exception as e:
       if DEBUG >= 1: print(f"Error in on_node_status: {e}")
       if DEBUG >= 2: traceback.print_exc()
 
   async def check_fault_tolerance(self) -> None:
-    """EXO-INSPIRED: Dynamic Fault Tolerance. Watchdog for stuck requests (>10s)."""
+    """LACP 3.0: Dynamic Fault Tolerance with rebalancing on node failure."""
     current_time = time.time()
+
+    # Phase 1: Check stuck requests (original watchdog)
     stuck_requests = []
     for request_id, req_info in list(self.outstanding_requests.items()):
-      # Support both legacy string status and refactored dict status
       if isinstance(req_info, dict):
           start_time = req_info.get("start_time", 0)
       else:
-          # If it's a string, we don't have a start_time to check for timeout
           start_time = 0
-          
       if start_time and (current_time - start_time) > 10.0:
         stuck_requests.append(request_id)
-    
+
     if stuck_requests:
       if DEBUG >= 1: print(f"!!! [FAULT_TOLERANCE] Found {len(stuck_requests)} stuck requests. Triggering topology refresh.")
       await self.collect_topology(set())
-      # In a real system, we would trigger re-sharding or notify the API client to retry
+
+    # Phase 2: LACP 3.0 node failure detection + rebalancing
+    if self.fault_tolerance and self._distributed_pipeline:
+      dead_nodes = self.fault_tolerance.get_dead_nodes()
+      for dead_id in dead_nodes:
+        if self.fault_tolerance._health.get(dead_id, None) and self.fault_tolerance._health[dead_id].is_blacklisted:
+          if DEBUG >= 1: print(f"!!! [LACP_FAULT] Node {dead_id} is dead, triggering rebalance")
+
+          current_assignments = {}
+          partitions = self._compute_lacp_partition()
+          for p in partitions:
+            num_layers = 32
+            start = int(p.start * num_layers)
+            end = min(int(p.end * num_layers) - 1, num_layers - 1)
+            current_assignments[p.node_id] = (start, end)
+
+          async def repartition(alive_nodes, total_layers):
+            nodes_resources = {}
+            for nid in alive_nodes:
+              if nid in self.topology.nodes:
+                nodes_resources[nid] = NodeResources.from_device_capabilities(self.topology.nodes[nid])
+            result = compute_partition(
+              nodes=nodes_resources,
+              total_layers=total_layers,
+              model_id="",
+            )
+            new_assignments = {}
+            for a in result.assignments:
+              new_assignments[a.node_id] = (a.start_layer, a.end_layer)
+            return new_assignments
+
+          await self.fault_tolerance.rebalance_after_failure(
+            dead_node_id=dead_id,
+            current_assignments=current_assignments,
+            total_layers=32,
+            lacp_partition_fn=repartition,
+          )
 
   async def on_p2p_tensor(self, event: Event):
     """Handle incoming tensor for inference via P2P."""
     data = event.data
     request_id = data.get("request_id")
-    tensor_data = np.array(data.get("tensor"))
+
+    # CRITICAL FIX: Support both binary (tobytes) and legacy list-based format
+    tensor_data_raw = data.get("tensor_data")
+    shape = data.get("shape")
+    dtype = data.get("dtype")
+
+    if tensor_data_raw is not None and shape is not None:
+        # Binary format: tainted from bytes
+        import numpy as np
+        if isinstance(tensor_data_raw, bytes):
+            tensor_data = np.frombuffer(tensor_data_raw, dtype=np.dtype(dtype))
+        elif isinstance(tensor_data_raw, str):
+            tensor_data = np.frombuffer(bytes.fromhex(tensor_data_raw), dtype=np.dtype(dtype))
+        else:
+            tensor_data = np.frombuffer(tensor_data_raw, dtype=np.dtype(dtype))
+        tensor_data = tensor_data.reshape(shape)
+    else:
+        # Legacy format: list-based
+        tensor_data = np.array(data.get("tensor"))
+        if dtype:
+            tensor_data = tensor_data.astype(np.dtype(dtype))
+
     shard_dict = data.get("shard")
     shard = Shard.from_dict(shard_dict)
     inference_state = data.get("inference_state")
-    
-    await self.process_tensor(shard, tensor_data, request_id, inference_state)
+
+    # CRITICAL FIX: Pass orchestrator_id so results are routed back correctly
+    orchestrator_id = data.get("_orchestrator_id")
+    await self.process_tensor(shard, tensor_data, request_id, inference_state, orchestrator_id=orchestrator_id)
 
   async def on_p2p_prompt(self, event: Event):
     """Handle incoming prompt for inference via P2P."""
@@ -240,6 +363,12 @@ class Node:
     shard_dict = data.get("shard")
     shard = Shard.from_dict(shard_dict)
     inference_state = data.get("inference_state")
+
+    # CRITICAL FIX: Store orchestrator_id so subsequent tensor forwarding
+    # knows where to route results back
+    orchestrator_id = data.get("_orchestrator_id")
+    if orchestrator_id:
+        self._request_orchestrator_map[request_id] = orchestrator_id
     
     await self.process_prompt(shard, prompt, request_id, inference_state)
 
@@ -249,8 +378,9 @@ class Node:
     request_id = data.get("request_id")
     tokens = data.get("tokens", [])
     is_finished = data.get("is_finished", False)
-    
+
     self._on_token_received(request_id, tokens, is_finished)
+    self.trigger_on_token_callbacks(request_id, tokens, is_finished)
 
   async def get_tailscale_nodes(self) -> List[Dict]:
     """Lấy danh sách thiết bị từ mạng Tailscale."""
@@ -310,6 +440,7 @@ class Node:
       result: np.ndarray,
       request_id: Optional[str] = None,
       inference_state: Optional[dict] = None,
+      orchestrator_id: Optional[str] = None,
   ):
     # CRITICAL DEBUG: Print immediately when entering this function
     if DEBUG >= 2:
@@ -438,12 +569,23 @@ class Node:
       self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
       
       if intermediate_result or is_finished:
-        # Broadcast result to the topic for this request_id listener
-        await self.event_router.publish(f"synapse/inference/result/{request_id}", {
+        # CRITICAL FIX: Publish result to BOTH request_id topic and orchestrator_id topic.
+        # The orchestrator node subscribes to result/{orchestrator_id} events,
+        # while peers subscribe to result/{request_id} events.
+        # We publish on both to ensure delivery regardless of which side the
+        # orchestrator listens on.
+        result_payload = {
             "request_id": request_id,
             "tokens": intermediate_result,
             "is_finished": is_finished
-        })
+        }
+
+        # 1. Publish to request_id-based topic (general broadcast)
+        await self.event_router.publish(f"synapse/inference/result/{request_id}", result_payload)
+
+        # 2. Publish directly to orchestrator if this is not the orchestrator
+        if orchestrator_id and orchestrator_id != self.id:
+            await self.event_router.publish(f"synapse/inference/result/{orchestrator_id}", result_payload)
     
       if is_finished:
         if request_id in self.buffered_token_output:
@@ -505,6 +647,23 @@ class Node:
       request_id = str(uuid.uuid4())
     shard = self.get_current_shard(base_shard)
     if DEBUG >= 2: print(f"[{request_id}] process prompt: {base_shard=} {shard=} {prompt=}")
+
+    # LACP 3.0: Use distributed pipeline when multiple nodes are available
+    node_count = len(self.topology.nodes) if self.topology.nodes else 0
+    if node_count > 1 and self.is_orchestrator_for_request(request_id):
+      if DEBUG >= 1: print(f"[{request_id}] LACP 3.0: Using distributed pipeline across {node_count} nodes")
+      try:
+        tokens = await self.distributed_pipeline.process_prompt_distributed(
+          base_shard=base_shard,
+          prompt=prompt,
+          request_id=request_id,
+          max_generate_tokens=max_generate_tokens,
+        )
+        return np.array(tokens) if tokens else None
+      except Exception as e:
+        if DEBUG >= 1:
+          print(f"[{request_id}] Distributed pipeline failed: {e}, falling back to single-node")
+          traceback.print_exc()
 
     if not shard.is_first_layer():
       if DEBUG >= 2: print(f"[{request_id}] forwarding to next shard: {base_shard=} {shard=} {prompt=}")
@@ -744,10 +903,11 @@ class Node:
     tensor: np.ndarray,
     request_id: Optional[str] = None,
     inference_state: Optional[dict] = None,
+    orchestrator_id: Optional[str] = None,
   ) -> Optional[np.ndarray]:
     shard = self.get_current_shard(base_shard)
     start_time = time.perf_counter_ns()
-    resp = await self._process_tensor(shard, tensor, request_id, inference_state)
+    resp = await self._process_tensor(shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
     end_time = time.perf_counter_ns()
     elapsed_time_ns = end_time - start_time
     if DEBUG >= 2: print(f"[{request_id}] process_tensor: {base_shard=} {shard=} {tensor.size=} {tensor.shape=} {elapsed_time_ns=}")
@@ -759,10 +919,15 @@ class Node:
     tensor: np.ndarray,
     request_id: Optional[str] = None,
     inference_state: Optional[dict] = None,
+    orchestrator_id: Optional[str] = None,
   ) -> Optional[np.ndarray]:
     if request_id is None:
       request_id = str(uuid.uuid4())
     shard = self.get_current_shard(base_shard)
+
+    # CRITICAL FIX: Store orchestrator_id for downstream forwarding chain
+    if orchestrator_id:
+        self._request_orchestrator_map[request_id] = orchestrator_id
 
     try:
       self.outstanding_requests[request_id] = "processing"
@@ -778,7 +943,7 @@ class Node:
           if DEBUG >= 2:
             print(f"[{request_id}] First layer: full sequence length {len(full_ids)} (prompt + {len(buf)} generated)")
       result, inference_state = await self.inference_engine.infer_tensor(request_id, shard, input_data, inference_state)
-      ret = await self.process_inference_result(shard, result, request_id, inference_state)
+      ret = await self.process_inference_result(shard, result, request_id, inference_state, orchestrator_id=orchestrator_id)
       return ret
     except Exception as e:
       self.outstanding_requests.pop(request_id, None)
@@ -797,7 +962,7 @@ class Node:
     target_index: int,
   ) -> None:
     if DEBUG >= 1: print(f"target partition index: {target_index}")
-    target_id = self.partitioning_strategy.partition(self.topology, base_shard)[target_index].node_id
+    target_id = self._compute_lacp_partition(base_shard)[target_index].node_id
     target_shard = self.get_current_shard(base_shard, target_index)
     if DEBUG >= 2: print(f"computed target from: {base_shard} {target_index}, {self.topology}. target shard: {target_shard}")
     target_peer = next((p for p in self.peers if p.id() == target_id), None)
@@ -816,7 +981,7 @@ class Node:
       inference_state: Optional[dict] = None,
   ) -> None:
       if DEBUG >= 1: print(f"target partition index: {target_index}")
-      target_id = self.partitioning_strategy.partition(self.topology, base_shard)[target_index].node_id
+      target_id = self._compute_lacp_partition(base_shard)[target_index].node_id
       next_shard = self.get_current_shard(base_shard, target_index)
       if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. next shard: {next_shard}")
       if target_id == self.id:
@@ -827,7 +992,10 @@ class Node:
               "request_id": request_id,
               "shard": next_shard.to_dict(),
               "prompt": prompt,
-              "inference_state": inference_state
+              "inference_state": inference_state,
+              # CRITICAL FIX: Include orchestrator_id so downstream nodes know
+              # where to route results and tokens back to the original requester
+              "_orchestrator_id": self.id,
           })
   
   async def forward_tensor(
@@ -839,36 +1007,53 @@ class Node:
     inference_state: Optional[dict] = None,
   ) -> None:
     if DEBUG >= 1: print(f"target partition index: {target_index}")
-    target_id = self.partitioning_strategy.partition(self.topology, base_shard)[target_index].node_id
+    target_id = self._compute_lacp_partition(base_shard)[target_index].node_id
     target_shard = self.get_current_shard(base_shard, target_index)
     if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. target shard: {target_shard}")
+
+    orchestrator_id = self._orchestrator_id_for_request(request_id)
+
     if target_id == self.id:
-      return await self.process_tensor(target_shard, tensor, request_id, inference_state)
+      return await self.process_tensor(target_shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
     else:
       logger.info(f"[P2P_MESH] Publishing work to Node: {target_id}")
+      # CRITICAL FIX: Use binary tensor encoding (tobytes + shape + dtype)
+      # instead of tensor.tolist() which creates massive nested JSON arrays.
       await self.event_router.publish(f"synapse/inference/tensor/{target_id}", {
         "request_id": request_id,
         "shard": target_shard.to_dict(),
-        "tensor": tensor.tolist(), # Convert to list for JSON serialization
-        "inference_state": inference_state
+        "tensor_data": tensor.tobytes(),
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "inference_state": inference_state,
+        "_orchestrator_id": orchestrator_id,
       })
-      return None # In P2P, we don't wait for return. Results come via result topic.
+      return None
 
   def get_partition_index(self, offset: int = 0, base_shard: Optional[Shard] = None):
-    if not self.partitioning_strategy:
-      if DEBUG >= 1: print("No partitioning strategy found. Skipping forward.")
+    if not self.topology.nodes:
+      if DEBUG >= 1: print("No nodes in topology. Skipping forward.")
       return None
-    partitions = self.partitioning_strategy.partition(self.topology, base_shard)
+    # CRITICAL FIX: Use authoritative partitions from master if available,
+    # otherwise compute locally (fallback for single-node or before first broadcast)
+    if self._authoritative_partitions is not None:
+        partitions = self._authoritative_partitions
+    else:
+        partitions = self._compute_lacp_partition(base_shard)
     current_partition_index = next((i for i, p in enumerate(partitions) if p.node_id == self.id), None)
     if current_partition_index is None:
       if DEBUG >= 1: print(f"Node {self.id} not found in partitions — may have departed or topology changed")
-      return 0  # Fall back to first partition instead of crashing
+      return 0
     return (current_partition_index + offset) % len(partitions)
 
   def get_current_shard(self, base_shard: Shard, index: Optional[int] = None) -> Shard:
     if index is None:
       index = self.get_partition_index(base_shard=base_shard)
-    partitions = self.partitioning_strategy.partition(self.topology, base_shard)
+    # CRITICAL FIX: Use authoritative partitions if available
+    if self._authoritative_partitions is not None:
+        partitions = self._authoritative_partitions
+    else:
+        partitions = self._compute_lacp_partition(base_shard)
     shards = map_partitions_to_shards(partitions, base_shard.n_layers, base_shard.model_id)
     return shards[index]
 
@@ -937,15 +1122,36 @@ class Node:
         did_peers_change = await self.update_peers()
         if DEBUG >= 3: print(f"{did_peers_change=}")
         
+        # LACP 3.0: Record heartbeat for all connected peers
+        self._lazy_init_fault_tolerance()
+        if self.fault_tolerance:
+          for peer_id in [p.id() for p in self.peers]:
+            self.fault_tolerance.record_heartbeat(peer_id)
+          # Register any new peers
+          for peer_id in [p.id() for p in self.peers]:
+            if peer_id not in self.fault_tolerance._health:
+              self.fault_tolerance.register_node(peer_id)
+
         # EXO-INSPIRED: Dynamic Fault Tolerance check
         await self.check_fault_tolerance()
         
         await self.collect_topology(set())
+
+        # CRITICAL FIX: Master broadcasts authoritative topology after each collection
+        # so that all nodes have a consistent view of the cluster
+        self._schedule_task(self.broadcast_authoritative_topology(), "broadcast_topology")
+
         if did_peers_change:
           await self.select_best_inference_engine()
       except Exception as e:
         print(f"Error in periodic_topology_collection: {e}")
         if DEBUG >= 2: traceback.print_exc()
+
+  async def _metrics_update_loop(self):
+    """Update cached NodeMetrics from realtime monitor every cycle."""
+    while True:
+      await asyncio.sleep(RealtimeMonitor.SAMPLE_INTERVAL)
+      self._current_metrics = self.monitor.latest
 
   async def collect_topology(self, visited: set[str], max_depth: int = 4) -> Topology:
     next_topology = Topology()
@@ -991,7 +1197,11 @@ class Node:
     next_topology.active_node_id = self.election_manager.current_master_id
     self.topology = next_topology
     if self.topology_viz:
-      self.topology_viz.update_visualization(self.topology, self.partitioning_strategy.partition(self.topology), self.id)
+      self.topology_viz.update_visualization(self.topology, self._compute_lacp_partition(), self.id)
+
+    # CRITICAL FIX: Master broadcasts authoritative topology to ensure all nodes agree
+    if self.election_manager.is_master():
+        self._schedule_task(self.broadcast_authoritative_topology(), "broadcast_topology")
     return self.topology
 
   @property
@@ -1045,6 +1255,106 @@ class Node:
     # in the case of opaque status, we also want to receive our own opaque statuses
     self.on_opaque_status.trigger_all(request_id, status)
 
+  def _compute_lacp_partition(self, base_shard: Optional[Shard] = None) -> List[Partition]:
+    """Compute partition using LACP 3.0 multi-resource scoring + ILP (if available), returning old Partition format for compatibility."""
+    num_layers = base_shard.n_layers if base_shard and base_shard.n_layers > 0 else 32
+    model_id = base_shard.model_id if base_shard else ""
+
+    # Attempt ILP-based partitioning if PuLP is available and >1 node
+    if len(self.topology.nodes) > 1:
+      from synapse.topology.ilp_partitioner import ILPPartitioner, LayerProfile
+      try:
+        ilp = ILPPartitioner(timeout=30)
+
+        latency_matrix = self._build_latency_matrix() or {}
+        from synapse.topology.latency_clustering import HierarchicalClusterer
+        clusterer = HierarchicalClusterer()
+        clusters = clusterer.cluster(latency_matrix) if latency_matrix else []
+
+        layer_profiles = [LayerProfile(layer_id=i, memory_mb=500.0, compute_flops=0.0) for i in range(num_layers)]
+
+        ilp_partitions = ilp.find_optimal(
+          topology=self.topology,
+          latency_matrix=latency_matrix,
+          clusters=clusters,
+          layer_profiles=layer_profiles,
+          timeout=30,
+        )
+        if ilp_partitions:
+          if DEBUG >= 1: print(f"[ILP] Optimal partition found: {len(ilp_partitions)} partitions")
+          return ilp_partitions
+      except Exception as e:
+        if DEBUG >= 1: print(f"[ILP] Solver failed ({e}), falling back to greedy LACP")
+
+    nodes_resources = {}
+    for node_id, dc in self.topology.nodes.items():
+        nr = NodeResources.from_device_capabilities(dc)
+        if node_id == self.id:
+            m = self._current_metrics
+            nr.gpu_util_pct = m.gpu_util_pct
+            nr.system_ram_used_mb = m.ram_used_mb
+            nr.current_power_w = m.gpu_power_w
+        nodes_resources[node_id] = nr
+
+    latency_matrix = self._build_latency_matrix()
+
+    lacp_result = compute_partition(
+        nodes=nodes_resources,
+        latency_matrix=latency_matrix,
+        total_layers=num_layers,
+        model_id=model_id,
+    )
+
+    partitions = []
+    for a in lacp_result.assignments:
+        partitions.append(Partition(
+            node_id=a.node_id,
+            start=a.start_layer / num_layers,
+            end=(a.end_layer + 1) / num_layers,
+        ))
+    return partitions
+
+  def _build_latency_matrix(self) -> Optional[Dict[str, Dict[str, float]]]:
+    """Build real latency matrix using LACP 3.0 TCP probing with fallback to defaults."""
+    node_ids = list(self.topology.nodes.keys())
+    if len(node_ids) < 2:
+      return None
+
+    matrix: Dict[str, Dict[str, float]] = {}
+    for nid in node_ids:
+      matrix[nid] = {other: 0.0 if other == nid else 50.0 for other in node_ids}
+
+    from synapse.lacp.latency_matrix import LatencyProber
+    prober = LatencyProber()
+
+    try:
+      for peer in self.peers:
+        addr = peer.addr()
+        try:
+          entry = None
+          if hasattr(prober, '_probe_cache'):
+            entry = prober._probe_cache.get(peer.id())
+          else:
+            loop = asyncio.get_running_loop()
+            try:
+              entry = loop.run_until_complete(
+                asyncio.wait_for(prober.probe(peer.id(), addr, timeout=1.0), timeout=2.0)
+              )
+            except (asyncio.TimeoutError, RuntimeError):
+              pass
+
+          if entry and entry.latency_ms > 0:
+            for nid in node_ids:
+              if nid != self.id:
+                matrix[self.id][nid] = entry.latency_ms
+                matrix[nid][self.id] = entry.latency_ms
+        except Exception:
+          continue
+    except Exception:
+      pass
+
+    return matrix
+
   def _setup_p2p_rpc_handlers(self):
     """Setup listeners for P2P RPC requests (Health, Topology)."""
     self.event_router.subscribe(f"synapse/rpc/health/request/{self.id}", self.on_p2p_health_request)
@@ -1066,80 +1376,6 @@ class Node:
     except Exception as e:
         logger.error(f"Error in on_p2p_topology_request: {e}")
         traceback.print_exc()
-
-  async def on_p2p_status(self, event: Event):
-    """Update local view of the cluster based on status broadcasts."""
-    try:
-        data = event.data
-        if isinstance(data, str):
-            data = json.loads(data)
-        
-        if data.get("type") == "node_status":
-            node_id = data.get("node_id")
-            # Update node in topology if we have its basic info
-            if node_id and node_id != self.id:
-                # We expect the full topology update via collect_topology, 
-                # but we can track simple status here.
-                pass
-    except Exception as e:
-        if DEBUG >= 2: logger.error(f"Error in on_p2p_status: {e}")
-
-  async def on_p2p_tensor(self, event: Event):
-    """Handle incoming tensor from P2P Mesh."""
-    data = event.data
-    try:
-        ack_topic = data.get("_ack_topic")
-        if ack_topic:
-            asyncio.create_task(self.event_router.publish(ack_topic, {"status": "received"}, origin=self.id))
-        request_id = data.get("request_id")
-        shard = Shard.from_dict(data.get("shard"))
-
-        # Deserialize tensor
-        tensor_bytes = data.get("tensor_data")
-        shape = data.get("shape")
-        dtype = data.get("dtype")
-        
-        if tensor_bytes is not None:
-            tensor = np.frombuffer(tensor_bytes, dtype=dtype).reshape(shape)
-        else:
-            # Fallback for list-based JSON serialization if bytes are missing
-            tensor = np.array(data.get("tensor"), dtype=dtype)
-
-        await self.process_tensor(shard, tensor, request_id)
-    except Exception as e:
-        logger.error(f"Error in on_p2p_tensor: {e}")
-        traceback.print_exc()
-
-  async def on_p2p_prompt(self, event: Event):
-    """Handle incoming prompt from P2P Mesh."""
-    data = event.data
-    try:
-        ack_topic = data.get("_ack_topic")
-        if ack_topic:
-            asyncio.create_task(self.event_router.publish(ack_topic, {"status": "received"}, origin=self.id))
-        request_id = data.get("request_id")
-        shard = Shard.from_dict(data.get("shard"))
-        prompt = data.get("prompt")
-        inference_state = data.get("inference_state")
-        
-        await self._process_prompt(shard, prompt, request_id, inference_state)
-    except Exception as e:
-        logger.error(f"Error in on_p2p_prompt: {e}")
-        traceback.print_exc()
-
-  async def on_p2p_result(self, event: Event):
-    """Handle incoming inference result from P2P Mesh."""
-    data = event.data
-    try:
-        request_id = data.get("request_id")
-        result = data.get("result", [])
-        is_finished = data.get("is_finished", False)
-        
-        # Update local buffer and trigger callbacks
-        self._on_token_received(request_id, result, is_finished)
-        self.trigger_on_token_callbacks(request_id, result, is_finished)
-    except Exception as e:
-        logger.error(f"Error in on_p2p_result: {e}")
 
   def _on_token_received(self, request_id: str, tokens: List[int], is_finished: bool) -> None:
     """Internal callback to synchronize buffered tokens on orchestrator node."""
@@ -1163,3 +1399,76 @@ class Node:
   @property
   def current_topology(self) -> Topology:
     return self.topology
+
+  def _orchestrator_id_for_request(self, request_id: str) -> str:
+    """Return the orchestrator node_id that should receive results for this request.
+    If this node initiated the request, returns self.id.
+    If the request came from another node, returns the stored orchestrator_id.
+    """
+    if request_id in self._request_orchestrator_map:
+        return self._request_orchestrator_map[request_id]
+    # We are the orchestrator
+    self._request_orchestrator_map[request_id] = self.id
+    return self.id
+
+  def is_orchestrator_for_request(self, request_id: str) -> bool:
+    """Check if this node is the orchestrator for the given request."""
+    if request_id in self._request_orchestrator_map:
+      return self._request_orchestrator_map[request_id] == self.id
+    return True
+
+  async def broadcast_authoritative_topology(self):
+    """If this node is master, broadcast the authoritative topology to all peers."""
+    if not self.election_manager.is_master():
+        return
+
+    topology_dict = self.topology.to_dict()
+    await self.event_router.publish("synapse/cluster/topology", {
+        "topology": topology_dict,
+        "master_id": self.id,
+    })
+
+  async def on_p2p_topology_broadcast(self, event: Event):
+    """Receive authoritative topology from the master node."""
+    data = event.data
+    if isinstance(data, dict):
+        topology_data = data.get("topology")
+        if topology_data:
+            received_topo = Topology.from_dict(topology_data)
+            master_id = data.get("master_id")
+            if master_id == self.election_manager.current_master_id or not self.election_manager.current_master_id:
+                self.topology = received_topo
+                if self.topology_viz:
+                    self.topology_viz.update_visualization(
+                        self.topology,
+                        self._compute_lacp_partition(),
+                        self.id
+                    )
+
+  async def broadcast_authoritative_partition(self, base_shard: Shard):
+    """If this node is master, compute and broadcast the authoritative partition."""
+    if not self.election_manager.is_master():
+        return
+
+    partitions = self._compute_lacp_partition(base_shard)
+    self._authoritative_partitions = partitions
+    self._authoritative_base_shard = base_shard
+
+    partition_data = [{"node_id": p.node_id, "start": p.start, "end": p.end} for p in partitions]
+    await self.event_router.publish("synapse/cluster/partition", {
+        "partitions": partition_data,
+        "base_shard": base_shard.to_dict(),
+        "master_id": self.id,
+    })
+
+  async def on_p2p_partition_broadcast(self, event: Event):
+    """Receive authoritative partition from the master node."""
+    data = event.data
+    if isinstance(data, dict):
+        master_id = data.get("master_id")
+        if master_id == self.election_manager.current_master_id or not self.election_manager.current_master_id:
+            partition_data = data.get("partitions", [])
+            base_shard_dict = data.get("base_shard")
+            self._authoritative_partitions = [Partition(**p) for p in partition_data]
+            if base_shard_dict:
+                self._authoritative_base_shard = Shard.from_dict(base_shard_dict)

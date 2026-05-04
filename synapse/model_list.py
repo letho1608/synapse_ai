@@ -33,12 +33,6 @@ HF_MODELS: Dict[str, str] = {
     "gpt3.5-turbo-16k-0613": "openai/gpt-3.5-turbo-16k-0613",
     "gpt3.5-turbo-16k-1106": "openai/gpt-3.5-turbo-16k-1106",
     "gpt3.5-turbo-16k-0125": "openai/gpt-3.5-turbo-16k-0125",
-    "gpt3.5-turbo-0613": "openai/gpt-3.5-turbo-0613",
-    "gpt3.5-turbo-1106": "openai/gpt-3.5-turbo-1106",
-    "gpt3.5-turbo-0125": "openai/gpt-3.5-turbo-0125",
-    "gpt3.5-turbo-16k-0613": "openai/gpt-3.5-turbo-16k-0613",
-    "gpt3.5-turbo-16k-1106": "openai/gpt-3.5-turbo-16k-1106",
-    "gpt3.5-turbo-16k-0125": "openai/gpt-3.5-turbo-16k-0125",
 }
 HF_MODEL_PARAMS: Dict[str, str] = {}
 HF_MODEL_LAYERS: Dict[str, int] = {k: 28 for k in HF_MODELS}
@@ -74,7 +68,7 @@ def _load_dynamic_config():
         pass
 
 # Chạy nạp dữ liệu một lần khi module load
-# _load_dynamic_config()
+_load_dynamic_config()
 
 
 def resolve_hf_id(model_name: str) -> str:
@@ -103,5 +97,4 @@ def resolve_hf_id(model_name: str) -> str:
             if ":" in key and key.split(":")[1].lower() in v.lower():
                 return v
             
-    # Always fallback to the raw key, meaning they explicitly typed a repo_id not in initial scan
-    return key
+    return "Qwen/Qwen2.5-1.5B-Instruct"

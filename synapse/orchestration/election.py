@@ -5,6 +5,7 @@ from loguru import logger
 import psutil
 from synapse.routing import EventRouter, Event
 
+
 class ElectionManager:
     """
     ElectionManager handles leading node selection for the Synapse cluster.
@@ -20,11 +21,16 @@ class ElectionManager:
         self.base_compute_weight = compute_weight
         self.compute_weight = compute_weight
         self.dynamic_weight = dynamic_weight
+        self._monitor = None  # set_monitor()
 
         self.active_nodes: Dict[str, Dict] = {}
         self.current_master_id: Optional[str] = None
         self._running = False
         self._election_task: Optional[asyncio.Task] = None
+
+    def set_monitor(self, monitor) -> None:
+        """Wire a RealtimeMonitor so dynamic weight uses cached metrics."""
+        self._monitor = monitor
 
     async def start(self):
         """Start the election background task."""
@@ -60,6 +66,16 @@ class ElectionManager:
         if not self.dynamic_weight:
             return
         try:
+            if self._monitor is not None:
+                m = self._monitor.latest
+                if m.gpu_util_pct > 0:
+                    gpu_util = m.gpu_util_pct / 100.0
+                    cpu_util = m.cpu_util_pct / 100.0
+                    load = max(gpu_util, cpu_util)
+                    scale = max(0.1, 1.0 - load * 0.9)
+                    self.compute_weight = self.base_compute_weight * scale
+                    return
+
             # Check GPU utilization (primary)
             gpu_util = 0.0
             try:

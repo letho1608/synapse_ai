@@ -69,7 +69,7 @@ def get_repo(model_id: str, inference_engine_classname: str) -> Optional[str]:
 def get_pretty_name(model_id: str) -> Optional[str]:
     """Lấy tên đẹp của mô hình"""
     if model_id not in _MODEL_REGISTRY:
-        return model_id
+        return None
     return _MODEL_REGISTRY[model_id].get("pretty_name", model_id)
 
 
