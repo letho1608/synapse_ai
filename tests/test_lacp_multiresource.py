@@ -16,7 +16,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from synapse.lacp.resource_weight import (
+from synapse.topology.resource_weight import (
     NodeResources,
     ResourceWeights,
     NormalizedScores,

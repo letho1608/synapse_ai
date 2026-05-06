@@ -672,9 +672,16 @@ class ChatGPTAPI:
 
   async def handle_get_models_status(self, request):
     """Trạng thái model: danh sách từ HF_MODELS (dùng cho web UI)."""
+    try:
+      ips = get_all_ip_addresses_and_interfaces()
+      host = next((ip for ip in ips if not ip.startswith("127.")), "localhost")
+      base_url = f"http://{host}:52415"
+    except Exception:
+      base_url = "http://localhost:52415"
     return web.json_response({
       "enabled": True,
       "models": sorted(HF_MODELS.keys()),
+      "base_url": base_url,
     })
 
   def _get_hf_downloaded_names(self) -> Set[str]:
@@ -2615,10 +2622,12 @@ class ChatGPTAPI:
         gpu_util = gpu_util_self if is_self else None
         ram_used = ram_used_self if is_self else None
 
+        node_ip = ts_info.get("addresses", [None])[0] or node_id
         result.append({
           "node_id": node_id,
           "name": display_name,
           "is_self": is_self,
+          "ip": node_ip,
           "chip": chip,
           "gpu_backend": gpu_backend,
           "has_gpu": has_gpu,
@@ -2628,6 +2637,8 @@ class ChatGPTAPI:
           "layer_start": start_layer,
           "layer_end": end_layer,
           "layer_count": layer_count,
+          "layer_start_pct": round(start_layer / total_layers * 100, 1),
+          "layer_end_pct": round((end_layer + 1) / total_layers * 100, 1),
           "share_pct": share_pct,
           "flops_share_pct": flops_share_pct,
           "cpu_cores": caps.cpu_cores if caps else 0,
@@ -2645,6 +2656,7 @@ class ChatGPTAPI:
             "node_id": self.node.id,
             "name": "Máy này",
             "is_self": True,
+            "ip": "127.0.0.1",
             "chip": self.node.device_capabilities.chip if self.node.device_capabilities else "Unknown",
             "gpu_backend": self.node.device_capabilities.gpu_backend if self.node.device_capabilities else "Unknown",
             "has_gpu": True, # Probable
@@ -2654,6 +2666,8 @@ class ChatGPTAPI:
             "layer_start": 0,
             "layer_end": total_layers - 1,
             "layer_count": total_layers,
+            "layer_start_pct": 0.0,
+            "layer_end_pct": 100.0,
             "share_pct": 100.0,
             "flops_share_pct": 100.0,
             "cpu_cores": self.node.device_capabilities.cpu_cores if self.node.device_capabilities else 0,

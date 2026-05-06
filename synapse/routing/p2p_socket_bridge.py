@@ -8,6 +8,12 @@ from loguru import logger
 from synapse.routing.event_router import EventRouter, Event
 from synapse.helpers import DEBUG
 
+PACKET_TYPE_EVENT = 0x01
+PACKET_TYPE_HANDSHAKE = 0x02
+PACKET_TYPE_PING = 0x03
+PACKET_TYPE_PONG = 0x04
+
+
 def _get_all_local_ips() -> Set[str]:
     """Get all IPv4 addresses of this machine to detect self-connections."""
     ips = set()
@@ -27,7 +33,7 @@ def _get_all_local_ips() -> Set[str]:
                 ips.add(ip)
         except Exception:
             pass
-    ips.add("127.0.0.1")  # Always include loopback
+    ips.add("127.0.0.1")
     return ips
 
 class P2PSocketBridge:
@@ -97,24 +103,20 @@ class P2PSocketBridge:
         """Establish a permanent connection to a peer.
         Returns True if connection succeeded.
         """
-        if peer_id == self.node_id: return True
-        # Check if already connected and alive
+        if peer_id == self.node_id:
+            return True
+
         if peer_id in self._connections:
             _, writer = self._connections[peer_id]
             if not writer.is_closing():
                 return True
             else:
-                # Connection is dead, cleanup
                 self._connections.pop(peer_id, None)
 
-        # Also check temp-id mapping for stale temp-id entries
         if peer_id in self._temp_id_map:
             real_id = self._temp_id_map.pop(peer_id)
             self._connections.pop(peer_id, None)
 
-        # Early self-connection detection: resolve host and compare to local IPs.
-        # Only skip if BOTH IP is local AND port matches our own port.
-        # When two nodes run on same machine, allow connecting to different-process nodes.
         try:
             _host, _port_str = address.split(":")
             resolved_ip = socket.gethostbyname(_host)
@@ -125,72 +127,57 @@ class P2PSocketBridge:
         except Exception:
             pass
 
-        # address format: "host:port"
         try:
             host, port_str = address.split(":")
             reader, writer = await asyncio.open_connection(host, int(port_str))
 
-            # Send our handshake
-            await self._send_handshake(writer)
+            await self._send_handshake(writer, PACKET_TYPE_HANDSHAKE)
 
-            # Read peer's handshake with timeout to get real peer_id
             try:
                 handshake_packet = await asyncio.wait_for(self._read_packet(reader), timeout=timeout)
                 if not handshake_packet or handshake_packet.get("type") != "handshake":
                     logger.warning(f"Invalid or missing handshake from {peer_id} at {address}")
-                    writer.close()
-                    await writer.wait_closed()
+                    self._close_writer(writer)
                     return False
                 actual_peer_id = handshake_packet.get("node_id")
             except asyncio.TimeoutError:
                 logger.warning(f"Handshake timeout for {peer_id} at {address}")
-                writer.close()
-                await writer.wait_closed()
+                self._close_writer(writer)
                 return False
             except Exception as e:
                 logger.error(f"Error during handshake with {peer_id} at {address}: {e}")
-                writer.close()
-                await writer.wait_closed()
+                self._close_writer(writer)
                 return False
 
-            # Reject if handshake reveals this is a self-connection
             if actual_peer_id == self.node_id:
                 logger.debug(f"Handshake resolved to self ({self.node_id}), closing self-connection to {address}")
-                writer.close()
-                await writer.wait_closed()
+                self._close_writer(writer)
                 return False
 
-            # Clean up any stale temp-id entry for this peer
             stale_temps = [tid for tid, rid in list(self._temp_id_map.items())
                            if rid == actual_peer_id or self._peer_addresses.get(tid) == address]
             for stale_temp in stale_temps:
                 self._temp_id_map.pop(stale_temp, None)
                 if stale_temp in self._connections:
                     old_r, old_w = self._connections.pop(stale_temp)
-                    old_w.close()
+                    self._close_writer(old_w)
 
-            # TIEBREAKER: Lower node_id's outgoing connection is canonical.
-            # Both sides must use the same TCP connection for full-duplex comms.
             if self.node_id < actual_peer_id:
-                # I have lower ID → my outgoing wins
                 if actual_peer_id in self._connections:
                     _, old_writer = self._connections[actual_peer_id]
-                    old_writer.close()
+                    self._close_writer(old_writer)
                 self._connections[actual_peer_id] = (reader, writer)
                 self._peer_addresses[actual_peer_id] = address
                 self._tasks.append(asyncio.create_task(self._read_loop(actual_peer_id, reader)))
                 self._mark_peer_alive(actual_peer_id)
                 logger.info(f"Connected to peer (outgoing): {actual_peer_id} at {address}")
             else:
-                # I have higher ID → prefer peer's outgoing connection
                 if actual_peer_id in self._connections:
-                    # Incoming already established (simultaneous connect)
-                    writer.close()
-                    await writer.wait_closed()
+                    self._close_writer(writer)
+                    await self._close_writer_wait(writer)
                     self._mark_peer_alive(actual_peer_id)
                     logger.info(f"Connected to peer (incoming): {actual_peer_id} at {address}")
                 else:
-                    # No incoming yet — keep my outgoing (single-direction / late join)
                     self._connections[actual_peer_id] = (reader, writer)
                     self._peer_addresses[actual_peer_id] = address
                     self._tasks.append(asyncio.create_task(self._read_loop(actual_peer_id, reader)))
@@ -201,6 +188,20 @@ class P2PSocketBridge:
         except Exception as e:
             logger.error(f"Failed to connect to peer {peer_id} at {address}: {e}")
             return False
+
+    def _close_writer(self, writer: asyncio.StreamWriter):
+        """Close a writer without awaiting wait_closed."""
+        if writer and not writer.is_closing():
+            writer.close()
+
+    async def _close_writer_wait(self, writer: asyncio.StreamWriter):
+        """Close a writer and wait for it to close."""
+        if writer and not writer.is_closing():
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     def is_peer_connected(self, peer_id: str) -> bool:
         """Check if a peer is currently connected (used by P2PPeerHandle)."""
@@ -229,7 +230,7 @@ class P2PSocketBridge:
                 try:
                     ping = {"type": "ping", "timestamp": now}
                     data = json.dumps(ping).encode("utf-8")
-                    writer.write(struct.pack("!I", len(data)) + data)
+                    writer.write(struct.pack("!IB", len(data), PACKET_TYPE_PING) + data)
                     await writer.drain()
                 except Exception:
                     disconnected.append(peer_id)
@@ -280,56 +281,45 @@ class P2PSocketBridge:
         logger.debug(f"Incoming connection from {addr}")
 
         try:
-            # 1. Wait for handshake
             peer_info = await self._read_packet(reader)
             if not peer_info or peer_info.get("type") != "handshake":
                 logger.warning(f"Invalid handshake from {addr}")
-                writer.close()
+                self._close_writer(writer)
                 return
 
             peer_id = peer_info.get("node_id")
             if not peer_id:
-                writer.close()
+                self._close_writer(writer)
                 return
 
-            # Resolve pending handshake future for this specific peer (matched by temp_id)
             for temp_id, future in list(self._pending_handshake_futures.items()):
                 if not future.done() and (self._temp_id_map.get(temp_id) == peer_id
                                            or self._peer_addresses.get(temp_id) == f"{addr[0]}:{addr[1]}"):
                     future.set_result(peer_id)
 
-            # TIEBREAKER: Lower node_id's outgoing connection is canonical.
-            # Both sides must use the same TCP connection for full-duplex comms.
             if self.node_id < peer_id:
-                # I have lower ID → my outgoing should win.
-                # Only store if connect_to_peer hasn't already stored the outgoing.
                 if peer_id not in self._connections:
-                    # Outgoing hasn't run yet, keep this incoming temporarily
                     self._connections[peer_id] = (reader, writer)
                     self._tasks.append(asyncio.create_task(self._read_loop(peer_id, reader)))
                     logger.debug(f"Peer {peer_id} connected (incoming, temporary) from {addr}")
-                # Send handshake back so peer's connect_to_peer can complete
-                await self._send_handshake(writer)
+                await self._send_handshake(writer, PACKET_TYPE_HANDSHAKE)
                 return
 
-            # I have higher ID → peer's outgoing is canonical
-            # This incoming connection IS the canonical one
             if peer_id in self._connections:
                 logger.debug(f"Peer {peer_id} already connected. Closing old (outgoing) connection.")
                 _, old_writer = self._connections[peer_id]
-                old_writer.close()
+                self._close_writer(old_writer)
 
             self._connections[peer_id] = (reader, writer)
             self._tasks.append(asyncio.create_task(self._read_loop(peer_id, reader)))
             self._mark_peer_alive(peer_id)
             logger.info(f"Peer {peer_id} connected from {addr}")
 
-            # 2. Send our handshake back
-            await self._send_handshake(writer)
+            await self._send_handshake(writer, PACKET_TYPE_HANDSHAKE)
 
         except Exception as e:
             logger.error(f"Error handling incoming connection from {addr}: {e}")
-            writer.close()
+            self._close_writer(writer)
 
     async def _on_local_event(self, event: Event):
         """React to events published on the local EventRouter."""
@@ -357,16 +347,12 @@ class P2PSocketBridge:
 
     async def _broadcast_packet(self, packet: Dict):
         """Send a packet to all connected peers."""
-        # CRITICAL FIX: Use BSON/MessagePack-like binary packing for tensor data
-        # JSON serialization of large nested float arrays can OOM on real machines.
-        # For event packets with tensor data, we must use efficient binary encoding.
         data = json.dumps(packet, default=self._json_serialize).encode('utf-8')
 
         disconnected = []
         for peer_id, (_, writer) in self._connections.items():
             try:
-                length_prefix = struct.pack("!I", len(data))
-                writer.write(length_prefix + data)
+                writer.write(struct.pack("!IB", len(data), PACKET_TYPE_EVENT) + data)
                 await writer.drain()
             except Exception as e:
                 logger.warning(f"Lost connection to peer {peer_id}: {e}")
@@ -397,29 +383,28 @@ class P2PSocketBridge:
         """Read packets from a specific peer stream."""
         try:
             while self._running:
-                packet = await self._read_packet(reader)
-                if packet is None: break
+                try:
+                    packet, pkt_type = await self._read_packet_with_type(reader)
+                    if packet is None:
+                        break
 
-                if packet.get("type") == "event":
-                    topic = packet.get("topic")
-                    data = self._json_deserialize(packet.get("data"))
-                    origin = packet.get("origin")
-
-                    # Re-publish locally with remote origin to prevent re-broadcast loops
-                    await self.event_router.publish(topic, data, origin=origin)
-
-                elif packet.get("type") == "handshake":
-                    pass
-
-                elif packet.get("type") == "ping":
-                    pong = {"type": "pong", "timestamp": packet.get("timestamp")}
-                    data = json.dumps(pong).encode("utf-8")
-                    stored = self._connections.get(peer_id)
-                    if stored:
-                        stored[1].write(struct.pack("!I", len(data)) + data)
-                        await stored[1].drain()
-                elif packet.get("type") == "pong":
-                    self._last_pong[peer_id] = time.time()
+                    if pkt_type == PACKET_TYPE_PING:
+                        pong = {"type": "pong", "timestamp": packet.get("timestamp")}
+                        data = json.dumps(pong).encode("utf-8")
+                        stored = self._connections.get(peer_id)
+                        if stored:
+                            stored[1].write(struct.pack("!IB", len(data), PACKET_TYPE_PONG) + data)
+                            await stored[1].drain()
+                    elif pkt_type == PACKET_TYPE_PONG:
+                        self._last_pong[peer_id] = time.time()
+                    elif pkt_type == PACKET_TYPE_EVENT:
+                        topic = packet.get("topic")
+                        data = self._json_deserialize(packet.get("data"))
+                        origin = packet.get("origin")
+                        await self.event_router.publish(topic, data, origin=origin)
+                except Exception as e:
+                    logger.debug(f"Read loop for {peer_id} ended: {e}")
+                    break
         except Exception as e:
             logger.debug(f"Read loop for {peer_id} ended: {e}")
         finally:
@@ -444,23 +429,33 @@ class P2PSocketBridge:
         return data
 
     async def _read_packet(self, reader: asyncio.StreamReader) -> Optional[Dict]:
-        """Read a single length-prefixed JSON packet."""
+        """Read a single length-prefixed JSON packet (legacy compatibility)."""
+        packet, _ = await self._read_packet_with_type(reader)
+        return packet
+
+    async def _read_packet_with_type(self, reader: asyncio.StreamReader) -> Tuple[Optional[Dict], int]:
+        """
+        Read a single length-prefixed JSON packet with type byte.
+        Returns (packet_dict, packet_type).
+        Uses [4 bytes length][1 byte type][payload] format.
+        """
         try:
-            header = await reader.readexactly(4)
-            length = struct.unpack("!I", header)[0]
-            # Sanity check on length to prevent memory issues
-            if length > 10 * 1024 * 1024: # 10MB max
+            header = await reader.readexactly(5)
+            length = struct.unpack("!I", header[:4])[0]
+            pkt_type = header[4]
+            if length > 10 * 1024 * 1024:
                 logger.error(f"Packet too large: {length} bytes, dropping connection")
-                return None
+                return None, 0
             data = await reader.readexactly(length)
-            return json.loads(data.decode('utf-8'))
+            packet = json.loads(data.decode('utf-8'))
+            return packet, pkt_type
         except (asyncio.IncompleteReadError, ConnectionError):
-            return None
+            return None, 0
         except Exception as e:
             logger.error(f"Error reading packet: {e}")
-            return None
+            return None, 0
 
-    async def _send_handshake(self, writer: asyncio.StreamWriter):
+    async def _send_handshake(self, writer: asyncio.StreamWriter, pkt_type: int = PACKET_TYPE_HANDSHAKE):
         """Send identification handshake to a peer."""
         handshake = {
             "type": "handshake",
@@ -468,5 +463,5 @@ class P2PSocketBridge:
             "port": self.port
         }
         data = json.dumps(handshake).encode('utf-8')
-        writer.write(struct.pack("!I", len(data)) + data)
+        writer.write(struct.pack("!IB", len(data), pkt_type) + data)
         await writer.drain()

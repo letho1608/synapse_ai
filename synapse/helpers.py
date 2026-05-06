@@ -1,12 +1,11 @@
 import os
 import sys
 import asyncio
+import hashlib
 from typing import Callable, TypeVar, Optional, Dict, Generic, Tuple, List
 import socket
 import random
 import psutil
-import uuid
-import socket
 import re
 import subprocess
 from pathlib import Path
@@ -18,6 +17,42 @@ import traceback
 DEBUG = int(os.getenv("DEBUG", default="0"))
 DEBUG_DISCOVERY = int(os.getenv("DEBUG_DISCOVERY", default="0"))
 VERSION = "0.0.1"
+
+
+def _get_mac_address() -> str:
+    """Get the primary MAC address of this machine."""
+    mac = None
+    try:
+        import psutil
+        for interface, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == psutil.AF_LINK and addr.address:
+                    mac = addr.address
+                    break
+            if mac:
+                break
+    except Exception:
+        pass
+    if not mac:
+        mac = "00:00:00:00:00:00"
+    return mac
+
+
+def _cleanup_old_node_id_files():
+    """Remove old .synapse_node_id files from temp directory."""
+    try:
+        old_files = [
+            Path(tempfile.gettempdir()) / ".synapse_node_id",
+            Path(tempfile.gettempdir()) / "synapse_node_id",
+        ]
+        for f in old_files:
+            if f.is_file():
+                f.unlink()
+                if DEBUG >= 2:
+                    print(f"Cleaned up old node ID file: {f}")
+    except Exception as e:
+        if DEBUG >= 2:
+            print(f"Failed to cleanup old node ID files: {e}")
 
 # Ensure UTF-8 output for Windows terminals to avoid UnicodeEncodeError with emojis
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
@@ -109,7 +144,7 @@ def _fit_emoji(fit: str) -> str:
 def _load_model_db() -> list:
     """Load hf_models.json from synapse/data/."""
     try:
-        data_path = os.path.join(os.path.dirname(__file__), "data", "hf_models.json")
+        data_path = os.path.join(os.path.dirname(__file__), "config", "hf_models.json")
         with open(data_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
@@ -359,38 +394,21 @@ class PrefixDict(Generic[K, V]):
     return max(matches, key=lambda x: len(x[0]))
 
 
-def is_valid_uuid(val):
-  try:
-    uuid.UUID(str(val))
-    return True
-  except ValueError:
-    return False
+def get_or_create_node_id(port: int = None):
+    """
+    Generate a deterministic node ID based on MAC address + port.
+    This ensures each node on the same machine with different ports
+    gets a unique ID, and the ID remains stable across restarts.
+    """
+    _cleanup_old_node_id_files()
 
+    mac = _get_mac_address()
+    unique_input = f"{mac}:{port}" if port else mac
+    node_id = hashlib.sha256(unique_input.encode()).hexdigest()[:32]
 
-def get_or_create_node_id():
-  NODE_ID_FILE = Path(tempfile.gettempdir())/".synapse_node_id"
-  try:
-    if NODE_ID_FILE.is_file():
-      with open(NODE_ID_FILE, "r") as f:
-        stored_id = f.read().strip()
-      if is_valid_uuid(stored_id):
-        if DEBUG >= 2: print(f"Retrieved existing node ID: {stored_id}")
-        return stored_id
-      else:
-        if DEBUG >= 2: print("Stored ID is not a valid UUID. Generating a new one.")
-
-    new_id = str(uuid.uuid4())
-    with open(NODE_ID_FILE, "w") as f:
-      f.write(new_id)
-
-    if DEBUG >= 2: print(f"Generated and stored new node ID: {new_id}")
-    return new_id
-  except IOError as e:
-    if DEBUG >= 2: print(f"IO error creating node_id: {e}")
-    return str(uuid.uuid4())
-  except Exception as e:
-    if DEBUG >= 2: print(f"Unexpected error creating node_id: {e}")
-    return str(uuid.uuid4())
+    if DEBUG >= 2:
+        print(f"Generated deterministic node ID: {node_id} (MAC={mac}, port={port})")
+    return node_id
 
 
 def pretty_print_bytes(size_in_bytes: int) -> str:

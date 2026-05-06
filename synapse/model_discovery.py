@@ -6,7 +6,7 @@ from pathlib import Path
 from synapse.helpers import DEBUG
 
 HF_API = "https://huggingface.co/api/models"
-HF_MODELS_JSON_PATH = Path(os.path.dirname(__file__)) / "data" / "hf_models.json"
+HF_MODELS_JSON_PATH = Path(os.path.dirname(__file__)) / "config" / "hf_models.json"
 
 MOE_CONFIGS = {
     "mixtral": {"num_experts": 8, "active_experts": 2},

@@ -2,7 +2,6 @@ import asyncio
 import time
 from typing import Dict, Optional, List
 from loguru import logger
-import psutil
 from synapse.routing import EventRouter, Event
 
 
@@ -10,27 +9,43 @@ class ElectionManager:
     """
     ElectionManager handles leading node selection for the Synapse cluster.
     Inspired by Exo's Master Election but simplified for Synapse's P2P mesh.
+
+    Uses capacity-based (VRAM + FLOPs) weighting instead of load-based
+    weighting to prevent Master flapping during AI tasks.
+    Implements Master Stickiness: a Master only loses status when truly offline.
     """
     TICK_INTERVAL = 2.0
     TIMEOUT = 6.0
+    MASTER_STICKINESS_GRACE_PERIOD = 30.0
 
     def __init__(self, node_id: str, event_router: EventRouter, compute_weight: float = 1.0,
-                 dynamic_weight: bool = True):
+                 dynamic_weight: bool = False):
         self.node_id = node_id
         self.event_router = event_router
         self.base_compute_weight = compute_weight
         self.compute_weight = compute_weight
         self.dynamic_weight = dynamic_weight
-        self._monitor = None  # set_monitor()
+        self._monitor = None
 
         self.active_nodes: Dict[str, Dict] = {}
         self.current_master_id: Optional[str] = None
         self._running = False
         self._election_task: Optional[asyncio.Task] = None
+        self._master_became_offline_at: Optional[float] = None
 
     def set_monitor(self, monitor) -> None:
-        """Wire a RealtimeMonitor so dynamic weight uses cached metrics."""
+        """Wire a RealtimeMonitor (not used for weight anymore, kept for compatibility)."""
         self._monitor = monitor
+
+    def set_base_compute_weight(self, vram_gb: float, fp32_flops: float) -> None:
+        """
+        Set base compute weight from hardware capacity (VRAM + FLOPs).
+        This is the stable, capacity-based weight used for election.
+        """
+        self.base_compute_weight = vram_gb + (fp32_flops / 100.0)
+        self.compute_weight = self.base_compute_weight
+        if self._monitor is None:
+            self.compute_weight = self.base_compute_weight
 
     async def start(self):
         """Start the election background task."""
@@ -49,96 +64,75 @@ class ElectionManager:
     async def _handle_election_event(self, event: Event):
         """Processes incoming election heartbeat from other nodes."""
         data = event.data
-        if not isinstance(data, dict): return
-        
+        if not isinstance(data, dict):
+            return
+
         node_id = data.get("node_id")
-        if not node_id: return
-        
-        # Update node status in our local view
+        if not node_id:
+            return
+
         self.active_nodes[node_id] = {
             "weight": data.get("weight", 0.0),
             "last_seen": event.timestamp,
         }
 
     def _update_compute_weight(self):
-        """Recalculate compute_weight based on current system load.
-        Scales base weight by available capacity: idle GPU = full weight, busy GPU = reduced weight."""
-        if not self.dynamic_weight:
-            return
-        try:
-            if self._monitor is not None:
-                m = self._monitor.latest
-                if m.gpu_util_pct > 0:
-                    gpu_util = m.gpu_util_pct / 100.0
-                    cpu_util = m.cpu_util_pct / 100.0
-                    load = max(gpu_util, cpu_util)
-                    scale = max(0.1, 1.0 - load * 0.9)
-                    self.compute_weight = self.base_compute_weight * scale
-                    return
-
-            # Check GPU utilization (primary)
-            gpu_util = 0.0
-            try:
-                import subprocess, shutil
-                if shutil.which('nvidia-smi'):
-                    result = subprocess.run(
-                        ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if result.returncode == 0 and result.stdout.strip():
-                        utils = [float(x.strip()) for x in result.stdout.strip().split('\n') if x.strip()]
-                        if utils:
-                            gpu_util = max(utils) / 100.0
-            except Exception:
-                pass
-
-            # CPU utilization
-            cpu_util = psutil.cpu_percent(interval=0.1) / 100.0
-
-            # Use the higher of GPU/CPU utilization as load indicator
-            load = max(gpu_util, cpu_util)
-            # Scale: idle (0% load) = full weight, 100% load = 10% of base weight
-            scale = max(0.1, 1.0 - load * 0.9)
-            self.compute_weight = self.base_compute_weight * scale
-        except Exception:
-            pass  # Keep current weight on error
+        """Compute weight is now static based on hardware capacity (VRAM + FLOPs).
+        This prevents Master flapping when AI tasks cause temporary load spikes.
+        """
+        if self.dynamic_weight and self._monitor is not None:
+            pass
+        self.compute_weight = self.base_compute_weight
 
     async def _election_loop(self):
         """Periodic loop to broadcast heartbeat and evaluate leadership."""
         while self._running:
             try:
-                # 0. Update dynamic weight based on current load
                 self._update_compute_weight()
-                # 1. Broadcast our existence
+
                 await self.event_router.publish("synapse/cluster/election", {
                     "node_id": self.node_id,
                     "weight": self.compute_weight
                 })
 
-                # 2. Cleanup timed out nodes
                 now = asyncio.get_event_loop().time()
                 self.active_nodes = {
                     nid: info for nid, info in self.active_nodes.items()
                     if now - info["last_seen"] < self.TIMEOUT
                 }
 
-                # 3. Evaluate who should be the Master
-                # Add ourselves to the pool for evaluation
-                all_candidates = {**self.active_nodes, self.node_id: {"weight": self.compute_weight}}
-                
-                # Selection Logic: 
-                # Highest weight first. Tie-break with lexicographical Node ID (smallest ID wins).
+                all_candidates = {**self.active_nodes, self.node_id: {"weight": self.compute_weight, "last_seen": now}}
+
                 sorted_candidates = sorted(
                     all_candidates.keys(),
                     key=lambda x: (-all_candidates[x]["weight"], x)
                 )
-                
+
                 new_master_id = sorted_candidates[0] if sorted_candidates else self.node_id
-                
-                if new_master_id != self.current_master_id:
+
+                if self.current_master_id is None:
                     self.current_master_id = new_master_id
                     if not self.is_master():
                         logger.info(f"Node {self.node_id} recognizes {self.current_master_id} as Master")
+                elif self.current_master_id == self.node_id:
+                    if new_master_id != self.node_id:
+                        logger.info(f"Node {self.node_id} is still Master (stickiness active)")
+                    self.current_master_id = self.node_id
+                elif self.current_master_id in self.active_nodes:
+                    self._master_became_offline_at = None
+                    if new_master_id != self.current_master_id:
+                        logger.info(f"Node {self.node_id} recognizes {self.current_master_id} as Master (sticky)")
+                    self.current_master_id = new_master_id
+                else:
+                    if self._master_became_offline_at is None:
+                        self._master_became_offline_at = now
+                    elif now - self._master_became_offline_at > self.MASTER_STICKINESS_GRACE_PERIOD:
+                        logger.warning(f"Master {self.current_master_id} offline for {now - self._master_became_offline_at:.0f}s, electing new Master")
+                        self.current_master_id = new_master_id
+                        self._master_became_offline_at = None
+                    else:
+                        if new_master_id != self.current_master_id:
+                            logger.info(f"Previous Master {self.current_master_id} went offline, waiting {self.MASTER_STICKINESS_GRACE_PERIOD - (now - self._master_became_offline_at):.0f}s before accepting new Master")
 
                 await asyncio.sleep(self.TICK_INTERVAL)
             except asyncio.CancelledError:

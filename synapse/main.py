@@ -105,7 +105,7 @@ shard_downloader: ShardDownloader = inference_engine.shard_downloader
 # node_port is now defaulted to 5678 in argparse
 if DEBUG >= 1: print(f"Using node port: {args.node_port}")
 
-args.node_id = args.node_id or get_or_create_node_id()
+args.node_id = args.node_id or get_or_create_node_id(args.node_port or 5678)
 chatgpt_api_endpoints = [f"http://{ip}:{args.chatgpt_api_port}/v1/chat/completions" for ip, _ in get_all_ip_addresses_and_interfaces()]
 web_chat_urls = [f"http://{ip}:{args.chatgpt_api_port}" for ip, _ in get_all_ip_addresses_and_interfaces()]
 

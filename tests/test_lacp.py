@@ -17,9 +17,9 @@ sys.path.insert(0, ROOT)
 
 def test_import_lacp_modules():
     """Import tất cả LACP 3.0 modules."""
-    from synapse.lacp.resource_weight import NodeResources, ResourceWeights, ResourceScorer, NormalizedScores
-    from synapse.lacp.latency_matrix import LatencyMatrix, LatencyProber, HierarchicalClusterer, Cluster
-    from synapse.lacp.partitioner import compute_partition, LACPPartition, ShardAssignment
+    from synapse.topology.resource_weight import NodeResources, ResourceWeights, ResourceScorer, NormalizedScores
+    from synapse.topology.latency_matrix import LatencyMatrix, LatencyProber, HierarchicalClusterer, Cluster
+    from synapse.topology.partitioner import compute_partition, LACPPartition, ShardAssignment
     from synapse.pipeline.scheduler import PipelineScheduler, PipelineSchedule, PipelineSlot, MicroBatchOp
     from synapse.pipeline.gradient_sync import RingAllReducer, DistributedTrainer, GradientShard
     from synapse.pipeline.fault_tolerance import FaultToleranceManager, NodeHealth, ShardCheckpoint
@@ -31,7 +31,7 @@ def test_import_lacp_modules():
 
 def test_node_resources():
     """Test NodeResources dataclass (LACP 3.0)."""
-    from synapse.lacp.resource_weight import NodeResources
+    from synapse.topology.resource_weight import NodeResources
     
     r = NodeResources(
         gpu_name="RTX 4090", gpu_vram_mb=24576, gpu_tflops_fp16=165,
@@ -48,7 +48,7 @@ def test_node_resources():
 
 def test_lacp3_cluster():
     """Test Cluster dataclass (LACP 3.0)."""
-    from synapse.lacp.latency_matrix import Cluster
+    from synapse.topology.latency_matrix import Cluster
     
     cluster = Cluster(cluster_id=1, nodes=["A", "B", "C"], centroid_latency_ms=15.0, intra_latency_ms=5.0)
     assert cluster.cluster_id == 1
@@ -62,7 +62,7 @@ def test_lacp3_cluster():
 
 def test_hierarchical_clusterer():
     """Test LACP 3.0 HierarchicalClusterer clustering."""
-    from synapse.lacp.latency_matrix import HierarchicalClusterer, LatencyMatrix, LatencyEntry
+    from synapse.topology.latency_matrix import HierarchicalClusterer, LatencyMatrix, LatencyEntry
     
     matrix = LatencyMatrix(
         nodes=["A", "B", "C"],
@@ -94,7 +94,7 @@ def test_hierarchical_clusterer():
 
 def test_hierarchical_clusterer_fallback():
     """Test fallback clustering with 2 nodes."""
-    from synapse.lacp.latency_matrix import HierarchicalClusterer, LatencyMatrix, LatencyEntry
+    from synapse.topology.latency_matrix import HierarchicalClusterer, LatencyMatrix, LatencyEntry
     
     matrix = LatencyMatrix(
         nodes=["A", "B"],
@@ -120,7 +120,7 @@ def test_hierarchical_clusterer_fallback():
 
 def test_resource_scorer():
     """Test LACP 3.0 ResourceScorer."""
-    from synapse.lacp.resource_weight import ResourceScorer, NodeResources, ResourceWeights
+    from synapse.topology.resource_weight import ResourceScorer, NodeResources, ResourceWeights
     
     nodes = {
         "A": NodeResources(gpu_name="RTX 4090", gpu_vram_mb=24576, gpu_tflops_fp16=165, cpu_cores=16, system_ram_mb=64000),
@@ -145,8 +145,8 @@ def test_resource_scorer():
 
 def test_compute_partition():
     """Test LACP 3.0 compute_partition with 2 nodes."""
-    from synapse.lacp.partitioner import compute_partition
-    from synapse.lacp.resource_weight import NodeResources
+    from synapse.topology.partitioner import compute_partition
+    from synapse.topology.resource_weight import NodeResources
     
     nodes = {
         "A": NodeResources(gpu_name="RTX 4090", gpu_vram_mb=24576, gpu_tflops_fp16=165, cpu_cores=16, system_ram_mb=64000),
@@ -349,9 +349,9 @@ def test_async_forwarder_create():
 
 def test_lacp3_full_integration():
     """Test full LACP 3.0 flow: resource scoring → cluster → partition → pipeline."""
-    from synapse.lacp.partitioner import compute_partition
-    from synapse.lacp.resource_weight import NodeResources
-    from synapse.lacp.latency_matrix import LatencyMatrix, LatencyEntry
+    from synapse.topology.partitioner import compute_partition
+    from synapse.topology.resource_weight import NodeResources
+    from synapse.topology.latency_matrix import LatencyMatrix, LatencyEntry
     from synapse.pipeline.scheduler import PipelineScheduler
     
     nodes = {
@@ -415,7 +415,7 @@ def test_largest_remainder_removed():
     ), "LargestRemainderPartitioningStrategy should be deleted"
     
     # Verify LACP 3.0 is available
-    from synapse.lacp.partitioner import compute_partition
+    from synapse.topology.partitioner import compute_partition
     assert compute_partition is not None
     
     print(" [OK] test_largest_remainder_removed")

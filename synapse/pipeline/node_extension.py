@@ -22,8 +22,8 @@ from synapse.inference.distributed_engine import (
     DistributedInferenceSession,
 )
 from synapse.transport.result_router import ResultRouter, RoutedResult
-from synapse.lacp.partitioner import compute_partition
-from synapse.lacp.resource_weight import NodeResources
+from synapse.topology.partitioner import compute_partition
+from synapse.topology.resource_weight import NodeResources
 from synapse.topology.partitioning_strategy import Partition, map_partitions_to_shards
 from synapse.pipeline.gradient_sync import DistributedTrainer, GradientShard
 from synapse.helpers import DEBUG

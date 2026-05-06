@@ -11,8 +11,8 @@ from synapse.inference.inference_engine import InferenceEngine, Shard, get_infer
 from synapse.topology.topology import Topology
 from synapse.topology.device_capabilities import device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.topology.partitioning_strategy import Partition, map_partitions_to_shards
-from synapse.lacp.partitioner import compute_partition, LACPPartition, ShardAssignment
-from synapse.lacp.resource_weight import NodeResources
+from synapse.topology.partitioner import compute_partition, LACPPartition, ShardAssignment
+from synapse.topology.resource_weight import NodeResources
 from synapse import DEBUG
 from synapse.helpers import AsyncCallbackSystem
 from synapse.loading import RepoProgressEvent
@@ -1256,35 +1256,9 @@ class Node:
     self.on_opaque_status.trigger_all(request_id, status)
 
   def _compute_lacp_partition(self, base_shard: Optional[Shard] = None) -> List[Partition]:
-    """Compute partition using LACP 3.0 multi-resource scoring + ILP (if available), returning old Partition format for compatibility."""
+    """Compute partition using LACP multi-resource scoring."""
     num_layers = base_shard.n_layers if base_shard and base_shard.n_layers > 0 else 32
     model_id = base_shard.model_id if base_shard else ""
-
-    # Attempt ILP-based partitioning if PuLP is available and >1 node
-    if len(self.topology.nodes) > 1:
-      from synapse.topology.ilp_partitioner import ILPPartitioner, LayerProfile
-      try:
-        ilp = ILPPartitioner(timeout=30)
-
-        latency_matrix = self._build_latency_matrix() or {}
-        from synapse.topology.latency_clustering import HierarchicalClusterer
-        clusterer = HierarchicalClusterer()
-        clusters = clusterer.cluster(latency_matrix) if latency_matrix else []
-
-        layer_profiles = [LayerProfile(layer_id=i, memory_mb=500.0, compute_flops=0.0) for i in range(num_layers)]
-
-        ilp_partitions = ilp.find_optimal(
-          topology=self.topology,
-          latency_matrix=latency_matrix,
-          clusters=clusters,
-          layer_profiles=layer_profiles,
-          timeout=30,
-        )
-        if ilp_partitions:
-          if DEBUG >= 1: print(f"[ILP] Optimal partition found: {len(ilp_partitions)} partitions")
-          return ilp_partitions
-      except Exception as e:
-        if DEBUG >= 1: print(f"[ILP] Solver failed ({e}), falling back to greedy LACP")
 
     nodes_resources = {}
     for node_id, dc in self.topology.nodes.items():
@@ -1324,7 +1298,7 @@ class Node:
     for nid in node_ids:
       matrix[nid] = {other: 0.0 if other == nid else 50.0 for other in node_ids}
 
-    from synapse.lacp.latency_matrix import LatencyProber
+    from synapse.topology.latency_matrix import LatencyProber
     prober = LatencyProber()
 
     try:

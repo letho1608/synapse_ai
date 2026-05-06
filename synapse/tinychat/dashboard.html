@@ -385,6 +385,10 @@
                             </div>
                             <div class="overview-stats">
                                 <div class="overview-row">
+                                    <span class="text-muted">API URL</span>
+                                    <span class="text-small" x-text="modelStatus.base_url || 'http://localhost:52415'"></span>
+                                </div>
+                                <div class="overview-row">
                                     <span class="text-muted">Model</span>
                                     <span class="badge badge-success" x-show="modelStatus.enabled">Sẵn sàng</span>
                                     <span class="badge badge-muted" x-show="!modelStatus.enabled">-</span>
@@ -985,6 +989,41 @@
                             Mỗi node xử lý phần layers được phân công ở trên.
                         </p>
                     </div>
+
+                    <!-- Peer Graph connections -->
+                    <div class="card" x-show="Object.keys(clusterPeerGraph).length > 0">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-project-diagram" style="color:var(--primary);margin-right:8px"></i>Peer Connections (Topology)</h2>
+                            <span class="badge badge-muted" x-text="Object.keys(clusterPeerGraph).length + ' node(s)'"></span>
+                        </div>
+                        <div class="monitoring-table-wrap" style="overflow-x:auto">
+                            <table class="table monitoring-table">
+                                <thead>
+                                    <tr>
+                                        <th>Node</th>
+                                        <th>Kết nối</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <template x-for="(conns, nid) in clusterPeerGraph" :key="nid">
+                                        <tr>
+                                            <td>
+                                                <strong x-text="nid.length > 16 ? nid.slice(0,14) + '…' : nid"></strong>
+                                            </td>
+                                            <td>
+                                                <template x-for="(conn, i) in conns" :key="i">
+                                                    <div style="font-size:12px; margin:2px 0">
+                                                        <span x-text="conn.description || (conn.from_id ? conn.from_id.slice(0,10) + ' → ' + conn.to_id.slice(0,10) : '-')"></span>
+                                                    </div>
+                                                </template>
+                                                <span x-show="!conns || conns.length === 0" class="text-muted" style="font-size:12px">-</span>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
                 <!-- ===== END CLUSTER PAGE ===== -->
 
@@ -1049,11 +1088,16 @@
                                     <input type="number" class="form-input" min="0" x-model.number="trainingMaxSteps"
                                         placeholder="0">
                                 </div>
-                                <div class="form-group">
-                                    <label class="form-label">Warmup steps</label>
-                                    <input type="number" class="form-input" min="0" x-model.number="trainingWarmupSteps"
-                                        placeholder="0">
-                                </div>
+<div class="form-group">
+                                <label class="form-label">Warmup steps</label>
+                                <input type="number" class="form-input" min="0" x-model.number="trainingWarmupSteps"
+                                    placeholder="0">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Max length (token, tối đa 2048)</label>
+                                <input type="number" class="form-input" min="1" max="2048" x-model.number="trainingMaxLength"
+                                    placeholder="128">
+                            </div>
                             </div>
                         </div>
 
@@ -1314,6 +1358,26 @@
                         <div class="stat-card">
                             <div class="stat-value" x-text="stats.uptime">-</div>
                             <div class="stat-label">Uptime</div>
+                        </div>
+                        <div class="stat-card" x-show="stats.gpu_name">
+                            <div class="stat-value" x-text="stats.gpu_name" style="font-size:13px">-</div>
+                            <div class="stat-label">GPU</div>
+                        </div>
+                        <div class="stat-card" x-show="stats.gpu_vram_gb">
+                            <div class="stat-value" x-text="stats.gpu_vram_used_mb != null ? (stats.gpu_vram_used_mb / 1024).toFixed(1) + ' / ' + stats.gpu_vram_gb + ' GB' : stats.gpu_vram_gb + ' GB'" style="font-size:15px">-</div>
+                            <div class="stat-label">VRAM</div>
+                        </div>
+                        <div class="stat-card" x-show="stats.gpu_utilization !== null">
+                            <div class="stat-value" x-text="stats.gpu_utilization + '%'">0%</div>
+                            <div class="stat-label">GPU Util</div>
+                        </div>
+                        <div class="stat-card" x-show="stats.gpu_power_w !== null">
+                            <div class="stat-value" x-text="stats.gpu_power_w + ' W'">0 W</div>
+                            <div class="stat-label">GPU Power</div>
+                        </div>
+                        <div class="stat-card" x-show="stats.gpu_temp_c !== null">
+                            <div class="stat-value" x-text="stats.gpu_temp_c + ' °C'">0°C</div>
+                            <div class="stat-label">GPU Temp</div>
                         </div>
                     </div>
                     <div class="card">
@@ -1789,6 +1853,7 @@
                 trainingOutputName: '',
                 trainingCheckpointDir: 'checkpoints',
                 trainingSystemPrompt: '',
+                trainingMaxLength: 128,
                 trainingStatus: 'idle',
                 trainingJob: null,
                 trainingLoading: false,
@@ -1819,7 +1884,7 @@
                 clusterTrainingJob: null,
                 clusterStrategyName: '',
                 clusterTotalLayers: 32,
-                _layerChart: null,
+                clusterPeerGraph: {},
                 _flopsChart: null,
                 // === Model filter ===
                 modelSearch: '',
@@ -1926,6 +1991,7 @@
                                 save_every: this.trainingSaveEvery,
                                 max_steps: this.trainingMaxSteps || 0,
                                 warmup_steps: this.trainingWarmupSteps || 0,
+                                max_length: this.trainingMaxLength || undefined,
                                 output_model_name: this.trainingOutputName || undefined,
                                 checkpoint_dir: this.trainingCheckpointDir || undefined,
                                 system_prompt: this.trainingSystemPrompt || undefined
@@ -2273,7 +2339,13 @@
                         this.stats.memory_total_gb = data.memory_total_gb ?? 0;
                         this.stats.uptime = data.uptime ?? '-';
                         this.stats.gpu = data.gpu ?? 'N/A';
+                        this.stats.gpu_name = data.gpu_name ?? null;
+                        this.stats.gpu_vram_gb = data.gpu_vram_gb ?? null;
+                        this.stats.unified_memory = data.unified_memory ?? false;
                         this.stats.gpu_utilization = data.gpu_utilization ?? null;
+                        this.stats.gpu_vram_used_mb = data.gpu_vram_used_mb ?? null;
+                        this.stats.gpu_power_w = data.gpu_power_w ?? null;
+                        this.stats.gpu_temp_c = data.gpu_temp_c ?? null;
                         this.stats.models_count = data.models_count ?? (this.modelList.downloaded || []).length;
                         this.stats.datasets_count = this.datasets.length;
                     } catch (e) {
@@ -2436,6 +2508,7 @@
                         this.clusterStrategyName = data.strategy_name || 'Unknown';
                         this.clusterTotalLayers = data.total_layers || 32;
                         this.clusterTrainingJob = data.training_job || null;
+                        this.clusterPeerGraph = data.peer_graph || {};
                         this.$nextTick(() => this.renderClusterCharts());
                     } catch (e) {
                         console.error('fetchClusterResources:', e);
