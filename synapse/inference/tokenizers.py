@@ -29,24 +29,21 @@ async def resolve_tokenizer(repo_id: Union[str, PathLike]):
 
 
 async def _resolve_tokenizer(repo_id_or_local_path: Union[str, PathLike]):
-  # Xử lý đặc biệt cho các model Qwen sử dụng Sliding Window Attention
   is_qwen = "qwen" in str(repo_id_or_local_path).lower()
-  
+
+  tokenizer_kwargs = {
+    "trust_remote_code": True,
+    "use_fast": False
+  }
+  if is_qwen:
+    tokenizer_kwargs["use_fast"] = True
+
+  loop = asyncio.get_event_loop()
+  def _load():
+    return AutoTokenizer.from_pretrained(repo_id_or_local_path, **tokenizer_kwargs)
+
   try:
-    if DEBUG >= 4: print(f"Trying AutoTokenizer for {repo_id_or_local_path}")
-    
-    # Cấu hình cho tokenizer với các tham số phù hợp với Sliding Window Attention
-    tokenizer_kwargs = {
-        "trust_remote_code": True,
-        "use_fast": False
-    }
-    
-    # Thêm xử lý đặc biệt cho model Qwen
-    if is_qwen:
-        # Qwen models có thể cần cấu hình attention đặc biệt
-        tokenizer_kwargs["use_fast"] = True
-    
-    tokenizer = AutoTokenizer.from_pretrained(repo_id_or_local_path, **tokenizer_kwargs)
+    tokenizer = await loop.run_in_executor(None, _load)
     return tokenizer
   except Exception as e:
     if DEBUG >= 4: print(f"Failed to load tokenizer for {repo_id_or_local_path}. Error: {e}")

@@ -28,6 +28,13 @@ from synapse.topology.partitioning_strategy import Partition, map_partitions_to_
 from synapse.pipeline.gradient_sync import DistributedTrainer, GradientShard
 from synapse.helpers import DEBUG
 
+def _maybe_span(tracer, name: str, ctx, attrs: dict):
+    """Start a tracing span if tracer is available, else no-op context manager."""
+    if tracer is None:
+        import contextlib
+        return contextlib.nullcontext()
+    return tracer.start_span(name, ctx, attrs)
+
 
 class DistributedPipelineExtension:
     def __init__(self, node: Any):
@@ -102,14 +109,33 @@ class DistributedPipelineExtension:
 
         on_token_cb = self._node._on_token_received
 
-        all_tokens = await self._controller.process_distributed_prompt(
-            base_shard=base_shard,
-            prompt=prompt,
-            request_id=request_id,
-            partition_assignments=partitions,
-            max_generate_tokens=token_limit,
-            on_token_callback=on_token_cb,
-        )
+        tracer = getattr(self._node, "tracer", None)
+        if tracer is not None:
+            from synapse.orchestration.tracing import TraceContext
+            tc = TraceContext(request_id=request_id, sequence_number=0)
+            tc.request_span = None
+            attrs = {"node_id": self._node.id, "num_stages": num_stages, "model_id": base_shard.model_id}
+            with tracer.start_span("node.process_prompt_distributed", tc, attrs) as span:
+                all_tokens = await self._controller.process_distributed_prompt(
+                    base_shard=base_shard,
+                    prompt=prompt,
+                    request_id=request_id,
+                    partition_assignments=partitions,
+                    max_generate_tokens=token_limit,
+                    on_token_callback=on_token_cb,
+                )
+                if span and all_tokens:
+                    span.set_attribute("num_tokens", len(all_tokens))
+                return all_tokens
+        else:
+            all_tokens = await self._controller.process_distributed_prompt(
+                base_shard=base_shard,
+                prompt=prompt,
+                request_id=request_id,
+                partition_assignments=partitions,
+                max_generate_tokens=token_limit,
+                on_token_callback=on_token_cb,
+            )
 
         self._node._schedule_task(
             self._node.broadcast_opaque_status(
@@ -241,79 +267,120 @@ class DistributedPipelineExtension:
         partitions = self._get_partition_assignments(base_shard)
         num_stages = len(partitions)
 
-        if not self._trainer:
+        ring_order = [pid for pid, _ in partitions]
+
+        if not self._trainer or self._trainer.world_size != num_stages:
             self._trainer = DistributedTrainer(
+                node_id=self._node.id,
                 world_size=num_stages,
+                ring_order=ring_order,
                 learning_rate=learning_rate,
             )
 
         shard = self._node.get_current_shard(base_shard)
         local_loss = None
 
+        tracer = getattr(self._node, "tracer", None)
         try:
             self._node.outstanding_requests[request_id] = "training"
 
-            if shard.is_first_layer():
-                result, _ = await self._node.inference_engine.infer_tensor(
-                    request_id, shard, input_ids
-                )
-            else:
-                result = input_ids
+            _train_span = None
+            if tracer is not None:
+                from synapse.orchestration.tracing import TraceContext
+                tc = TraceContext(request_id=request_id, sequence_number=0)
+                tc.request_span = None
+                attrs = {"node_id": self._node.id, "world_size": num_stages, "model_id": base_shard.model_id}
+                _train_span = tracer.start_span("node.train_step_distributed", tc, attrs)
 
             loss, grad = await self._node.inference_engine.train(
-                request_id, shard, result, labels, np.ones(result.shape[0])
+                request_id, shard, input_ids, labels,
+                np.ones(input_ids.shape[0] if input_ids.ndim >= 1 else 1),
+                sync_gradients=True,
             )
 
-            grad_shard = GradientShard(
-                node_id=self._node.id,
-                layer_range=(shard.start_layer, shard.end_layer),
-                gradients=grad if grad is not None else {},
-                step=self._trainer._train_step,
-                loss=loss if loss is not None else 0.0,
-            )
+            if grad is None:
+                grad = {}
 
-            async def send_grads(data):
-                encoded = json.dumps({
-                    "node_id": self._node.id,
-                    "grads_shape": None,
-                    "loss": loss,
+            async def send_grads(target_id: str, gradients):
+                data = {k: v.tobytes() for k, v in gradients.items()}
+                shapes = {k: list(v.shape) for k, v in gradients.items()}
+                dtypes = {k: str(v.dtype) for k, v in gradients.items()}
+                payload = json.dumps({
+                    "from_node": self._node.id,
                     "step": self._trainer._train_step,
+                    "data": {k: v.hex() for k, v in data.items()},
+                    "shapes": shapes,
+                    "dtypes": dtypes,
                 })
-                for pid, peer_shard in partitions:
-                    if pid != self._node.id:
-                        await self._node.event_router.publish(
-                            f"synapse/training/gradient/{pid}",
-                            encoded,
-                        )
+                await self._node.event_router.publish(
+                    f"synapse/training/gradient/{target_id}",
+                    payload,
+                )
 
-            async def recv_grads():
+            async def recv_grads(source_id: str):
                 recv_future = asyncio.get_event_loop().create_future()
-                topic = f"synapse/training/gradient/response/{request_id}"
+                topic = f"synapse/training/gradient/{self._node.id}"
 
                 def on_response(event):
-                    if not recv_future.done():
-                        recv_future.set_result(event.data)
+                    if recv_future.done():
+                        return
+                    try:
+                        msg = json.loads(event.data) if isinstance(event.data, str) else event.data
+                        if msg.get("from_node") == source_id:
+                            data = msg.get("data", {})
+                            shapes = msg.get("shapes", {})
+                            dtypes = msg.get("dtypes", {})
+                            gradients = {}
+                            for k, v in data.items():
+                                raw = bytes.fromhex(v)
+                                gradients[k] = np.frombuffer(raw, dtype=np.dtype(dtypes.get(k, "float32"))).reshape(shapes.get(k, []))
+                            recv_future.set_result(gradients)
+                    except Exception:
+                        if not recv_future.done():
+                            recv_future.set_result({})
 
                 self._node.event_router.subscribe(topic, on_response)
                 try:
-                    result = await asyncio.wait_for(recv_future, timeout=30.0)
+                    result = await asyncio.wait_for(recv_future, timeout=60.0)
                     return result
                 finally:
                     self._node.event_router.unsubscribe(topic, on_response)
 
-            updates = self._trainer.step(
-                local_gradients=grad_shard.gradients,
-                local_loss=grad_shard.loss,
+            updates = await self._trainer.step(
+                local_gradients=grad,
+                local_loss=float(loss) if loss else 0.0,
                 send_fn=send_grads,
                 recv_fn=recv_grads,
             )
-            local_loss = self._trainer.average_loss
+            if updates:
+                await self._node.inference_engine.apply_gradient_updates(shard, updates)
+            local_loss = self._trainer.average_loss if self._trainer._loss_history else (float(loss) if loss else 0.0)
+            if _train_span:
+                _train_span.set_attribute("loss", local_loss)
+                _train_span.set_attribute("num_grads", len(grad) if grad else 0)
+                _train_span.set_status(type(_train_span)._status_type.OK)
+                _train_span.end()
+                _train_span = None
 
         except Exception as e:
+            if _train_span:
+                try:
+                    from opentelemetry.trace import Status, StatusCode
+                    _train_span.set_status(Status(StatusCode.ERROR, str(e)))
+                    _train_span.end()
+                except Exception:
+                    pass
+                _train_span = None
             if DEBUG >= 1:
                 import traceback
                 traceback.print_exc()
+            local_loss = None
         finally:
+            if _train_span:
+                try:
+                    _train_span.end()
+                except Exception:
+                    pass
             self._node.outstanding_requests.pop(request_id, None)
 
         return local_loss if local_loss is not None else 0.0

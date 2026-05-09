@@ -31,7 +31,9 @@ from synapse.loading import RepoProgressEvent
 import tempfile
 from synapse.apputil import create_animation_mp4
 from collections import defaultdict
-from synapse.training.finetune_lora import load_raw_data, format_sample_to_text
+from synapse.training.finetune_lora import load_raw_data, load_raw_data_async, format_sample_to_text, _build_lora_config
+from synapse.training.preprocessing import preprocess, preprocess_async
+from synapse.loading import get_checkpoints_dir
 from synapse.models import build_base_shard, get_repo
 from synapse.inference.tokenizers import resolve_tokenizer
 from synapse.api.function_calling import build_tool_instructions, parse_tool_call, parse_tool_calls, run_tool_and_format, run_tools_parallel
@@ -2227,7 +2229,7 @@ class ChatGPTAPI:
       self.activity_logs.pop(0)
 
   async def _run_training_job_distributed(self, job: Dict) -> None:
-    """Training chia tải (mặc định): dùng pipeline Node (enqueue_example), 1 node hoặc nhiều node."""
+    """Training chia tai (mac dinh): dung pipeline Node + Ring All-Reduce, 1 node hoac nhieu node."""
     job_id = job.get("job_id", "")
     model = job.get("model", "")
     dataset_path = (job.get("dataset") or "").strip()
@@ -2236,15 +2238,15 @@ class ChatGPTAPI:
     batch_size = int(job.get("batch_size", 1))
     max_length = min(int(job.get("max_length", 128)), 2048)
     min_max_length = 64
+    min_chars = int(job.get("min_chars", 10))
+    max_chars = int(job.get("max_chars", 100000))
+    skip_dedup = job.get("skip_dedup", False)
+    save_every = int(job.get("save_every", 5))
+    checkpoint_dir = (job.get("checkpoint_dir") or "").strip() or str(get_checkpoints_dir(model))
 
     def _is_cuda_oom_error(exc: Exception) -> bool:
       msg = str(exc).lower()
-      patterns = (
-        "cuda out of memory",
-        "cuda_oom",
-        "outofmemoryerror",
-        "cublas_status_alloc_failed",
-      )
+      patterns = ("cuda out of memory", "cuda_oom", "outofmemoryerror", "cublas_status_alloc_failed",)
       return any(p in msg for p in patterns)
 
     def _clear_cuda_cache() -> None:
@@ -2255,8 +2257,6 @@ class ChatGPTAPI:
       except Exception:
         pass
 
-    # GPU <= 3GB không phù hợp full fine-tune với batch/seq lớn.
-    # Giảm cấu hình để tránh OOM ngay từ bước đầu.
     try:
       import torch
       if torch.cuda.is_available():
@@ -2275,24 +2275,41 @@ class ChatGPTAPI:
       path = self._resolve_dataset_path(dataset_path)
       if path is None:
         job["status"] = "failed"
-        job["error"] = f"Dataset không tồn tại hoặc không hợp lệ: {dataset_path}"
+        job["error"] = f"Dataset khong ton tai hoac khong hop le: {dataset_path}"
         self.log_activity("Training Failed", model, "failed")
         return
-      raw_data = load_raw_data(path)
+      raw_data = await load_raw_data_async(path)
       if not raw_data:
         job["status"] = "failed"
-        job["error"] = "Dataset rỗng"
+        job["error"] = "Dataset rong"
         self.log_activity("Training Failed", model, "failed")
         return
-        
-      # Kiểm tra nếu là dữ liệu OCR (Hình ảnh)
+
       is_ocr = False
       if isinstance(raw_data, list) and len(raw_data) > 0:
           if "image_path" in raw_data[0]:
               is_ocr = True
-              
+
+      if not is_ocr:
+        pp = await preprocess_async(raw_data, format_type="auto", min_chars=min_chars, max_chars=max_chars, dedup=not skip_dedup,)
+        raw_data = pp["processed_samples"]
+        job["preprocess"] = {
+          "original_count": pp["original_count"],
+          "empty_removed": pp["empty_removed"],
+          "short_removed": pp["short_removed"],
+          "duplicate_removed": pp["duplicate_removed"],
+          "validation_errors": pp["validation_errors"],
+          "valid_count": pp["valid_count"],
+          "format_detected": pp["format_detected"],
+        }
+        if not raw_data:
+          job["status"] = "failed"
+          job["error"] = "Khong co mau hop le sau tien xu ly"
+          self.log_activity("Training Failed", model, "failed")
+          return
+
       if is_ocr:
-          print(f"[Training] Bắt đầu huấn luyện OCR (CRNN) phân tán cho model: {model}")
+          print(f"[Training] Bat dau huan luyen OCR (CRNN) phan tan cho model: {model}")
           from synapse.training.ocr_trainer import train_crnn_ocr
           await train_crnn_ocr(job, raw_data, self.node)
           return
@@ -2354,6 +2371,28 @@ class ChatGPTAPI:
         total_steps = max(1, planned_steps)
       step_count = 0
       effective_max_length = max_length
+      world_size = len(getattr(self.node, "peers", [])) + 1
+      ext = getattr(self.node, "_pipeline_extension", None)
+      lr_val = float((job.get("learning_rate") or "1e-5").strip()) if job.get("learning_rate") else 1e-5
+      save_every = int(job.get("save_every", 5))
+      checkpoint_dir = (job.get("checkpoint_dir") or "").strip() or str(get_checkpoints_dir(model))
+      use_lora = job.get("use_lora", False)
+
+      if use_lora:
+        try:
+          lora_config = _build_lora_config(job)
+          if lora_config is not None:
+            from peft import get_peft_model
+            engine = self.node.inference_engine
+            if hasattr(engine, "_model") and engine._model is not None:
+              engine._model = get_peft_model(engine._model, lora_config)
+              if hasattr(engine._model, "print_trainable_parameters"):
+                engine._model.print_trainable_parameters()
+              job["lora_applied"] = True
+        except Exception as e:
+          if DEBUG >= 1:
+            print(f"[Training] LoRA prepare failed: {e}")
+
       for epoch in range(epochs):
         if self._training_job is None or self._training_job.get("job_id") != job_id:
           return
@@ -2376,14 +2415,19 @@ class ChatGPTAPI:
 
             try:
               example_np, target_np, length_np = tokenize_batch(current_batch_texts, effective_max_length)
-              loss = await self.node.enqueue_example(
-                base_shard,
-                example_np,
-                target_np,
-                length_np,
-                request_id=str(uuid.uuid4()),
-                train=True,
-              )
+
+              if ext is not None and world_size > 1:
+                import uuid
+                loss = await ext.train_step_distributed(
+                  base_shard, example_np, target_np,
+                  request_id=str(uuid.uuid4()),
+                  learning_rate=lr_val,
+                )
+              else:
+                loss = await self.node.enqueue_example(
+                  base_shard, example_np, target_np, length_np,
+                  request_id=str(uuid.uuid4()), train=True,
+                )
               if loss is None:
                 raise RuntimeError("Training step trả về loss=None")
               if isinstance(loss, (int, float)):
@@ -2440,6 +2484,13 @@ class ChatGPTAPI:
               )
               self.log_activity("Training Failed", model, "failed")
               return
+
+        if save_every > 0 and (epoch + 1) % save_every == 0:
+          try:
+            await self.node.coordinate_save(base_shard, epoch + 1, str(checkpoint_dir))
+          except Exception:
+            pass
+
       if self._training_job and self._training_job.get("job_id") == job_id:
         job["status"] = "completed"
         job["progress"] = 100
@@ -2494,10 +2545,18 @@ class ChatGPTAPI:
       output_model_name = (body.get("output_model_name") or body.get("output_name") or "").strip() or None
       checkpoint_dir = (body.get("checkpoint_dir") or "").strip() or None
       system_prompt = (body.get("system_prompt") or body.get("system") or "").strip() or None
+      min_chars = int(body.get("min_chars", 10))
+      max_chars = int(body.get("max_chars", 100000))
+      skip_dedup = body.get("skip_dedup", False)
+      use_lora = body.get("use_lora", False)
+      lora_r = int(body.get("lora_r", 8))
+      lora_alpha = int(body.get("lora_alpha", 16))
+      lora_dropout = float(body.get("lora_dropout", 0.05))
+      lora_target_modules = body.get("lora_target_modules") or "q_proj,v_proj,k_proj,o_proj"
       if not model:
-        return web.json_response({"success": False, "message": "Thiếu model"}, status=400)
+        return web.json_response({"success": False, "message": "Thieu model"}, status=400)
       if not dataset:
-        return web.json_response({"success": False, "message": "Thiếu dataset (path)"}, status=400)
+        return web.json_response({"success": False, "message": "Thieu dataset (path)"}, status=400)
       job_id = str(uuid.uuid4())
       self._training_job = {
         "job_id": job_id,
@@ -2514,6 +2573,14 @@ class ChatGPTAPI:
         "checkpoint_dir": checkpoint_dir,
         "system_prompt": system_prompt,
         "base_model_id": model,
+        "min_chars": min_chars,
+        "max_chars": max_chars,
+        "skip_dedup": skip_dedup,
+        "use_lora": use_lora,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "lora_target_modules": lora_target_modules,
         "status": "started",
         "progress": 0,
         "current_epoch": 0,

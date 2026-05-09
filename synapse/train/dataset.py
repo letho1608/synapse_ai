@@ -1,4 +1,5 @@
 #Dataset utilities for training
+import asyncio
 from pathlib import Path
 import numpy as np
 import json
@@ -63,6 +64,23 @@ class Dataset:
   def __len__(self):
     return len(self._data)
 
+  @classmethod
+  async def from_path_async(cls, path: Path, preprocess=lambda item: item, loadline=json.loads):
+    """Async version - loads file I/O in thread executor."""
+    loop = asyncio.get_event_loop()
+    def _load():
+      with open(path, "r") as fid:
+        data = [loadline(l) for l in fid]
+      maxlen = max(len(preprocess(x)) for x in data)
+      return data, maxlen
+    result = await loop.run_in_executor(None, _load)
+    data, maxlen = result
+    instance = cls.__new__(cls)
+    instance._data = data
+    instance.preprocess = preprocess
+    instance._maxlen = maxlen
+    return instance
+
 
 def load_dataset(data_path: str, preprocess=lambda i: i, loadline=json.loads):
   def load_and_check(name):
@@ -75,6 +93,20 @@ def load_dataset(data_path: str, preprocess=lambda i: i, loadline=json.loads):
 
   names = ("train", "valid", "test")
   train, valid, test = (load_and_check(n) for n in names)
-
   return train, valid, test
+
+
+async def load_dataset_async(data_path: str, preprocess=lambda i: i, loadline=json.loads):
+  """Async version - loads all splits in parallel using thread executors."""
+  names = ("train", "valid", "test")
+  async def load_and_check_async(name):
+    dataset_path = Path(data_path) / f"{name}.jsonl"
+    try:
+      return await Dataset.from_path_async(dataset_path, preprocess=preprocess, loadline=loadline)
+    except Exception as e:
+      print(f"Unable to build dataset {dataset_path} ({e})")
+      raise
+
+  results = await asyncio.gather(*(load_and_check_async(n) for n in names))
+  return results  # (train, valid, test)
 

@@ -21,7 +21,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from synapse.pipeline.gradient_sync import (
     GradientShard,
-    ReducedGradients,
     RingAllReducer,
     DistributedTrainer,
 )
@@ -56,10 +55,10 @@ class TestRingAllReducer:
         assert reducer.get_successor("node-2") == "node-0"
 
     def test_scale_for_update(self):
-        reducer = RingAllReducer(4)
+        trainer = DistributedTrainer(node_id="n0", world_size=4, ring_order=["n0"], learning_rate=1.0, max_grad_norm=999.0)
         grads = {"w": np.array([8.0, 16.0, 32.0])}
-        scaled = reducer.scale_for_update(grads, world_size=4)
-        assert np.allclose(scaled["w"], [2.0, 4.0, 8.0])
+        result = asyncio.run(trainer.step(local_gradients=grads, local_loss=1.0, send_fn=None, recv_fn=None))
+        assert np.allclose(result["w"], [-2.0, -4.0, -8.0])
 
     def test_total_bytes(self):
         gs = GradientShard(

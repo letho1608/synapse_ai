@@ -14,7 +14,6 @@ from .stage import (
 )
 from .gradient_sync import (
     GradientShard,
-    ReducedGradients,
     RingAllReducer,
     DistributedTrainer,
 )
@@ -40,7 +39,6 @@ __all__ = [
     "StageResult",
     "StageStats",
     "GradientShard",
-    "ReducedGradients",
     "RingAllReducer",
     "DistributedTrainer",
     "ShardCheckpoint",

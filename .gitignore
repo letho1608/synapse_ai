@@ -12,5 +12,6 @@ data/models/
 .roo/
 .code-graph-review/
 test_logs/
+.synapse_checkpoints/
 
 .hf_cache/

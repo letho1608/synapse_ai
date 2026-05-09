@@ -10,6 +10,7 @@ import os
 import time
 import subprocess
 import json
+import tempfile
 import uuid
 import urllib.request
 import urllib.error
@@ -137,7 +138,7 @@ def run_p2p_cluster_test(model_name: str, prompt: str):
     print(f"{'SYNAPSE AI - FULL CLUSTER TEST (LACP & P2P)'.center(64)}")
     print(f"{'='*64}\n")
 
-    temp_dir = os.path.join(ROOT, "test_logs")
+    temp_dir = os.path.join(tempfile.gettempdir(), "synapse_test_logs")
     os.makedirs(temp_dir, exist_ok=True)
 
     # Generate manual discovery config

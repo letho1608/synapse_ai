@@ -36,10 +36,11 @@ class InferenceEngine(ABC):
   async def save_checkpoint(self, shard: Shard, path: str):
     pass
 
-  async def train(self, request_id: str, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, backgrad: Optional[np.ndarray] = None, loss: str = "forward") -> Tuple[Optional[float], Optional[np.ndarray]]:
-      """Training phân tán (chia layer): last layer tính loss; các layer khác nhận backgrad. Subclass nên override."""
-      # Default: chỉ forward, không training (对于 chỉ forward qua các layer)
+  async def train(self, request_id: str, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, backgrad: Optional[np.ndarray] = None, loss: str = "forward", sync_gradients: bool = False) -> Tuple[Optional[float], Optional[np.ndarray]]:
       return None, None
+
+  async def apply_gradient_updates(self, shard: Shard, updates: dict) -> None:
+      pass
   
   async def evaluate(self, request_id: str, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray) -> Optional[float]:
       """Đánh giá (eval) phân tán. Subclass nên override."""

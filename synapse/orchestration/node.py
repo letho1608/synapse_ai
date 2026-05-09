@@ -21,7 +21,13 @@ from synapse.routing import EventRouter, Event
 from synapse.routing.libp2p_node import Libp2pNode
 from synapse.orchestration.election import ElectionManager
 from synapse.networking.peer_handle import PeerHandle
+from synapse.shared.state import ClusterState, NodeState
 from synapse.monitoring.realtime import RealtimeMonitor, NodeMetrics
+
+try:
+    from synapse.orchestration.tracing import tracer
+except ImportError:
+    tracer = None
 
 class Node:
   def __init__(
@@ -80,6 +86,7 @@ class Node:
     self.event_router.subscribe("synapse/cluster/topology", self.on_p2p_topology_broadcast)
     # CRITICAL FIX: Subscribe to authoritative partition broadcasts from master.
     self.event_router.subscribe("synapse/cluster/partition", self.on_p2p_partition_broadcast)
+    self.event_router.subscribe("synapse/cluster/state", self.on_p2p_cluster_state)
     self._setup_p2p_rpc_handlers()
 
     self.node_download_progress: Dict[str, RepoProgressEvent] = {}
@@ -98,6 +105,9 @@ class Node:
     self._on_opaque_status = AsyncCallbackSystem()
 
     self.monitor = RealtimeMonitor()
+    self.cluster_state = ClusterState(master_node_id=None)
+    self.tracer = tracer
+
     self._current_metrics: NodeMetrics = NodeMetrics()
 
     # Register internal callback for token synchronization in distributed mode
@@ -174,6 +184,53 @@ class Node:
     self._lazy_init_fault_tolerance()
     if self.fault_tolerance:
         await self.fault_tolerance.start()
+
+    self.cluster_state.update_node(self.id, {
+        "device": str(self.device_capabilities),
+        "max_concurrent_requests": self.max_concurrent_requests,
+        "has_inference_engine": self.inference_engine is not None,
+    })
+    await self._broadcast_cluster_state()
+    self._schedule_task(self._cluster_state_heartbeat(), "cluster_state_heartbeat")
+
+  async def _cluster_state_heartbeat(self) -> None:
+    """Periodically update own node state and broadcast to cluster."""
+    while True:
+        await asyncio.sleep(5.0)
+        self.cluster_state.update_node(self.id, {
+            "device": str(self.device_capabilities),
+            "max_concurrent_requests": self.max_concurrent_requests,
+            "has_inference_engine": self.inference_engine is not None,
+        })
+        self.cluster_state.remove_stale_nodes(timeout=30.0)
+        try:
+            await self._broadcast_cluster_state()
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"Cluster state broadcast failed: {e}")
+
+  async def _broadcast_cluster_state(self) -> None:
+    """Broadcast cluster state to all peers via P2P event router."""
+    import msgpack
+    state_dict = self.cluster_state.to_dict()
+    payload = msgpack.packb(state_dict)
+    await self.event_router.publish("synapse/cluster/state", {"data": payload})
+
+  async def on_p2p_cluster_state(self, event: Event) -> None:
+    """Receive and merge cluster state from a peer node."""
+    import msgpack
+    try:
+        data = event.data if isinstance(event.data, bytes) else event.data.get("data", b"")
+        peer_state = msgpack.unpackb(data)
+        peer_version = peer_state.get("version", 0)
+        if peer_version > self.cluster_state.version:
+            for nid, nstate in peer_state.get("nodes", {}).items():
+                self.cluster_state.update_node(nid, nstate.get("capabilities", {}))
+            self.cluster_state.version = peer_version
+            self.cluster_state.updated_at = peer_state.get("updated_at", time.time())
+    except Exception as e:
+        if DEBUG >= 1:
+            print(f"Failed to merge peer cluster state: {e}")
 
   async def stop(self) -> None:
     if DEBUG >= 1: print("Stopping node: Cleaning up components...")
@@ -620,10 +677,22 @@ class Node:
         }),
       )
     )
-    start_time = time.perf_counter_ns()
-    resp = await self._process_prompt(base_shard, prompt, request_id, inference_state, max_generate_tokens)
-    end_time = time.perf_counter_ns()
-    elapsed_time_ns = end_time - start_time
+    if self.tracer is not None:
+      from synapse.orchestration.tracing import TraceContext
+      trace_ctx = TraceContext(request_id=request_id or "", sequence_number=0)
+      trace_ctx.request_span = None
+      with self.tracer.start_span("node.process_prompt", trace_ctx, {"node_id": self.id, "prompt_len": len(prompt)}) as span:
+        _start = time.perf_counter_ns()
+        resp = await self._process_prompt(base_shard, prompt, request_id, inference_state, max_generate_tokens)
+        _elapsed = time.perf_counter_ns() - _start
+        if span:
+          span.set_attribute("request_id", request_id or "")
+          span.set_attribute("elapsed_ms", _elapsed / 1e6)
+        return resp
+    else:
+      _start = time.perf_counter_ns()
+      resp = await self._process_prompt(base_shard, prompt, request_id, inference_state, max_generate_tokens)
+      elapsed_time_ns = time.perf_counter_ns() - _start
     self._schedule_task(
       self.broadcast_opaque_status(
         request_id,

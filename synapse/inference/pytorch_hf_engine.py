@@ -495,9 +495,20 @@ class PyTorchHFInferenceEngine(InferenceEngine):
 
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
+            loop = asyncio.get_event_loop()
+
+            def _tok_local():
+                return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True, local_files_only=True)
+            def _model_local():
+                return AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw, local_files_only=True)
+            def _tok_remote():
+                return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+            def _model_remote():
+                return AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw)
+
             try:
-                self.tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True, local_files_only=True)
-                self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw, local_files_only=True)
+                self.tokenizer = await loop.run_in_executor(None, _tok_local)
+                self._model = await loop.run_in_executor(None, _model_local)
             except (OSError, ValueError):
                 # --- [P2P LAN Cache Sync] ---
                 try:
@@ -510,16 +521,13 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                         self_ips = set(ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip)
                         urls = get_synapse_api_urls_from_node_list(nodes, api_port=52415, only_synapse_nodes=True, exclude_ips=self_ips)
                         if urls:
-                            master_url = urls[0] # Node cao điểm nhất (Election Master)
+                            master_url = urls[0]
                             if DEBUG >= 1: print(f"[PyTorchHF] Requesting P2P LAN Cache sync from: {master_url}...")
-                            # Trong thực tế: Dùng aiohttp_client để scan `repo_files` và tải đè local_dir.
-                            # Tạm thời dùng fallback gốc vì thay đổi HF_HOME/blob hash rất dễ gây lỗi nạp (Corrupt file).
                 except Exception as e:
                     if DEBUG >= 2: print(f"[P2P Sync Exception]: {e}")
-                
-                # Fallback to direct HF download
-                self.tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
-                self._model = AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw)
+
+                self.tokenizer = await loop.run_in_executor(None, _tok_remote)
+                self._model = await loop.run_in_executor(None, _model_remote)
 
             # ÉP MODEL LÊN GPU (Nếu không dùng quantization/device_map)
             if hw["device"] == "cuda" and "device_map" not in load_model_kw:
@@ -700,88 +708,92 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         length: np.ndarray,
         backgrad: Optional[np.ndarray] = None,
         loss: str = "forward",
+        sync_gradients: bool = False,
     ) -> Tuple[Optional[float], Optional[np.ndarray]]:
-        """
-        Huấn luyện phân tán: 
-        Hỗ trợ cả Causal LLM (CrossEntropy) và Vision/OCR (CTCLoss).
-        """
         await self.ensure_shard(shard)
         if loss == "back_gradient":
             if DEBUG >= 1:
-                print("[PyTorchHF] train(back_gradient) chưa implement cho nhiều node; bỏ qua.")
+                print("[PyTorchHF] train(back_gradient) chua implement cho nhieu node; bo qua.")
             return None, None
-            
+
         try:
             import torch
             import torch.nn.functional as F
             from torch import nn
-            
+
             if self._model is None:
                 return None, None
-                
+
             device = self._device
             self._model.train()
-            
-            # 1. Kiểm tra nếu là dữ liệu Vision (OCR)
-            # example shape: [B, 1, H, W]
+
             is_vision = len(target.shape) > 0 and len(example.shape) == 4
-            
+
             if is_vision:
-                # --- OCR TRAINING (CTCLoss) ---
                 imgs = torch.from_numpy(example).to(device)
                 labels = torch.from_numpy(target).to(device)
                 label_lens = torch.from_numpy(length).to(device)
-                
-                # Forward
-                preds = self._model(imgs) # [T, B, C]
+                preds = self._model(imgs)
                 T = preds.size(0)
                 batch_size = imgs.size(0)
                 input_lens = torch.full(size=(batch_size,), fill_value=T, dtype=torch.int32).to(device)
-                
-                # Log Softmax
                 preds = preds.log_softmax(2)
-                
-                # CTCLoss (blank=0 mặc định trong ocr_trainer)
                 criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True).to(device)
                 loss_val = criterion(preds, labels, input_lens, label_lens)
             else:
-                # --- LLM TRAINING (CrossEntropy) ---
                 if example.dtype != np.int64:
                     example = example.astype(np.int64)
                 if target.dtype != np.int64:
                     target = target.astype(np.int64)
-                    
                 input_ids = torch.from_numpy(example).to(device)
                 labels = torch.from_numpy(target).to(device)
-                
                 if input_ids.dim() == 1:
                     input_ids = input_ids.unsqueeze(0)
                 if labels.dim() == 1:
                     labels = labels.unsqueeze(0)
-                    
                 out = self._model(input_ids)
                 logits = out.logits if hasattr(out, "logits") else out[0]
-                
-                # Causal LM shift
                 shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
                 shift_labels = labels[..., 1:].contiguous().view(-1)
                 loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
 
-            # 2. Backward & Step
             opt = self._get_optimizer()
             if opt is not None:
                 opt.zero_grad()
                 loss_val.backward()
                 torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
-                opt.step()
-                
+
+                if sync_gradients:
+                    grads = {}
+                    for name, param in self._model.named_parameters():
+                        if param.grad is not None:
+                            grads[name] = param.grad.detach().cpu().numpy().copy()
+                    return float(loss_val.item()), grads
+                else:
+                    opt.step()
+
             return float(loss_val.item()), None
-            
+
         except Exception as e:
             if DEBUG >= 1:
                 import traceback
                 traceback.print_exc()
             raise RuntimeError(f"PyTorchHF train error: {e}") from e
+
+    async def apply_gradient_updates(self, shard: Shard, updates: dict) -> None:
+        if self._model is None:
+            return
+        try:
+            import torch
+            for name, param in self._model.named_parameters():
+                if name in updates:
+                    update_val = torch.from_numpy(updates[name]).to(param.device).to(param.dtype)
+                    param.data.add_(update_val)
+            if DEBUG >= 2:
+                print(f"[PyTorchHF] Applied {len(updates)} gradient updates")
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"[PyTorchHF] apply_gradient_updates error: {e}")
 
     async def evaluate(
         self,

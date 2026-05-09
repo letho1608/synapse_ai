@@ -87,7 +87,10 @@ class FaultToleranceManager:
     CHECKPOINT_INTERVAL = 30.0  # seconds between state snapshots
     MAX_MISSES = 3             # consecutive missed heartbeats before blacklisting
 
-    def __init__(self, node_id: str, checkpoint_dir: str = ".synapse_checkpoints"):
+    def __init__(self, node_id: str, checkpoint_dir: str = None):
+        if checkpoint_dir is None:
+            from synapse.loading import get_checkpoints_dir
+            checkpoint_dir = get_checkpoints_dir()
         self.node_id = node_id
         self.checkpoint_dir = checkpoint_dir
         self._health: Dict[str, NodeHealth] = {}
