@@ -223,6 +223,55 @@
         .model-family-btn:hover:not(.active) {
             background: var(--surface-hover)
         }
+
+        /* === OCR Training Tab styles === */
+        .training-tab-bar {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid var(--border);
+            padding-bottom: 0;
+        }
+        .training-tab-btn {
+            padding: 8px 20px;
+            border: none;
+            background: transparent;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            color: var(--text-muted);
+            border-bottom: 3px solid transparent;
+            margin-bottom: -2px;
+            transition: all .2s;
+            border-radius: 6px 6px 0 0;
+        }
+        .training-tab-btn.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+            background: rgba(15,118,110,.06);
+        }
+        .training-tab-btn:hover:not(.active) { background: var(--surface-hover); color: var(--text-primary); }
+
+        .ocr-upload-zone {
+            border: 2px dashed var(--border);
+            border-radius: var(--radius-lg);
+            padding: 28px 20px;
+            text-align: center;
+            background: var(--surface-hover);
+            cursor: pointer;
+            transition: all .2s;
+        }
+        .ocr-upload-zone:hover { border-color: var(--primary); background: rgba(15,118,110,.04); }
+        .ocr-upload-zone.has-file { border-color: #059669; background: #D1FAE5; }
+        .ocr-dataset-info {
+            background: var(--surface-hover);
+            border-radius: var(--radius-md);
+            padding: 12px 16px;
+            margin-top: 12px;
+            font-size: 13px;
+        }
+        .ocr-stat-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--divider); }
+        .ocr-stat-row:last-child { border-bottom: none; }
     </style>
 </head>
 
@@ -276,8 +325,8 @@
                 </a>
                 <a href="#" class="nav-item" :class="{ 'active': currentPage === 'monitoring' }"
                     @click="currentPage = 'monitoring'; sidebarOpen = false">
-                    <i class="fas fa-chart-line"></i>
-                    <span>Giám Sát</span>
+                    <i class="fas fa-server"></i>
+                    <span>Mạng & Hệ thống</span>
                 </a>
                 <a href="#" class="nav-item" :class="{ 'active': currentPage === 'settings' }"
                     @click="currentPage = 'settings'; sidebarOpen = false; fetchModelList(); fetchSettings()">
@@ -305,109 +354,75 @@
             <!-- Content -->
             <div class="content">
                 <!-- Dashboard Page -->
-                <div x-show="currentPage === 'dashboard'">
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-value" x-text="stats.models_count">0</div>
-                            <div class="stat-label">Mô Hình</div>
+                <div x-show="currentPage === 'dashboard'" x-cloak>
+                    <!-- Cluster KPI Row -->
+                    <div class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: var(--spacing-lg);">
+                        <div class="stat-card" style="border-left: 4px solid var(--primary);">
+                            <div class="stat-value" x-text="clusterResources.length">0</div>
+                            <div class="stat-label">Nodes Hoạt Động</div>
                         </div>
-                        <div class="stat-card">
-                            <div class="stat-value" x-text="stats.datasets_count">0</div>
-                            <div class="stat-label">Dataset</div>
+                        <div class="stat-card" style="border-left: 4px solid #D97706;">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.flops_fp16||0),0).toFixed(1) + ' TF'">0 TF</div>
+                            <div class="stat-label">Sức Mạnh Cluster (FP16)</div>
                         </div>
-                        <div class="stat-card">
-                            <div class="stat-value" x-text="stats.cpu + '%'">0%</div>
-                            <div class="stat-label">CPU</div>
+                        <div class="stat-card" style="border-left: 4px solid #059669;">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.vram_gb||0),0).toFixed(1) + ' GB'">0 GB</div>
+                            <div class="stat-label">Tổng VRAM Cluster</div>
                         </div>
-                        <div class="stat-card">
-                            <div class="stat-value" x-text="stats.memory + '%'">0%</div>
-                            <div class="stat-label">RAM</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value"
-                                x-text="stats.gpu_utilization != null ? stats.gpu_utilization + '%' : 'N/A'">N/A</div>
-                            <div class="stat-label">GPU</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value" x-text="stats.uptime">-</div>
-                            <div class="stat-label">Uptime</div>
+                        <div class="stat-card" style="border-left: 4px solid #0EA5E9;">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.ram_gb||0),0).toFixed(1) + ' GB'">0 GB</div>
+                            <div class="stat-label">Tổng RAM Cluster</div>
                         </div>
                     </div>
 
-                    <div class="dashboard-overview-grid">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--spacing-lg); margin-bottom: var(--spacing-lg);">
+                        <!-- Trạng thái dịch vụ -->
                         <div class="card">
                             <div class="card-header">
-                                <h2 class="card-title">Tổng quan cluster</h2>
-                                <span class="badge badge-success"
-                                    x-show="clusterResources.length > 0"
-                                    x-text="clusterResources.length + ' node'"></span>
-                                <span class="badge badge-muted"
-                                    x-show="clusterResources.length === 0">Chưa có
-                                    cluster</span>
+                                <h2 class="card-title">Trạng thái API & Model</h2>
                             </div>
                             <div class="overview-stats">
                                 <div class="overview-row">
-                                    <span class="text-muted">Thiết bị Tailscale</span>
-                                    <strong x-text="tailscaleNodes.length">0</strong>
+                                    <span class="text-muted">Địa chỉ API</span>
+                                    <span class="text-small" style="font-family: monospace;" x-text="modelStatus.base_url || 'http://localhost:52415'"></span>
                                 </div>
                                 <div class="overview-row">
-                                    <span class="text-muted">Node đang online</span>
-                                    <strong x-text="clusterResources.length">0</strong>
-                                </div>
-                                <div class="overview-row">
-                                    <span class="text-muted">Tổng lõi CPU (online)</span>
-                                    <strong
-                                        x-text="clusterResources.reduce((s, n) => s + (n.cpu_cores ?? 0), 0)">0</strong>
-                                </div>
-                                <div class="overview-row">
-                                    <span class="text-muted">Tổng RAM hệ thống (online)</span>
-                                    <strong
-                                        x-text="clusterResources.reduce((s, n) => s + (n.ram_gb ?? 0), 0).toFixed(1) + ' GB'">0
-                                        GB</strong>
-                                </div>
-                                <div class="overview-row">
-                                    <span class="text-muted">Tổng VRAM GPU (online)</span>
-                                    <strong
-                                        x-text="clusterResources.reduce((s, n) => s + (n.vram_gb ?? 0), 0).toFixed(1) + ' GB'">0
-                                        GB</strong>
-                                </div>
-                                <div class="overview-row">
-                                    <span class="text-muted">Tổng ổ đĩa (online)</span>
-                                    <strong
-                                        x-text="clusterResources.reduce((s, n) => s + (n.disk_gb ?? 0), 0) + ' GB'">0
-                                        GB</strong>
-                                </div>
-                            </div>
-                            </div>
-                            <div class="card">
-                            <div class="card-header">
-                            <h2 class="card-title">Trạng thái dịch vụ</h2>
-                            </div>
-                            <div class="overview-stats">
-                                <div class="overview-row">
-                                    <span class="text-muted">API URL</span>
-                                    <span class="text-small" x-text="modelStatus.base_url || 'http://localhost:52415'"></span>
-                                </div>
-                                <div class="overview-row">
-                                    <span class="text-muted">Model</span>
+                                    <span class="text-muted">Trạng thái Model</span>
                                     <span class="badge badge-success" x-show="modelStatus.enabled">Sẵn sàng</span>
-                                    <span class="badge badge-muted" x-show="!modelStatus.enabled">-</span>
+                                    <span class="badge badge-muted" x-show="!modelStatus.enabled">Chưa tải</span>
                                 </div>
                                 <div class="overview-row">
-                                    <span class="text-muted">Danh sách model</span>
-                                    <span class="text-small" x-text="(modelStatus.models || []).length"></span>
+                                    <span class="text-muted">Model đang chạy</span>
+                                    <span class="text-small" style="font-weight: 600;" x-text="selectedModel || '-'"></span>
                                 </div>
                                 <div class="overview-row">
-                                    <span class="text-muted">Phân mảnh Model</span>
+                                    <span class="text-muted">Phân mảnh Layer</span>
                                     <span class="text-small" x-text="distributedStatus.partitions_count || 0">0</span>
                                 </div>
+                            </div>
+                        </div>
+
+                        <!-- Máy chủ hiện tại -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">Máy chủ này (Local Node)</h2>
+                            </div>
+                            <div class="overview-stats">
                                 <div class="overview-row">
-                                    <span class="text-muted">API Chat</span>
-                                    <span class="text-small">/v1/chat/completions</span>
+                                    <span class="text-muted">CPU / RAM</span>
+                                    <span class="text-small" x-text="stats.cpu + '% / ' + stats.memory + '%'"></span>
                                 </div>
                                 <div class="overview-row">
-                                    <span class="text-muted">GPU (máy này)</span>
+                                    <span class="text-muted">GPU Local</span>
                                     <span class="text-small" x-text="stats.gpu || 'N/A'"></span>
+                                </div>
+                                <div class="overview-row">
+                                    <span class="text-muted">Uptime hệ thống</span>
+                                    <span class="text-small" x-text="stats.uptime || '-'"></span>
+                                </div>
+                                <div class="overview-row">
+                                    <span class="text-muted">Giao thức Mạng</span>
+                                    <span class="badge badge-info" x-text="tailscaleNodes.length > 1 ? 'Tailscale Mesh' : 'Local Only'"></span>
                                 </div>
                             </div>
                         </div>
@@ -547,20 +562,22 @@
                 <!-- Test Page - Giao diện chat kiểu ChatGPT -->
                 <div x-show="currentPage === 'test'" x-cloak class="test-page-wrap">
                     <div class="chat-layout">
-                        <div class="chat-toolbar">
-                            <h2 class="card-title" style="margin: 0;">Chat với Model</h2>
-                            <div class="chat-toolbar-actions">
-                                <select class="form-select chat-select-model" x-model="selectedModel"
-                                    title="Chọn model">
-                                    <option value="">-- Chọn model --</option>
+                        <div class="chat-toolbar" style="display: flex; justify-content: space-between; align-items: center; padding-bottom: 12px; border-bottom: 1px solid var(--border); margin-bottom: 12px;">
+                            <div style="display: flex; align-items: center; gap: 12px;">
+                                <h2 class="card-title" style="margin: 0;"><i class="fas fa-flask" style="color:var(--primary); margin-right: 6px;"></i>Kiểm thử Model</h2>
+                                <span class="badge" x-show="selectedModel" :class="(selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr')) ? 'badge-warning' : 'badge-primary'" x-text="(selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr')) ? 'Vision / OCR' : 'Text / NLP'"></span>
+                            </div>
+                            <div class="chat-toolbar-actions" style="display: flex; gap: 8px; align-items: center;">
+                                <select class="form-select chat-select-model" x-model="selectedModel" title="Chọn model" style="min-width: 200px;">
+                                    <option value="">-- Chọn model đã tải --</option>
                                     <template x-for="m in modelList.downloaded" :key="m.name">
                                         <option :value="m.name" x-text="m.name"></option>
                                     </template>
                                 </select>
-                                <label class="chat-temp-label">
-                                    <span class="text-muted">Temp.</span>
+                                <label class="chat-temp-label" style="display: flex; align-items: center; gap: 6px; background: var(--surface-hover); padding: 4px 8px; border-radius: 6px;" x-show="!(selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr'))">
+                                    <span class="text-muted" style="font-size: 13px;">Temp</span>
                                     <input type="number" class="form-input" min="0" max="2" step="0.1"
-                                        x-model.number="testTemperature" placeholder="0.7" style="width: 64px;">
+                                        x-model.number="testTemperature" placeholder="0.7" style="width: 50px; padding: 2px 6px; height: 26px;">
                                 </label>
                                 <button type="button" class="btn btn-outline btn-sm" @click="testChatMessages = []"
                                     title="Xóa lịch sử chat" :disabled="isTesting">
@@ -574,13 +591,30 @@
                         </div>
                         <div id="chat-messages" class="chat-messages" x-ref="chatMessages">
                             <template x-if="testChatMessages.length === 0">
-                                <div class="chat-placeholder">
-                                    <p class="text-muted">Nhập tin nhắn bên dưới và nhấn Enter hoặc nút Gửi để bắt đầu.
-                                        Chọn model đã tải trước khi chat.</p>
-                                    <p class="text-muted" style="margin-top: 8px; font-size: 12px;">Để chat tự nhiên:
-                                        dùng model <strong>Instruct/Chat</strong> (vd. qwen2.5:1.5b, llama3.2:3b,
-                                        phi3:mini). Model <strong>Code</strong> (codellama, starcoder2, deepseek-coder)
-                                        dành cho code, có thể trả lời ngắn hoặc lặp khi dùng như chat.</p>
+                                <div class="chat-placeholder" style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; text-align:center; padding: 20px;">
+                                    <template x-if="!selectedModel">
+                                        <div>
+                                            <i class="fas fa-robot" style="font-size: 3rem; color: var(--border); margin-bottom: 16px; display:block;"></i>
+                                            <h3 style="color: var(--text-secondary); margin-bottom: 8px;">Chưa chọn Model</h3>
+                                            <p class="text-muted">Vui lòng chọn một model từ danh sách phía trên để bắt đầu kiểm thử.</p>
+                                        </div>
+                                    </template>
+                                    <template x-if="selectedModel && !(selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr'))">
+                                        <div>
+                                            <i class="fas fa-comment-dots" style="font-size: 3rem; color: var(--primary); margin-bottom: 16px; display:block; opacity: 0.8;"></i>
+                                            <h3 style="color: var(--text-primary); margin-bottom: 8px;">Sẵn sàng Chat (NLP)</h3>
+                                            <p class="text-muted">Nhập tin nhắn bên dưới và nhấn Enter để bắt chuyện với <strong><span x-text="selectedModel"></span></strong>.</p>
+                                            <p class="text-muted" style="margin-top: 8px; font-size: 12px; max-width: 400px; line-height: 1.5;">Model <strong>Instruct/Chat</strong> thích hợp cho hội thoại tự nhiên. Model <strong>Code</strong> có thể trả lời rất ngắn gọn hoặc chỉ xuất ra code.</p>
+                                        </div>
+                                    </template>
+                                    <template x-if="selectedModel && (selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr'))">
+                                        <div>
+                                            <i class="fas fa-file-image" style="font-size: 3rem; color: #D97706; margin-bottom: 16px; display:block; opacity: 0.8;"></i>
+                                            <h3 style="color: var(--text-primary); margin-bottom: 8px;">Nhận diện ảnh OCR</h3>
+                                            <p class="text-muted">Model <strong><span x-text="selectedModel"></span></strong> là model Vision/OCR.</p>
+                                            <p class="text-muted" style="margin-top: 8px; font-size: 13px;">Hãy click vào nút <i class="fas fa-image"></i> bên dưới để đính kèm hình ảnh chữ viết tay, sau đó bấm Gửi để model đọc chữ nhé.</p>
+                                        </div>
+                                    </template>
                                 </div>
                             </template>
                             <template x-for="(msg, idx) in testChatMessages" :key="idx">
@@ -590,7 +624,12 @@
                                         <i class="fas fa-robot"></i>
                                     </div>
                                     <div class="chat-msg-bubble">
-                                        <div class="chat-msg-content" x-text="msg.content"
+                                        <template x-if="msg.image">
+                                            <div style="margin-bottom: 8px;">
+                                                <img :src="msg.image" style="max-width: 100%; max-height: 200px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+                                            </div>
+                                        </template>
+                                        <div class="chat-msg-content" x-show="msg.content" x-text="msg.content"
                                             style="white-space: pre-wrap;"></div>
                                         <div class="chat-msg-usage text-muted" x-show="msg.usage" x-text="msg.usage">
                                         </div>
@@ -603,25 +642,47 @@
                             <div class="chat-msg chat-msg-assistant" x-show="isTesting">
                                 <div class="chat-msg-avatar"><i class="fas fa-robot"></i></div>
                                 <div class="chat-msg-bubble">
-                                    <span class="text-muted"><i class="fas fa-spinner fa-spin"></i> Đang trả
-                                        lời...</span>
+                                    <span class="text-muted"><i class="fas fa-spinner fa-spin" style="color:var(--primary); margin-right:6px;"></i> Đang xử lý...</span>
                                 </div>
                             </div>
                         </div>
                         <div class="chat-input-wrap">
-                            <textarea class="chat-input" rows="1"
-                                placeholder="Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)"
-                                x-model="testInput"
-                                @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); if (isTesting) cancelTest(); else if (selectedModel && testInput.trim()) runTest(); }"
-                                :disabled="isTesting"></textarea>
-                            <button type="button" class="btn chat-send-btn"
-                                :class="isTesting ? 'btn-danger' : 'btn-primary'"
-                                @click="isTesting ? cancelTest() : runTest()"
-                                :disabled="!isTesting && (!selectedModel || !testInput.trim())"
-                                :title="isTesting ? 'Dừng (Enter)' : 'Gửi (Enter)'">
-                                <i class="fas fa-paper-plane" x-show="!isTesting"></i>
-                                <i class="fas fa-stop" x-show="isTesting"></i>
-                            </button>
+                            <!-- Image preview area -->
+                            <div x-show="testImageBase64" style="padding: 8px; margin-bottom: 8px; border-radius: 8px; background: rgba(15,118,110,0.04); border: 1px dashed rgba(15,118,110,0.3); display: inline-flex; align-items: center; gap: 12px; position: relative;">
+                                <div style="position: relative; display: inline-block;">
+                                    <img :src="testImageBase64" style="height: 50px; width: 50px; object-fit: cover; border-radius: 6px; border: 1px solid rgba(0,0,0,0.1);">
+                                    <button type="button" @click="testImageBase64 = null" style="position: absolute; top: -6px; right: -6px; background: var(--error); color: white; border: none; border-radius: 50%; width: 18px; height: 18px; font-size: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 3px rgba(0,0,0,0.2);">
+                                        <i class="fas fa-times"></i>
+                                    </button>
+                                </div>
+                                <div style="display:flex; flex-direction: column;">
+                                    <span style="font-size: 13px; font-weight: 600; color: var(--text-primary);">Ảnh đính kèm</span>
+                                    <span class="text-muted" style="font-size: 11px;">Sẵn sàng cho OCR/Vision</span>
+                                </div>
+                            </div>
+                            <div style="display: flex; align-items: flex-end; gap: 8px; width: 100%;">
+                                <!-- Hidden file input -->
+                                <input type="file" x-ref="testImageInput" accept="image/*" style="display: none" @change="handleTestImageUpload($event)">
+                                <button type="button" class="btn btn-outline" style="border: none; padding: 0; width: 44px; height: 44px; border-radius: var(--radius-md); color: var(--text-muted); background: var(--surface-hover); flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: all 0.2s;" @click="$refs.testImageInput.click()" title="Đính kèm ảnh">
+                                    <i class="fas fa-image" style="font-size: 1.1rem;"></i>
+                                </button>
+                                
+                                <textarea class="chat-input" rows="1"
+                                    :placeholder="(selectedModel && (selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr'))) ? 'Gửi ảnh để nhận diện...' : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'"
+                                    x-model="testInput"
+                                    @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); if (isTesting) cancelTest(); else if (selectedModel && (testInput.trim() || testImageBase64)) runTest(); }"
+                                    @input="$el.style.height = '44px'; $el.style.height = $el.scrollHeight + 'px'"
+                                    :disabled="isTesting || (selectedModel && (selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr')) && !testImageBase64 && !testInput.trim())"></textarea>
+                                    
+                                <button type="button" class="btn chat-send-btn"
+                                    :class="isTesting ? 'btn-danger' : 'btn-primary'"
+                                    @click="isTesting ? cancelTest() : runTest()"
+                                    :disabled="!isTesting && (!selectedModel || (!testInput.trim() && !testImageBase64))"
+                                    :title="isTesting ? 'Dừng (Enter)' : 'Gửi (Enter)'">
+                                    <i class="fas fa-paper-plane" x-show="!isTesting" style="margin-left: -2px;"></i>
+                                    <i class="fas fa-stop" x-show="isTesting"></i>
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -631,32 +692,25 @@
                     x-init="$watch('currentPage', v => { if(v==='cluster') { fetchClusterResources(); } })">
 
                     <!-- Header summary row -->
-                    <div class="stats-grid"
-                        style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));margin-bottom:20px">
-                        <div class="stat-card" style="border-left-color:#059669">
-                            <div class="stat-value" x-text="clusterResources.length" style="color:#059669">0</div>
-                            <div class="stat-label">Node kết nối</div>
+                    <div class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin-bottom: 20px">
+                        <div class="stat-card" style="border-left: 4px solid var(--primary);">
+                            <div class="stat-value" x-text="clusterResources.length" style="color: var(--primary)">0</div>
+                            <div class="stat-label">Nodes Synapse</div>
                         </div>
-                        <div class="stat-card">
-                            <div class="stat-value"
-                                x-text="clusterResources.reduce((s,n)=>s+(n.flops_fp16||0),0).toFixed(1) + ' TF'">0 TF
-                            </div>
+                        <div class="stat-card" style="border-left: 4px solid #D97706;">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.flops_fp16||0),0).toFixed(1) + ' TF'" style="color: #D97706">0 TF</div>
                             <div class="stat-label">Tổng TFLOPS fp16</div>
                         </div>
-                        <div class="stat-card">
-                            <div class="stat-value"
-                                x-text="clusterResources.reduce((s,n)=>s+(n.vram_gb||0),0).toFixed(1) + ' GB'">0 GB
-                            </div>
+                        <div class="stat-card" style="border-left: 4px solid #059669;">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.vram_gb||0),0).toFixed(1) + ' GB'" style="color: #059669">0 GB</div>
                             <div class="stat-label">Tổng VRAM</div>
                         </div>
-                        <div class="stat-card">
-                            <div class="stat-value"
-                                x-text="clusterResources.reduce((s,n)=>s+(n.ram_gb||0),0).toFixed(1) + ' GB'">0 GB</div>
-                            <div class="stat-label">Tổng RAM hệ thống</div>
+                        <div class="stat-card" style="border-left: 4px solid #0EA5E9;">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.ram_gb||0),0).toFixed(1) + ' GB'" style="color: #0EA5E9">0 GB</div>
+                            <div class="stat-label">Tổng RAM Cluster</div>
                         </div>
-                        <div class="stat-card">
-                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.cpu_cores||0),0)">0
-                            </div>
+                        <div class="stat-card" style="border-left: 4px solid var(--text-muted);">
+                            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.cpu_cores||0),0)">0</div>
                             <div class="stat-label">Tổng CPU Cores</div>
                         </div>
                     </div>
@@ -1027,130 +1081,257 @@
                 </div>
                 <!-- ===== END CLUSTER PAGE ===== -->
 
+
                 <!-- Training Page: Training với dataset -->
                 <div x-show="currentPage === 'training'" x-cloak>
                     <div class="card">
                         <div class="card-header">
-                            <h2 class="card-title">Training với dataset</h2>
-                            <span class="badge" :class="trainingStatus === 'started' ? 'badge-success' : 'badge-muted'"
-                                x-text="trainingStatus === 'started' ? 'Đang chạy' : 'Chưa chạy'"></span>
+                            <h2 class="card-title">Training</h2>
+                            <div style="display:flex;gap:8px;align-items:center">
+                                <span class="badge badge-success" x-show="trainingTab==='llm' && trainingStatus==='started'">LLM đang chạy</span>
+                                <span class="badge badge-warning" x-show="trainingTab==='ocr' && ocrJobStatus==='started'">OCR đang chạy</span>
+                                <span class="badge badge-muted" x-show="trainingTab==='llm' && trainingStatus!=='started'">Chờ</span>
+                            </div>
                         </div>
 
-                        <div class="training-section">
-                            <h3 class="training-section-title">Chọn model &amp; dataset</h3>
-                            <div class="form-group">
-                                <label class="form-label">Model gốc (base)</label>
-                                <select class="form-select" x-model="trainingModel">
-                                    <option value="">-- Chọn model đã tải --</option>
-                                    <template x-for="m in modelList.downloaded" :key="m.name">
-                                        <option :value="m.name" x-text="m.name"></option>
+                        <!-- Tab bar -->
+                        <div class="training-tab-bar">
+                            <button class="training-tab-btn" :class="{active: trainingTab==='llm'}" @click="trainingTab='llm'">
+                                <i class="fas fa-robot"></i> LLM / LoRA
+                            </button>
+                            <button class="training-tab-btn" :class="{active: trainingTab==='ocr'}" @click="trainingTab='ocr'; fetchOcrTrainingStatus()">
+                                <i class="fas fa-pen-nib"></i> OCR Chữ Viết Tay (CRNN)
+                            </button>
+                        </div>
+
+                        <!-- ===== LLM PANEL ===== -->
+                        <div x-show="trainingTab==='llm'">
+                            <div class="training-section">
+                                <h3 class="training-section-title">Chọn model &amp; dataset</h3>
+                                <div class="form-group">
+                                    <label class="form-label">Model gốc (base)</label>
+                                    <select class="form-select" x-model="trainingModel">
+                                        <option value="">-- Chọn model đã tải --</option>
+                                        <template x-for="m in modelList.downloaded" :key="m.name">
+                                            <option :value="m.name" x-text="m.name"></option>
+                                        </template>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Dataset</label>
+                                    <select class="form-select" x-model="trainingDataset">
+                                        <option value="">-- Chọn dataset (xem trang Dataset) --</option>
+                                        <template x-for="d in datasets" :key="d.name">
+                                            <option :value="d.path" x-text="d.name + (d.sample_count != null ? ' (' + d.sample_count + ' mẫu)' : '')"></option>
+                                        </template>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="training-section">
+                                <h3 class="training-section-title">Thông số training</h3>
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                                    <div class="form-group">
+                                        <label class="form-label">Epochs</label>
+                                        <input type="number" class="form-input" min="1" x-model.number="trainingEpochs" placeholder="10">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Batch size</label>
+                                        <input type="number" class="form-input" min="1" x-model.number="trainingBatchSize" placeholder="16">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Learning rate</label>
+                                        <input type="text" class="form-input" x-model="trainingLearningRate" placeholder="1e-5">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Lưu checkpoint mỗi (epochs)</label>
+                                        <input type="number" class="form-input" min="0" x-model.number="trainingSaveEvery" placeholder="5">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Max steps (0 = không giới hạn)</label>
+                                        <input type="number" class="form-input" min="0" x-model.number="trainingMaxSteps" placeholder="0">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Warmup steps</label>
+                                        <input type="number" class="form-input" min="0" x-model.number="trainingWarmupSteps" placeholder="0">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Max length (token, tối đa 2048)</label>
+                                        <input type="number" class="form-input" min="1" max="2048" x-model.number="trainingMaxLength" placeholder="128">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="training-section">
+                                <h3 class="training-section-title">Tùy chọn</h3>
+                                <div class="form-group">
+                                    <label class="form-label">Tên model đầu ra (sau khi train)</label>
+                                    <input type="text" class="form-input" x-model="trainingOutputName" placeholder="vd: my-model-v1">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Thư mục lưu checkpoint</label>
+                                    <input type="text" class="form-input" x-model="trainingCheckpointDir" placeholder="checkpoints">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">System prompt (tùy chọn)</label>
+                                    <textarea class="form-textarea" rows="3" placeholder="VD: Bạn là trợ lý trả lời bằng tiếng Việt." x-model="trainingSystemPrompt"></textarea>
+                                </div>
+                            </div>
+
+                            <div class="training-section">
+                                <h3 class="training-section-title"><i class="fas fa-layer-group" style="color:var(--primary);margin-right:6px"></i>Cấu hình LoRA (PEFT)</h3>
+                                <div class="form-group" style="margin-bottom: 12px;">
+                                    <label class="form-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                        <input type="checkbox" x-model="trainingUseLora" style="width: 18px; height: 18px;">
+                                        Sử dụng LoRA (Low-Rank Adaptation)
+                                    </label>
+                                    <small class="text-muted">Giúp tiết kiệm VRAM và training nhanh hơn bằng cách chỉ cập nhật một phần nhỏ tham số (Rank-based).</small>
+                                </div>
+                                <div x-show="trainingUseLora" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 12px; background: var(--surface-hover); border-radius: var(--radius-md); border: 1px solid var(--border);">
+                                    <div class="form-group">
+                                        <label class="form-label">LoRA Rank (r)</label>
+                                        <input type="number" class="form-input" x-model.number="trainingLoraR" placeholder="8">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">LoRA Alpha</label>
+                                        <input type="number" class="form-input" x-model.number="trainingLoraAlpha" placeholder="16">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">LoRA Dropout</label>
+                                        <input type="text" class="form-input" x-model="trainingLoraDropout" placeholder="0.05">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Target Modules</label>
+                                        <input type="text" class="form-input" x-model="trainingLoraTargetModules" placeholder="q_proj,v_proj,k_proj,o_proj">
+                                        <small class="text-muted" style="font-size: 10px;">Phân cách bởi dấu phẩy</small>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="training-progress-card" x-show="trainingJob">
+                                <h3 class="training-section-title">Tiến trình LLM Training</h3>
+                                <p class="text-muted"><strong>Job:</strong> <span x-text="trainingJob && trainingJob.job_id"></span> · Bắt đầu: <span x-text="trainingJob && trainingJob.started_at"></span></p>
+                                <p class="text-muted" x-show="trainingJob && trainingJob.completed_at">Hoàn thành: <span x-text="trainingJob && trainingJob.completed_at"></span></p>
+                                <div class="progress-bar-wrap">
+                                    <div class="progress-bar" :style="'width: ' + ((trainingJob && trainingJob.progress) || 0) + '%'"></div>
+                                </div>
+                                <p class="text-muted"><strong x-text="((trainingJob && trainingJob.progress) || 0) + '%'">0%</strong> · Epoch <span x-text="(trainingJob && trainingJob.current_epoch) || 0"></span> / <span x-text="trainingJob && trainingJob.epochs"></span> · <span class="badge" :class="(trainingJob && trainingJob.status)==='completed' ? 'badge-success' : (trainingJob && trainingJob.status)==='failed' ? 'badge-muted' : 'badge'" x-text="trainingJob && trainingJob.status"></span> <span x-show="trainingJob && trainingJob.use_lora" class="badge badge-info" style="margin-left:4px">LoRA Active</span></p>
+                                <p x-show="trainingJob && trainingJob.error" class="text-danger" x-text="'Lỗi: ' + (trainingJob && trainingJob.error)"></p>
+                            </div>
+                            <button type="button" class="btn btn-primary" @click="startTraining()"
+                                :disabled="trainingLoading || !trainingModel || !trainingDataset || (trainingJob && trainingJob.status === 'started')">
+                                <i class="fas fa-spinner fa-spin" x-show="trainingLoading"></i>
+                                <i class="fas fa-play" x-show="!trainingLoading"></i>
+                                <span x-text="trainingLoading ? 'Đang gửi...' : 'Bắt đầu Training LLM'"></span>
+                            </button>
+                        </div>
+
+                        <!-- ===== OCR CRNN PANEL ===== -->
+                        <div x-show="trainingTab==='ocr'">
+                            <!-- Mô tả -->
+                            <div style="background:linear-gradient(135deg,rgba(15,118,110,.08),rgba(14,165,233,.06));border-radius:var(--radius-lg);padding:16px 20px;margin-bottom:20px;border-left:4px solid var(--primary)">
+                                <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+                                    <i class="fas fa-pen-nib" style="color:var(--primary);font-size:1.2rem"></i>
+                                    <strong style="font-size:15px">CRNN — Nhận diện Chữ Viết Tay Tiếng Việt</strong>
+                                </div>
+                                <p class="text-muted" style="font-size:13px;margin:0">Kiến trúc CNN + Bi-LSTM + CTC Loss. Upload dataset ZIP (thư mục ảnh + <code>labels.json</code>), cấu hình tham số rồi bắt đầu training. Model được lưu tự động theo checkpoint.</p>
+                            </div>
+
+                            <!-- Upload ZIP dataset -->
+                            <div class="training-section">
+                                <h3 class="training-section-title"><i class="fas fa-folder-open" style="color:var(--primary);margin-right:6px"></i>Dataset Ảnh</h3>
+
+                                <input type="file" x-ref="ocrZipInput" accept=".zip" style="display:none" @change="uploadOcrZip($event)">
+
+                                <div class="ocr-upload-zone" :class="{hasfile: ocrDatasetInfo}" @click="$refs.ocrZipInput.click()">
+                                    <template x-if="!ocrDatasetInfo">
+                                        <div>
+                                            <i class="fas fa-cloud-upload-alt" style="font-size:2rem;color:var(--text-muted);margin-bottom:8px;display:block"></i>
+                                            <p style="font-weight:600;margin:0">Click để upload file ZIP dataset</p>
+                                            <p class="text-muted" style="font-size:12px;margin:4px 0 0">Cấu trúc: <code>images/img1.png</code>, <code>images/img2.jpg</code>, ... + <code>labels.json</code></p>
+                                            <p class="text-muted" style="font-size:11px;margin-top:4px">labels.json: <code>[{"image_path":"images/img1.png","text":"abc"}]</code> hoặc <code>{"img1.png":"abc"}</code></p>
+                                        </div>
                                     </template>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Dataset</label>
-                                <select class="form-select" x-model="trainingDataset">
-                                    <option value="">-- Chọn dataset (xem trang Dataset) --</option>
-                                    <template x-for="d in datasets" :key="d.name">
-                                        <option :value="d.path"
-                                            x-text="d.name + (d.sample_count != null ? ' (' + d.sample_count + ' mẫu)' : '')">
-                                        </option>
+                                    <template x-if="ocrDatasetInfo">
+                                        <div>
+                                            <i class="fas fa-check-circle" style="font-size:1.5rem;color:#059669;margin-bottom:8px;display:block"></i>
+                                            <p style="font-weight:700;color:#059669;margin:0" x-text="'✓ ' + ocrDatasetInfo.dataset_name"></p>
+                                            <p class="text-muted" style="font-size:12px;margin:4px 0 0" x-text="ocrDatasetInfo.image_count + ' ảnh · labels.json: ' + (ocrDatasetInfo.has_labels ? 'Có' : 'Không')"></p>
+                                            <p style="font-size:11px;color:var(--text-muted);margin-top:4px">Click để đổi dataset khác</p>
+                                        </div>
                                     </template>
-                                </select>
+                                </div>
+                                <div x-show="ocrUploadLoading" style="text-align:center;padding:12px;color:var(--primary)">
+                                    <i class="fas fa-spinner fa-spin"></i> Đang upload và giải nén...
+                                </div>
                             </div>
-                        </div>
 
-                        <div class="training-section">
-                            <h3 class="training-section-title">Thông số training</h3>
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
-                                <div class="form-group">
-                                    <label class="form-label">Epochs</label>
-                                    <input type="number" class="form-input" min="1" x-model.number="trainingEpochs"
-                                        placeholder="10">
+                            <!-- Thông số training -->
+                            <div class="training-section">
+                                <h3 class="training-section-title"><i class="fas fa-sliders-h" style="color:var(--primary);margin-right:6px"></i>Thông số Training</h3>
+                                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                                    <div class="form-group">
+                                        <label class="form-label">Epochs</label>
+                                        <input type="number" class="form-input" min="1" x-model.number="ocrEpochs" placeholder="50">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Batch size</label>
+                                        <input type="number" class="form-input" min="1" x-model.number="ocrBatchSize" placeholder="16">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Learning rate</label>
+                                        <input type="text" class="form-input" x-model="ocrLearningRate" placeholder="0.0005">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Lưu checkpoint mỗi (epochs)</label>
+                                        <input type="number" class="form-input" min="1" x-model.number="ocrSaveEvery" placeholder="5">
+                                    </div>
+                                    <div class="form-group" style="grid-column:1/-1">
+                                        <label class="form-label">Tên model đầu ra</label>
+                                        <input type="text" class="form-input" x-model="ocrOutputName" placeholder="vietnamese_crnn_v1">
+                                    </div>
                                 </div>
-                                <div class="form-group">
-                                    <label class="form-label">Batch size</label>
-                                    <input type="number" class="form-input" min="1" x-model.number="trainingBatchSize"
-                                        placeholder="16">
-                                </div>
-                                <div class="form-group">
-                                    <label class="form-label">Learning rate</label>
-                                    <input type="text" class="form-input" x-model="trainingLearningRate"
-                                        placeholder="1e-5">
-                                </div>
-                                <div class="form-group">
-                                    <label class="form-label">Lưu checkpoint mỗi (epochs)</label>
-                                    <input type="number" class="form-input" min="0" x-model.number="trainingSaveEvery"
-                                        placeholder="5">
-                                </div>
-                                <div class="form-group">
-                                    <label class="form-label">Max steps (0 = không giới hạn)</label>
-                                    <input type="number" class="form-input" min="0" x-model.number="trainingMaxSteps"
-                                        placeholder="0">
-                                </div>
-<div class="form-group">
-                                <label class="form-label">Warmup steps</label>
-                                <input type="number" class="form-input" min="0" x-model.number="trainingWarmupSteps"
-                                    placeholder="0">
                             </div>
-                            <div class="form-group">
-                                <label class="form-label">Max length (token, tối đa 2048)</label>
-                                <input type="number" class="form-input" min="1" max="2048" x-model.number="trainingMaxLength"
-                                    placeholder="128">
-                            </div>
-                            </div>
-                        </div>
 
-                        <div class="training-section">
-                            <h3 class="training-section-title">Tùy chọn</h3>
-                            <div class="form-group">
-                                <label class="form-label">Tên model đầu ra (sau khi train)</label>
-                                <input type="text" class="form-input" x-model="trainingOutputName"
-                                    placeholder="vd: my-model-v1">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Thư mục lưu checkpoint</label>
-                                <input type="text" class="form-input" x-model="trainingCheckpointDir"
-                                    placeholder="checkpoints">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">System prompt (nhúng vào model, tùy chọn)</label>
-                                <textarea class="form-textarea" rows="3"
-                                    placeholder="VD: Bạn là trợ lý trả lời bằng tiếng Việt."
-                                    x-model="trainingSystemPrompt"></textarea>
-                            </div>
-                        </div>
-
-                        <div class="training-progress-card" x-show="trainingJob">
-                            <h3 class="training-section-title">Tiến trình training</h3>
-                            <p class="text-muted"><strong>Job:</strong> <span x-text="trainingJob.job_id"></span> · Bắt
-                                đầu: <span x-text="trainingJob.started_at"></span></p>
-                            <p class="text-muted" x-show="trainingJob.completed_at">Hoàn thành: <span
-                                    x-text="trainingJob.completed_at"></span></p>
-                            <div class="progress-bar-wrap">
-                                <div class="progress-bar" role="progressbar"
-                                    :style="'width: ' + (trainingJob.progress || 0) + '%'"
-                                    :aria-valuenow="trainingJob.progress || 0" aria-valuemin="0" aria-valuemax="100">
+                            <!-- Tiến trình OCR -->
+                            <div class="training-progress-card" x-show="ocrJob">
+                                <h3 class="training-section-title"><i class="fas fa-chart-line" style="color:var(--primary);margin-right:6px"></i>Tiến trình OCR Training</h3>
+                                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+                                    <div>
+                                        <span class="text-muted" style="font-size:12px">Mẫu:</span>
+                                        <strong x-text="(ocrJob && ocrJob.sample_count) || 0"></strong>
+                                    </div>
+                                    <div>
+                                        <span class="text-muted" style="font-size:12px">Epoch:</span>
+                                        <strong x-text="((ocrJob && ocrJob.current_epoch) || 0) + '/' + ((ocrJob && ocrJob.epochs) || 0)"></strong>
+                                    </div>
+                                    <div>
+                                        <span class="text-muted" style="font-size:12px">Loss:</span>
+                                        <strong x-text="(ocrJob && ocrJob.loss != null) ? ocrJob.loss : '-'"></strong>
+                                    </div>
+                                    <div>
+                                        <span class="text-muted" style="font-size:12px">Trạng thái:</span>
+                                        <span class="badge" :class="(ocrJob && ocrJob.status)==='completed' ? 'badge-success' : (ocrJob && ocrJob.status)==='failed' ? 'badge-muted' : 'badge'" x-text="ocrJob && ocrJob.status"></span>
+                                    </div>
                                 </div>
+                                <div class="progress-bar-wrap">
+                                    <div class="progress-bar" :style="'width:' + ((ocrJob && ocrJob.progress) || 0) + '%'"></div>
+                                </div>
+                                <p class="text-muted" style="margin-top:6px;font-size:13px"><strong x-text="((ocrJob && ocrJob.progress) || 0) + '%'"></strong> · Bắt đầu: <span x-text="ocrJob && ocrJob.started_at"></span></p>
+                                <p x-show="ocrJob && ocrJob.completed_at" class="text-muted" style="font-size:13px">Hoàn thành: <span x-text="ocrJob && ocrJob.completed_at"></span></p>
+                                <p x-show="ocrJob && ocrJob.error" class="text-danger" x-text="'Lỗi: ' + (ocrJob && ocrJob.error)"></p>
                             </div>
-                            <p class="text-muted"><strong x-text="trainingJob.progress + '%'">0%</strong> · Epoch <span
-                                    x-text="trainingJob.current_epoch || 0"></span> / <span
-                                    x-text="trainingJob.epochs"></span> · Trạng thái: <span class="badge"
-                                    :class="trainingJob.status === 'completed' ? 'badge-success' : trainingJob.status === 'failed' || trainingJob.status === 'cancelled' ? 'badge-muted' : 'badge'"
-                                    x-text="trainingJob.status"></span></p>
-                            <p x-show="trainingJob.error" class="text-danger" x-text="'Lỗi: ' + trainingJob.error"></p>
-                        </div>
-                        <button type="button" class="btn btn-primary" @click="startTraining()"
-                            :disabled="trainingLoading || !trainingModel || !trainingDataset || (trainingJob && trainingJob.status === 'started')">
-                            <i class="fas fa-spinner fa-spin" x-show="trainingLoading"></i>
-                            <i class="fas fa-play" x-show="!trainingLoading"></i>
-                            <span x-text="trainingLoading ? 'Đang gửi...' : 'Bắt đầu Training'"></span>
-                        </button>
 
-                        <p class="text-muted" style="margin-top: 16px;" x-show="distributedStatus.partitions_count > 1">
-                            <strong>Phân tán:</strong> request chat có thể chạy qua nhiều node (layer sharding).
-                            Training chạy trên 1 máy (LoRA).
-                        </p>
+                            <button type="button" class="btn btn-primary" @click="startOcrTraining()"
+                                :disabled="ocrTrainingLoading || !ocrDatasetInfo || ocrJobStatus==='started'">
+                                <i class="fas fa-spinner fa-spin" x-show="ocrTrainingLoading"></i>
+                                <i class="fas fa-play" x-show="!ocrTrainingLoading"></i>
+                                <span x-text="ocrTrainingLoading ? 'Đang gửi...' : 'Bắt đầu Training OCR'"></span>
+                            </button>
+                            <p class="text-muted" style="margin-top:12px;font-size:12px" x-show="distributedStatus.partitions_count > 1">
+                                <i class="fas fa-network-wired"></i> OCR hỗ trợ phân tán — gradient được đồng bộ qua Ring All-Reduce trên <strong x-text="distributedStatus.partitions_count"></strong> node.
+                            </p>
+                        </div>
                     </div>
                 </div>
 
@@ -1424,69 +1605,6 @@
                         </div>
                         <p class="empty-state" x-show="tailscaleNodes.length === 0">Chưa có node Tailscale hoặc
                             discovery không dùng Tailscale.</p>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">
-                            <h2 class="card-title">Trạng thái hệ thống</h2>
-                            <span class="card-subtitle">Tổng hợp cluster (dữ liệu thật từ Tailscale — mỗi node tự báo
-                                CPU/RAM/GPU/ổ đĩa)</span>
-                        </div>
-                        <div class="monitoring-table-wrap">
-                            <table class="table monitoring-table system-stats-table">
-                                <thead>
-                                    <tr>
-                                        <th>Chỉ số</th>
-                                        <th>Giá trị</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <tr>
-                                        <td><strong>Tổng số thiết bị Tailscale</strong></td>
-                                        <td x-text="tailscaleNodes.length">0</td>
-                                    </tr>
-                                    <tr>
-                                        <td><strong>Số node Synapse</strong></td>
-                                        <td x-text="tailscaleNodes.filter(n => n.is_synapse_node).length">0</td>
-                                    </tr>
-                                    <tr>
-                                        <td><strong>Node cập nhật &lt; 60s</strong></td>
-                                        <td
-                                            x-text="tailscaleNodes.filter(n => n.last_seen_sec_ago != null && n.last_seen_sec_ago < 60).length + ' / ' + tailscaleNodes.filter(n => n.is_synapse_node).length">
-                                            0 / 0</td>
-                                    </tr>
-                                    <tr>
-                                        <td><strong>Tổng CPU (số lõi, cluster)</strong></td>
-                                        <td
-                                            x-text="tailscaleNodes.filter(n => n.is_synapse_node).reduce((s, n) => s + (n.cpu_cores ?? 0), 0)">
-                                            0</td>
-                                    </tr>
-                                    <tr>
-                                        <td><strong>Tổng GPU (TFLOPS fp16, cluster)</strong></td>
-                                        <td
-                                            x-text="(tailscaleNodes.filter(n => n.is_synapse_node).reduce((s, n) => s + (n.flops_fp16 ?? 0), 0)).toFixed(2) + ' TFLOPS'">
-                                            0.00 TFLOPS</td>
-                                    </tr>
-                                    <tr>
-                                        <td><strong>Tổng RAM hệ thống (cluster)</strong></td>
-                                        <td
-                                            x-text="tailscaleNodes.filter(n => n.is_synapse_node).reduce((s, n) => s + (n.system_ram_gb ?? 0), 0) + ' GB'">
-                                            0 GB</td>
-                                    </tr>
-                                    <tr>
-                                        <td><strong>Tổng VRAM GPU (cluster)</strong></td>
-                                        <td
-                                            x-text="tailscaleNodes.filter(n => n.is_synapse_node).reduce((s, n) => s + (n.memory_gb ?? 0), 0) + ' GB'">
-                                            0 GB</td>
-                                    </tr>
-                                    <tr>
-                                        <td><strong>Tổng dung lượng ổ đĩa (cluster)</strong></td>
-                                        <td
-                                            x-text="tailscaleNodes.filter(n => n.is_synapse_node).reduce((s, n) => s + (n.disk_gb ?? 0), 0) + ' GB'">
-                                            0 GB</td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
                     </div>
                 </div>
 
@@ -1831,6 +1949,7 @@
                 activities: [],
                 selectedModel: '',
                 testInput: '',
+                testImageBase64: null,
                 testChatMessages: [],
                 testTemperature: 0.7,
                 isTesting: false,
@@ -1854,9 +1973,26 @@
                 trainingCheckpointDir: 'checkpoints',
                 trainingSystemPrompt: '',
                 trainingMaxLength: 128,
+                trainingUseLora: true,
+                trainingLoraR: 8,
+                trainingLoraAlpha: 16,
+                trainingLoraDropout: 0.05,
+                trainingLoraTargetModules: 'q_proj,v_proj,k_proj,o_proj',
                 trainingStatus: 'idle',
                 trainingJob: null,
                 trainingLoading: false,
+                trainingTab: 'llm',
+                // OCR Training state
+                ocrEpochs: 50,
+                ocrBatchSize: 16,
+                ocrLearningRate: '0.0005',
+                ocrSaveEvery: 5,
+                ocrOutputName: 'vietnamese_crnn_v1',
+                ocrDatasetInfo: null,
+                ocrUploadLoading: false,
+                ocrTrainingLoading: false,
+                ocrJob: null,
+                ocrJobStatus: 'idle',
                 uploadLoading: false,
                 deleteDatasetLoading: '',
                 datasetPreview: [],
@@ -1913,6 +2049,7 @@
                         this.fetchDistributedStatus();
                         if (this.currentPage === 'dashboard') this.fetchTerminalLogs();
                         if (this.currentPage === 'training' || this.currentPage === 'dashboard') this.fetchTrainingStatus();
+                        if (this.currentPage === 'training' && this.trainingTab === 'ocr') this.fetchOcrTrainingStatus();
                         if (this.currentPage === 'datasets') this.fetchDatasets();
                         if (this.currentPage === 'settings') this.fetchSettings();
                         if (this.currentPage === 'test' || this.currentPage === 'models') this.fetchModelList();
@@ -1994,7 +2131,12 @@
                                 max_length: this.trainingMaxLength || undefined,
                                 output_model_name: this.trainingOutputName || undefined,
                                 checkpoint_dir: this.trainingCheckpointDir || undefined,
-                                system_prompt: this.trainingSystemPrompt || undefined
+                                system_prompt: this.trainingSystemPrompt || undefined,
+                                use_lora: this.trainingUseLora,
+                                lora_r: this.trainingLoraR,
+                                lora_alpha: this.trainingLoraAlpha,
+                                lora_dropout: this.trainingLoraDropout,
+                                lora_target_modules: this.trainingLoraTargetModules
                             })
                         });
                         const data = await res.json();
@@ -2389,11 +2531,43 @@
                     }
                 },
 
+                handleTestImageUpload(ev) {
+                    const file = ev.target.files && ev.target.files[0];
+                    if (!file) return;
+                    
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        this.testImageBase64 = e.target.result;
+                    };
+                    reader.readAsDataURL(file);
+                    ev.target.value = ''; // Reset input
+                },
+
                 async runTest() {
-                    if (!this.selectedModel || !this.testInput.trim()) return;
-                    const userContent = this.testInput.trim();
+                    // Check if either text or image is provided
+                    if (!this.selectedModel || (!this.testInput.trim() && !this.testImageBase64)) return;
+                    
+                    const userText = this.testInput.trim();
                     this.testInput = '';
-                    this.testChatMessages.push({ role: 'user', content: userContent });
+                    
+                    // Create message content
+                    let msgContent = userText;
+                    if (this.testImageBase64) {
+                        msgContent = [];
+                        if (userText) msgContent.push({ type: "text", text: userText });
+                        msgContent.push({ type: "image_url", image_url: { url: this.testImageBase64 } });
+                    }
+                    
+                    this.testChatMessages.push({ 
+                        role: 'user', 
+                        content: userText, // Display text
+                        image: this.testImageBase64, // For displaying preview in chat
+                        apiContent: msgContent // The actual content to send to API
+                    });
+                    
+                    // Clear the selected image after adding to chat
+                    this.testImageBase64 = null;
+                    
                     this.isTesting = true;
 
                     // Ép browser vẽ lại (spinner quay, nút đỏ) trước khi gọi API
@@ -2402,7 +2576,11 @@
 
                     try {
                         const temp = typeof this.testTemperature === 'number' ? this.testTemperature : 0.7;
-                        const messages = this.testChatMessages.map(m => ({ role: m.role, content: m.content }));
+                        // Build messages for API
+                        const messages = this.testChatMessages.map(m => ({ 
+                            role: m.role, 
+                            content: m.apiContent ? m.apiContent : m.content 
+                        }));
 
                         const startTime = performance.now();
                         this.abortController = new AbortController();
@@ -2490,7 +2668,7 @@
                         'test': 'Kiểm thử',
                         'training': 'Training',
                         'datasets': 'Quản Lý Dataset',
-                        'monitoring': 'Giám Sát Hệ Thống',
+                        'monitoring': 'Mạng & Hệ thống',
                         'settings': 'Cài Đặt',
                         'cluster': 'Cluster Resources',
                         'about': 'Giới thiệu'
@@ -2625,6 +2803,71 @@
                             || (status === 'available' && !m.isDownloaded);
                         return matchSearch && matchStatus;
                     });
+                },
+
+                // ===== OCR TRAINING FUNCTIONS =====
+                async uploadOcrZip(ev) {
+                    const file = ev.target.files && ev.target.files[0];
+                    if (!file) return;
+                    this.ocrUploadLoading = true;
+                    this.ocrDatasetInfo = null;
+                    try {
+                        const form = new FormData();
+                        form.append('file', file);
+                        const res = await fetch('/v1/training/ocr/upload_zip', { method: 'POST', body: form });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.ocrDatasetInfo = data;
+                        } else {
+                            alert('Upload thất bại: ' + (data.message || 'Lỗi không xác định'));
+                        }
+                    } catch (e) {
+                        alert('Lỗi upload: ' + (e.message || e));
+                    } finally {
+                        this.ocrUploadLoading = false;
+                        ev.target.value = '';
+                    }
+                },
+
+                async startOcrTraining() {
+                    if (!this.ocrDatasetInfo || this.ocrTrainingLoading) return;
+                    this.ocrTrainingLoading = true;
+                    try {
+                        const res = await fetch('/v1/training/ocr/start', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                image_dir: this.ocrDatasetInfo.dataset_name,
+                                epochs: this.ocrEpochs,
+                                batch_size: this.ocrBatchSize,
+                                learning_rate: this.ocrLearningRate,
+                                save_every: this.ocrSaveEvery,
+                                output_model_name: this.ocrOutputName || 'vietnamese_crnn_v1',
+                            })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            await this.fetchOcrTrainingStatus();
+                        } else {
+                            alert('Khởi chạy OCR training thất bại: ' + (data.message || ''));
+                        }
+                    } catch (e) {
+                        alert('Lỗi: ' + (e.message || e));
+                    } finally {
+                        this.ocrTrainingLoading = false;
+                    }
+                },
+
+                async fetchOcrTrainingStatus() {
+                    try {
+                        const res = await fetch('/v1/training/ocr/status');
+                        const data = await res.json();
+                        this.ocrJobStatus = data.status || 'idle';
+                        this.ocrJob = data.job || null;
+                    } catch (e) {
+                        this.ocrJobStatus = 'idle';
+                        this.ocrJob = null;
+                    }
                 },
             }
         }

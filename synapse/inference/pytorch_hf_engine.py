@@ -3,6 +3,7 @@ PyTorch + Hugging Face inference engine.
 Phân tán: load model từ HF. Danh sách model lấy từ synapse.model_list (download + web UI).
 """
 
+import asyncio
 import numpy as np
 import inspect
 from pathlib import Path
@@ -423,17 +424,46 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         if DEBUG >= 1:
             print(f"[PyTorchHF] Loading {shard.model_id} -> {hf_id}")
 
-        is_vision = shard.model_id in VISION_MODELS
+        is_vision = (shard.model_id in VISION_MODELS) or ("crnn" in shard.model_id.lower()) or ("ocr" in shard.model_id.lower())
         if is_vision:
             try:
                 from huggingface_hub import snapshot_download
                 import sys
                 import torch
                 import json
-                repo_path = snapshot_download(repo_id=hf_id)
+                from pathlib import Path
+                import glob
+                
+                # Check if it's a local checkpoint
+                local_dir = Path(__file__).parent.parent.parent / "synapse_data" / "checkpoints" / hf_id
+                if local_dir.exists() and local_dir.is_dir():
+                    repo_path = str(local_dir)
+                    # Find CRNN model file or latest checkpoint
+                    pth_files = glob.glob(f"{repo_path}/*.pth")
+                    if f"{repo_path}/vietnamese_crnn_model.pth" in pth_files:
+                        weights_path = f"{repo_path}/vietnamese_crnn_model.pth"
+                    elif pth_files:
+                        # Sort by modification time or name
+                        weights_path = sorted(pth_files)[-1]
+                    else:
+                        raise FileNotFoundError(f"No .pth file found in {repo_path}")
+                else:
+                    repo_path = snapshot_download(repo_id=hf_id)
+                    weights_path = f"{repo_path}/vietnamese_crnn_model.pth"
+                
                 if repo_path not in sys.path:
                     sys.path.insert(0, repo_path)
-                import model as crnn_model
+                
+                # Import the model code - if local, it might not have model.py, we might need to fallback to the default CRNN
+                try:
+                    import model as crnn_model
+                except ImportError:
+                    # Fallback to the base model's CRNN implementation if the local checkpoint doesn't have model.py
+                    import sys
+                    base_repo_path = snapshot_download(repo_id="Bingsu/vietocr-base-crnn")
+                    if base_repo_path not in sys.path:
+                        sys.path.insert(0, base_repo_path)
+                    import model as crnn_model
                 
                 with open(f"{repo_path}/vocab.json", "r", encoding="utf-8") as f:
                     vocab = json.load(f)
@@ -446,7 +476,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 num_classes = max([int(k) for k in idx_dict.keys()]) + 1
                 
                 self._model = crnn_model.CRNN(vocab_size=num_classes, hidden_size=256)
-                weights_path = f"{repo_path}/vietnamese_crnn_model.pth"
                 checkpoint = torch.load(weights_path, map_location=self._device, weights_only=False)
                 if 'model_state_dict' in checkpoint:
                     self._model.load_state_dict(checkpoint['model_state_dict'])

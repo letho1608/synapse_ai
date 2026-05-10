@@ -235,25 +235,33 @@ body {
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
+  min-height: 0;
+}
+
+/* Fix for full-height pages like Test/Chat */
+.content:has(.test-page-wrap) {
+  overflow: hidden;
+  padding: 0;
 }
 
 /* ========== Chat với Model (giao diện chat kiểu ChatGPT) ========== */
 .test-page-wrap {
   display: flex;
   flex-direction: column;
-  flex: 1 1 0;
-  min-height: 0;
+  height: 100%;
+  padding: var(--spacing-md); /* Add padding here instead of parent */
 }
 
 .chat-layout {
   display: flex;
   flex-direction: column;
   flex: 1;
-  min-height: 400px;
+  min-height: 0;
   background: var(--surface);
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
   overflow: hidden;
+  box-shadow: var(--shadow-sm);
 }
 
 .chat-toolbar {
@@ -376,14 +384,17 @@ body {
 .chat-input {
   flex: 1;
   min-height: 44px;
-  max-height: 160px;
-  padding: 10px 14px;
+  max-height: 200px;
+  padding: 12px 16px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  font-family: var(--font-family);
-  font-size: var(--font-size-sm);
+  border-radius: var(--radius-md);
+  font-family: inherit;
+  font-size: var(--font-size-md);
+  line-height: 1.5;
   resize: none;
-  transition: border-color 0.2s;
+  background: var(--surface);
+  color: var(--text-primary);
+  transition: all 0.2s;
 }
 
 .chat-input:focus {
@@ -1156,14 +1167,20 @@ body.theme-dark .chat-msg-user .chat-msg-bubble {
   background: rgba(15, 118, 110, 0.25);
   border-color: #0f766e;
 }
+body.theme-dark .chat-layout {
+  background: #0f172a;
+  border-color: #1e293b;
+}
+
 body.theme-dark .chat-input-wrap {
   background: #1e293b;
   border-color: #334155;
 }
+
 body.theme-dark .chat-input {
-  background: #0f172a;
+  background: #020617;
   border-color: #334155;
-  color: #e2e8f0;
+  color: #f8fafc;
 }
 body.theme-dark .chat-input:focus {
   border-color: #14b8a6;

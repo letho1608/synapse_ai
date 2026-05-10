@@ -354,6 +354,10 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/settings", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/settings/save", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/cluster/resources", self.handle_get_cluster_resources), {"*": cors_options})
+    # OCR Training endpoints
+    cors.add(self.app.router.add_post("/v1/training/ocr/start", self.handle_post_ocr_training), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/training/ocr/status", self.handle_get_ocr_training_status), {"*": cors_options})
+    cors.add(self.app.router.add_post("/v1/training/ocr/upload_zip", self.handle_post_ocr_upload_zip), {"*": cors_options})
     # Static: PHẢI dùng prefix /_static/ (không dùng "/") vì add_static("/") match mọi path và chỉ cho GET/HEAD -> POST sẽ 405
     if "__compiled__" not in globals():
       self.static_dir = Path(__file__).parent.parent/"tinychat"
@@ -723,6 +727,13 @@ class ChatGPTAPI:
       except Exception:
           pass
           
+      # 3. Quét thư mục checkpoints cục bộ (để chứa model OCR đã train)
+      checkpoints_dir = Path(__file__).parent.parent.parent / "synapse_data" / "checkpoints"
+      if checkpoints_dir.exists():
+          for cp in checkpoints_dir.iterdir():
+              if cp.is_dir():
+                  complete.add(cp.name)
+
       return complete
     except Exception:
       return set()
@@ -926,7 +937,7 @@ class ChatGPTAPI:
             {"error": {"message": f"Model '{model_id}' không có trong registry PyTorch/HF. Chọn model từ danh sách.", "code": "model_not_found"}},
             status=400,
           )
-        is_vision = model_id in VISION_MODELS
+        is_vision = (model_id in VISION_MODELS) or ("crnn" in model_id.lower()) or ("ocr" in model_id.lower())
         if is_vision:
           base64_image = None
           for msg in reversed(data.get("messages", [])):
@@ -2382,6 +2393,7 @@ class ChatGPTAPI:
         try:
           lora_config = _build_lora_config(job)
           if lora_config is not None:
+            # pyrefly: ignore [missing-import]
             from peft import get_peft_model
             engine = self.node.inference_engine
             if hasattr(engine, "_model") and engine._model is not None:
@@ -2606,6 +2618,176 @@ class ChatGPTAPI:
     if self._training_job is None:
       return web.json_response({"status": "idle", "job": None})
     return web.json_response({"status": self._training_job.get("status", "idle"), "job": self._training_job})
+
+  # ========== OCR Training Handlers ==========
+
+  async def handle_post_ocr_training(self, request):
+    """Bắt đầu job training OCR/CRNN từ dataset ảnh đã upload.
+    Body JSON: {model, image_dir, epochs, batch_size, learning_rate, save_every, output_model_name}"""
+    try:
+      body = await request.json() if request.can_read_body else {}
+      model = (body.get("model") or "vietnamese_crnn").strip()
+      image_dir = (body.get("image_dir") or body.get("dataset_dir") or "").strip()
+      epochs = int(body.get("epochs", 50))
+      batch_size = max(1, int(body.get("batch_size", 16)))
+      learning_rate = (body.get("learning_rate") or "0.0005").strip()
+      save_every = int(body.get("save_every", 5))
+      output_model_name = (body.get("output_model_name") or "vietnamese_crnn_latest").strip()
+      checkpoint_dir = (body.get("checkpoint_dir") or "").strip() or None
+
+      if not image_dir:
+        return web.json_response({"success": False, "message": "Thiếu image_dir (thư mục dataset ảnh)"}, status=400)
+
+      # Kiểm tra thư mục tồn tại
+      ocr_data_dir = self._data_dir / "ocr_datasets"
+      img_path = ocr_data_dir / image_dir
+      if not img_path.exists():
+        # Thử absolute path
+        img_path = Path(image_dir)
+      if not img_path.exists() or not img_path.is_dir():
+        return web.json_response({"success": False, "message": f"Thư mục không tồn tại: {image_dir}"}, status=400)
+
+      # Load label file
+      label_file = img_path / "labels.json"
+      if not label_file.exists():
+        return web.json_response({"success": False, "message": "Không tìm thấy labels.json trong thư mục dataset"}, status=400)
+
+      with open(label_file, "r", encoding="utf-8") as f:
+        raw_labels = json.load(f)
+
+      # Chuẩn hoá sang list[{image_path, text}]
+      raw_data = []
+      if isinstance(raw_labels, list):
+        for item in raw_labels:
+          if isinstance(item, dict) and "image_path" in item and "text" in item:
+            p = item["image_path"]
+            if not Path(p).is_absolute():
+              p = str(img_path / p)
+            raw_data.append({"image_path": p, "text": item["text"]})
+      elif isinstance(raw_labels, dict):
+        for fname, text in raw_labels.items():
+          p = str(img_path / fname)
+          raw_data.append({"image_path": p, "text": text})
+
+      if not raw_data:
+        return web.json_response({"success": False, "message": "labels.json không có dữ liệu hợp lệ"}, status=400)
+
+      # Khởi tạo job
+      job_id = str(uuid.uuid4())
+      ocr_job = {
+        "job_id": job_id,
+        "type": "ocr",
+        "model": model,
+        "image_dir": str(img_path),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "save_every": save_every,
+        "output_model_name": output_model_name,
+        "checkpoint_dir": checkpoint_dir,
+        "status": "started",
+        "progress": 0,
+        "current_epoch": 0,
+        "current_step": 0,
+        "loss": None,
+        "error": None,
+        "sample_count": len(raw_data),
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+      }
+      self._ocr_training_job = ocr_job
+      self.log_activity("OCR Training Started", model, "started")
+
+      async def _run_ocr():
+        await asyncio.sleep(0.05)
+        try:
+          from synapse.training.ocr_trainer import train_crnn_ocr
+          await train_crnn_ocr(ocr_job, raw_data, getattr(self, "node", None))
+          if ocr_job.get("status") not in ("cancelled", "failed"):
+            ocr_job["status"] = "completed"
+            ocr_job["progress"] = 100
+            ocr_job["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            self.log_activity("OCR Training Completed", model, "success")
+        except asyncio.CancelledError:
+          ocr_job["status"] = "cancelled"
+          self.log_activity("OCR Training Cancelled", model, "cancelled")
+        except Exception as e:
+          import traceback; traceback.print_exc()
+          ocr_job["status"] = "failed"
+          ocr_job["error"] = str(e)
+          self.log_activity("OCR Training Failed", model, "failed")
+
+      asyncio.create_task(_run_ocr())
+      return web.json_response({
+        "success": True,
+        "job_id": job_id,
+        "message": f"OCR Training đã bắt đầu với {len(raw_data)} mẫu, {epochs} epoch.",
+        "sample_count": len(raw_data),
+      })
+    except Exception as e:
+      import traceback; traceback.print_exc()
+      return web.json_response({"success": False, "message": str(e)}, status=500)
+
+  async def handle_get_ocr_training_status(self, request):
+    """Trả về trạng thái job OCR training hiện tại."""
+    job = getattr(self, "_ocr_training_job", None)
+    if job is None:
+      return web.json_response({"status": "idle", "job": None})
+    return web.json_response({"status": job.get("status", "idle"), "job": job})
+
+  async def handle_post_ocr_upload_zip(self, request):
+    """Upload file ZIP dataset OCR (ảnh + labels.json) vào data/ocr_datasets/<name>."""
+    import zipfile
+    try:
+      reader = await request.multipart()
+      field = await reader.next()
+      if field is None or field.name != "file":
+        return web.json_response({"success": False, "message": "Thiếu file field"}, status=400)
+
+      filename = field.filename or "dataset.zip"
+      dataset_name = Path(filename).stem  # lấy tên không có đuôi
+
+      # Đọc dữ liệu
+      zip_bytes = b""
+      while True:
+        chunk = await field.read_chunk(65536)
+        if not chunk:
+          break
+        zip_bytes += chunk
+
+      if not zip_bytes:
+        return web.json_response({"success": False, "message": "File rỗng"}, status=400)
+
+      # Giải nén vào thư mục tạm
+      ocr_datasets_dir = self._data_dir / "ocr_datasets"
+      ocr_datasets_dir.mkdir(parents=True, exist_ok=True)
+      out_dir = ocr_datasets_dir / dataset_name
+      if out_dir.exists():
+        import shutil
+        shutil.rmtree(out_dir)
+      out_dir.mkdir(parents=True, exist_ok=True)
+
+      with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
+        zf.extractall(out_dir)
+
+      # Đếm ảnh
+      img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+      img_count = sum(1 for f in out_dir.rglob("*") if f.suffix.lower() in img_exts)
+      has_labels = (out_dir / "labels.json").exists()
+
+      self.log_activity("OCR Dataset Uploaded", dataset_name, "success")
+      return web.json_response({
+        "success": True,
+        "dataset_name": dataset_name,
+        "path": str(out_dir),
+        "image_count": img_count,
+        "has_labels": has_labels,
+        "message": f"Đã giải nén {img_count} ảnh vào '{dataset_name}'"
+      })
+    except zipfile.BadZipFile:
+      return web.json_response({"success": False, "message": "File ZIP không hợp lệ"}, status=400)
+    except Exception as e:
+      import traceback; traceback.print_exc()
+      return web.json_response({"success": False, "message": str(e)}, status=500)
 
   async def handle_get_cluster_resources(self, request):
     """

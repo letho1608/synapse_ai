@@ -442,27 +442,21 @@ class Node:
   async def get_tailscale_nodes(self) -> List[Dict]:
     """Lấy danh sách thiết bị từ mạng Tailscale."""
     from synapse.networking.tailscale.tailscale_discovery import TailscaleDiscovery
-    from synapse.networking.tailscale.tailscale_helpers import get_tailscale_devices
+    from synapse.networking.tailscale.tailscale_helpers import get_tailscale_devices, get_self_tailscale_info
     
-    api_key = None
-    tailnet = None
-    
-    # Ưu tiên lấy từ module discovery đang chạy
+    # 1. Ưu tiên lấy từ module discovery đang chạy (đã có logic merge attributes)
     if hasattr(self, "discovery") and isinstance(self.discovery, TailscaleDiscovery):
-      api_key = self.discovery.tailscale_api_key
-      tailnet = self.discovery.tailnet
+      return await self.discovery.get_devices_for_ui()
     
-    # Fallback nếu không có discovery hoặc discovery không phải Tailscale
-    if not api_key:
-      api_key = os.getenv("TS_API_KEY") or os.getenv("TAILSCALE_API_KEY")
-    if not tailnet:
-      tailnet = os.getenv("TS_TAILNET") or os.getenv("TAILSCALE_TAILNET")
+    # 2. Fallback nếu không có discovery hoặc discovery không phải Tailscale
+    api_key = os.getenv("TS_API_KEY") or os.getenv("TAILSCALE_API_KEY")
+    tailnet = os.getenv("TS_TAILNET") or os.getenv("TAILSCALE_TAILNET")
       
-    # Tailscale credentials must be set via environment variables
     if not api_key or not tailnet:
-      print("Tailscale API key and tailnet are required. Set TS_API_KEY and TS_TAILNET environment variables.")
+      return []
 
     try:
+      our_device_id, _ = await get_self_tailscale_info()
       devices_dict = await get_tailscale_devices(api_key, tailnet)
       results = []
       for name, dev in devices_dict.items():
@@ -470,8 +464,9 @@ class Node:
           "device_id": dev.device_id,
           "name": dev.name,
           "addresses": dev.addresses,
-          "last_seen": dev.last_seen.isoformat() if dev.last_seen else None,
-          "is_self": False # Sẽ được đánh dấu ở API handler nếu cần
+          "last_seen_sec_ago": round(time.time() - dev.last_seen.timestamp()) if dev.last_seen else None,
+          "is_self": str(dev.device_id) == str(our_device_id) if our_device_id else False,
+          "is_synapse_node": False # Fallback không có discovery thì không check attributes để tránh chậm
         })
       return results
     except Exception as e:
