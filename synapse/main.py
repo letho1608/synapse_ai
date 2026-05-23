@@ -398,7 +398,7 @@ async def main():
       raise
 
     if args.command == "run" or args.run_model:
-      model_name = args.model_name or args.run_model
+      model_name = args.model_name or args.run_model or default_model
       if not model_name:
         print("[ERROR] Model name is required")
         return

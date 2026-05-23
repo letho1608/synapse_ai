@@ -4,7 +4,7 @@ services:
     container_name: synapse-ai
     image: synapse-ai:latest
     restart: unless-stopped
-    command: python main.py run --discovery-module udp
+    command: python main.py run --default-model qwen2.5:0.5b --discovery-module udp
     ports:
       - "50051:50051"
       - "5678:5678/udp"
@@ -19,14 +19,14 @@ services:
     environment:
       - NODE_PORT=50051
       - CHATGPT_API_PORT=52415
-    # Uncomment the following section if you have an NVIDIA GPU and nvidia-container-toolkit installed
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+      - HF_HUB_DISABLE_SYMLINKS=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
 volumes:
   synapse-models:

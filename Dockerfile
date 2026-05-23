@@ -1,52 +1,40 @@
-# Use an official Python runtime as a parent image
-FROM python:3.10-slim
+# Use CUDA base image — GPU detection + nvidia-smi work out of the box.
+# Still runs on CPU when --gpus flag is omitted in docker-compose.
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    HF_HUB_DISABLE_SYMLINKS=1
+    HF_HUB_DISABLE_SYMLINKS=1 \
+    DEBIAN_FRONTEND=noninteractive
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Install system dependencies
-# - build-essential: for compiling some python packages
-# - libgl1-mesa-glx & libglib2.0-0: required for OpenCV
-# - libpcap-dev: required for Scapy
-# - git: to clone/download models if needed
+# Install Python 3.10 + system libs
 RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3.10-dev \
     build-essential \
     libgl1 \
     libglib2.0-0 \
     libpcap-dev \
     git \
     curl \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip \
     && curl -fsSL https://tailscale.com/install.sh | sh \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
 COPY requirements.txt .
 
-# Remove Windows-specific dependencies and DirectML (which is for Windows)
-# Use standard torch for Linux
 RUN sed -i '/pywin32/d' requirements.txt && \
-    sed -i '/torch-directml/d' requirements.txt
+    sed -i '/torch-directml/d' requirements.txt && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy the rest of the application code
 COPY . .
 
-# Expose ports:
-# 50051: Node Port (P2P/GRPC)
-# 5678: Discovery Port (UDP)
-# 52415: Web UI / ChatGPT API Port
 EXPOSE 50051 5678 52415
 
-# Create models directory to ensure it exists
 RUN mkdir -p models
 
-# The command to run the application
-# We use "run" command by default
-CMD ["python", "main.py", "run"]
+CMD ["python", "main.py", "run", "--default-model", "qwen2.5:0.5b"]
