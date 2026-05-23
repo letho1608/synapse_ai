@@ -1352,17 +1352,23 @@ class Node:
         ))
     return partitions
 
-  def _build_latency_matrix(self) -> Optional[Dict[str, Dict[str, float]]]:
+  def _build_latency_matrix(self) -> Optional["LatencyMatrix"]:
     """Build real latency matrix using LACP 3.0 TCP probing with fallback to defaults."""
     node_ids = list(self.topology.nodes.keys())
     if len(node_ids) < 2:
       return None
 
-    matrix: Dict[str, Dict[str, float]] = {}
-    for nid in node_ids:
-      matrix[nid] = {other: 0.0 if other == nid else 50.0 for other in node_ids}
+    from synapse.topology.latency_matrix import LatencyMatrix, LatencyEntry, LatencyProber
 
-    from synapse.topology.latency_matrix import LatencyProber
+    matrix = LatencyMatrix()
+    for from_nid in node_ids:
+      for to_nid in node_ids:
+        latency = 0.0 if from_nid == to_nid else 50.0
+        matrix.set(LatencyEntry(
+          from_node=from_nid, to_node=to_nid,
+          latency_ms=latency, jitter_ms=0.0, bandwidth_mbps=0.0,
+        ))
+
     prober = LatencyProber()
 
     try:
@@ -1384,8 +1390,16 @@ class Node:
           if entry and entry.latency_ms > 0:
             for nid in node_ids:
               if nid != self.id:
-                matrix[self.id][nid] = entry.latency_ms
-                matrix[nid][self.id] = entry.latency_ms
+                matrix.set(LatencyEntry(
+                  from_node=self.id, to_node=nid,
+                  latency_ms=entry.latency_ms, jitter_ms=entry.jitter_ms,
+                  bandwidth_mbps=entry.bandwidth_mbps,
+                ))
+                matrix.set(LatencyEntry(
+                  from_node=nid, to_node=self.id,
+                  latency_ms=entry.latency_ms, jitter_ms=entry.jitter_ms,
+                  bandwidth_mbps=entry.bandwidth_mbps,
+                ))
         except Exception:
           continue
     except Exception:

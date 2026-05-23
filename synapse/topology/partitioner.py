@@ -130,6 +130,10 @@ def compute_partition(
     if not nodes:
         return partition
 
+    # Defensive: ensure latency_matrix is a LatencyMatrix, not a plain dict
+    if latency_matrix is not None and not isinstance(latency_matrix, LatencyMatrix):
+        latency_matrix = None
+
     # Step 1: Resource scoring
     scorer = ResourceScorer(weights)
     partition.node_scores = scorer.compute_scores(nodes)
