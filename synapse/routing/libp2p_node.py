@@ -1,5 +1,5 @@
 import asyncio
-from typing import List, Callable, Optional, Any
+from typing import List, Callable, Optional, Any, Tuple
 from loguru import logger
 import json
 
@@ -31,19 +31,19 @@ class Libp2pNode:
             for peer in bootstrap_peers:
                 await self.connect_to_peer(f"bootstrap-{peer}", peer)
 
-    async def connect_to_peer(self, peer_id: str, peer_addr: str) -> bool:
+    async def connect_to_peer(self, peer_id: str, peer_addr: str) -> Tuple[bool, Optional[str]]:
         """Establish connection to a specific peer.
-        Returns True if connected successfully.
+        Returns (True, actual_peer_id) if connected successfully.
         peer_id: the node's unique ID (used to track connection in bridge)
         peer_addr: "host:port" string
         """
-        if not self._running: return False
+        if not self._running: return False, None
 
         try:
             return await self._bridge.connect_to_peer(peer_id, peer_addr, timeout=5.0)
         except Exception as e:
             logger.error(f"Failed to connect to peer {peer_addr}: {e}")
-            return False
+            return False, None
 
     def is_peer_connected(self, peer_id: str) -> bool:
         """Check if a peer is currently connected."""

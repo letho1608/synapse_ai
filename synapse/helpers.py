@@ -394,13 +394,34 @@ class PrefixDict(Generic[K, V]):
     return max(matches, key=lambda x: len(x[0]))
 
 
-def get_or_create_node_id(port: int = None):
+def get_or_create_node_id(port: int = None, use_tailscale_name: bool = False):
     """
     Generate a deterministic node ID based on MAC address + port.
     This ensures each node on the same machine with different ports
     gets a unique ID, and the ID remains stable across restarts.
+    If use_tailscale_name is True, it tries to use the Tailscale DNS name first.
     """
     _cleanup_old_node_id_files()
+
+    if use_tailscale_name:
+        try:
+            import subprocess
+            import json
+            process = subprocess.run(['tailscale', 'status', '--json'], capture_output=True, text=True, timeout=5)
+            if process.returncode == 0:
+                data = json.loads(process.stdout)
+                self_data = data.get('Self') or {}
+                dns_name = self_data.get('DNSName')
+                if dns_name:
+                    dns_name = dns_name.strip()
+                    if dns_name.endswith('.'):
+                        dns_name = dns_name[:-1]
+                    if DEBUG >= 1:
+                        print(f"Using Tailscale DNS name as node ID: {dns_name}")
+                    return dns_name
+        except Exception as e:
+            if DEBUG >= 2:
+                print(f"Failed to get Tailscale DNS name for node ID: {e}")
 
     mac = _get_mac_address()
     unique_input = f"{mac}:{port}" if port else mac

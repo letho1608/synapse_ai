@@ -99,17 +99,17 @@ class P2PSocketBridge:
 
         logger.info("P2P Socket Bridge stopped.")
 
-    async def connect_to_peer(self, peer_id: str, address: str, timeout: float = 5.0) -> bool:
+    async def connect_to_peer(self, peer_id: str, address: str, timeout: float = 5.0) -> Tuple[bool, Optional[str]]:
         """Establish a permanent connection to a peer.
-        Returns True if connection succeeded.
+        Returns (True, actual_peer_id) if connection succeeded.
         """
         if peer_id == self.node_id:
-            return True
+            return True, self.node_id
 
         if peer_id in self._connections:
             _, writer = self._connections[peer_id]
             if not writer.is_closing():
-                return True
+                return True, peer_id
             else:
                 self._connections.pop(peer_id, None)
 
@@ -123,7 +123,7 @@ class P2PSocketBridge:
             target_port = int(_port_str)
             if resolved_ip in _get_all_local_ips() and target_port == self.port:
                 logger.debug(f"Skipping self-connection to {address} (local IP + same port)")
-                return False
+                return False, None
         except Exception:
             pass
 
@@ -138,21 +138,21 @@ class P2PSocketBridge:
                 if not handshake_packet or handshake_packet.get("type") != "handshake":
                     logger.warning(f"Invalid or missing handshake from {peer_id} at {address}")
                     self._close_writer(writer)
-                    return False
+                    return False, None
                 actual_peer_id = handshake_packet.get("node_id")
             except asyncio.TimeoutError:
                 logger.warning(f"Handshake timeout for {peer_id} at {address}")
                 self._close_writer(writer)
-                return False
+                return False, None
             except Exception as e:
                 logger.error(f"Error during handshake with {peer_id} at {address}: {e}")
                 self._close_writer(writer)
-                return False
+                return False, None
 
             if actual_peer_id == self.node_id:
                 logger.debug(f"Handshake resolved to self ({self.node_id}), closing self-connection to {address}")
                 self._close_writer(writer)
-                return False
+                return False, None
 
             stale_temps = [tid for tid, rid in list(self._temp_id_map.items())
                            if rid == actual_peer_id or self._peer_addresses.get(tid) == address]
@@ -184,10 +184,10 @@ class P2PSocketBridge:
                     self._mark_peer_alive(actual_peer_id)
                     logger.info(f"Connected to peer (outgoing, single-dir): {actual_peer_id} at {address}")
 
-            return True
+            return True, actual_peer_id
         except Exception as e:
             logger.error(f"Failed to connect to peer {peer_id} at {address}: {e}")
-            return False
+            return False, None
 
     def _close_writer(self, writer: asyncio.StreamWriter):
         """Close a writer without awaiting wait_closed."""

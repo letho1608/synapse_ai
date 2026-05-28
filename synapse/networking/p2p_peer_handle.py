@@ -58,11 +58,15 @@ class P2PPeerHandle(PeerHandle):
     async def health_check(self) -> bool:
         try:
             print(f"[DEBUG-HC] {self._id}: connecting to {self.address}...", flush=True)
-            connected = await self.libp2p_node.connect_to_peer(self._id, self.address)
-            print(f"[DEBUG-HC] {self._id}: connect_to_peer = {connected}", flush=True)
+            connected, actual_id = await self.libp2p_node.connect_to_peer(self._id, self.address)
+            print(f"[DEBUG-HC] {self._id}: connect_to_peer = {connected}, actual_id = {actual_id}", flush=True)
             if not connected:
                 if DEBUG >= 2: print(f"Health check failed to connect to {self._id}")
                 return False
+
+            if actual_id and actual_id != self._id:
+                print(f"[DEBUG-HC] Updating peer ID from {self._id} to {actual_id}", flush=True)
+                self._id = actual_id
 
             print(f"[DEBUG-HC] {self._id}: doing RPC health call...", flush=True)
             res = await self._rpc_call("synapse/rpc/health", {}, timeout=15.0)
