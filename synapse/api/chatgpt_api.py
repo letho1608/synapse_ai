@@ -1397,24 +1397,77 @@ class ChatGPTAPI:
       if DEBUG >= 2: traceback.print_exc()
       return web.json_response({"detail": f"Error getting topology: {str(e)}"}, status=500)
 
+  def _get_total_layers(self) -> int:
+    total_layers = 32
+    try:
+      if hasattr(self.node.inference_engine, "num_layers") and self.node.inference_engine.num_layers:
+        total_layers = self.node.inference_engine.num_layers
+    except Exception:
+      pass
+    return total_layers
+
+  def _get_lacp_snapshot(self) -> Dict[str, Any]:
+    topology = self.node.current_topology
+    total_layers = self._get_total_layers()
+    topology_nodes = len(topology.nodes) if topology and getattr(topology, "nodes", None) else 0
+    partitions = []
+    partition_error = None
+
+    if topology_nodes > 0:
+      try:
+        partitions = self.node._compute_lacp_partition()
+      except Exception as e:
+        partition_error = str(e)
+        if DEBUG >= 2:
+          traceback.print_exc()
+
+    partition_rows = []
+    for idx, partition in enumerate(partitions or []):
+      start_layer = int(partition.start * total_layers)
+      end_layer = max(start_layer, int(partition.end * total_layers) - 1)
+      if idx == len(partitions) - 1:
+        end_layer = total_layers - 1
+      layer_count = max(0, end_layer - start_layer + 1)
+      partition_rows.append({
+        "node_id": partition.node_id,
+        "layer_start": start_layer,
+        "layer_end": end_layer,
+        "layer_count": layer_count,
+        "share_pct": round((partition.end - partition.start) * 100, 1),
+      })
+
+    lacp_node_ids = {
+      row["node_id"]
+      for row in partition_rows
+      if row.get("node_id") and row.get("layer_count", 0) > 0
+    }
+    return {
+      "topology": topology,
+      "topology_nodes": topology_nodes,
+      "total_layers": total_layers,
+      "partitions": partitions or [],
+      "partition_rows": partition_rows,
+      "partitions_count": len(partition_rows) if partition_rows else 1,
+      "lacp_nodes": len(lacp_node_ids),
+      "partition_error": partition_error,
+    }
+
   def _get_partitions_count(self) -> int:
     """Số partition (node) trong topology; 1 = chỉ máy này."""
-    try:
-      if not self.node.topology or not self.node.topology.nodes:
-        return 1
-      partitions = self.node._compute_lacp_partition()
-      return len(partitions) if partitions else 1
-    except Exception:
-      return 1
+    return int(self._get_lacp_snapshot().get("partitions_count") or 1)
 
   async def handle_get_distributed_status(self, request):
     """Trạng thái phân tán: nhiều node cùng xử lý 1 request (inference/training)."""
     try:
-      n = self._get_partitions_count()
+      snapshot = self._get_lacp_snapshot()
+      n = int(snapshot.get("partitions_count") or 1)
       return web.json_response({
         "partitions_count": n,
         "multi_node_inference": n > 1,
         "multi_node_training": n > 1,
+        "topology_nodes": snapshot["topology_nodes"],
+        "lacp_nodes": snapshot["lacp_nodes"],
+        "partition_error": snapshot["partition_error"],
         "message": "Luồng phân tán: nhiều node (partitions_count > 1).",
       })
     except Exception as e:
@@ -2382,8 +2435,26 @@ class ChatGPTAPI:
         total_steps = max(1, planned_steps)
       step_count = 0
       effective_max_length = max_length
-      world_size = len(getattr(self.node, "peers", [])) + 1
-      ext = getattr(self.node, "_pipeline_extension", None)
+      try:
+        training_partitions = self.node._compute_lacp_partition(base_shard)
+      except Exception as e:
+        training_partitions = []
+        job["partition_error"] = str(e)
+      world_size = len({p.node_id for p in training_partitions}) if training_partitions else 1
+      ext = self.node.distributed_pipeline if world_size > 1 else None
+      if ext is not None:
+        await ext.start()
+      job["distribution"] = {
+        "world_size": world_size,
+        "partitions": [
+          {
+            "node_id": p.node_id,
+            "start": p.start,
+            "end": p.end,
+          }
+          for p in training_partitions
+        ],
+      }
       lr_val = float((job.get("learning_rate") or "1e-5").strip()) if job.get("learning_rate") else 1e-5
       save_every = int(job.get("save_every", 5))
       checkpoint_dir = (job.get("checkpoint_dir") or "").strip() or str(get_checkpoints_dir(model))
@@ -2796,31 +2867,25 @@ class ChatGPTAPI:
     Trả về: danh sách node với chip, TFLOPS, layer_start/end indices, share_pct, cpu_pct, gpu_util.
     """
     try:
-      topology = self.node.current_topology
-      partitions = []
+      snapshot = self._get_lacp_snapshot()
+      topology = snapshot["topology"]
+      total_layers = snapshot["total_layers"]
+      partition_rows = snapshot["partition_rows"]
       
       # Lấy số layer thực tế từ model đang chạy hoặc fallback 32
-      total_layers = 32
-      try:
-        if hasattr(self.node.inference_engine, "num_layers") and self.node.inference_engine.num_layers:
-          total_layers = self.node.inference_engine.num_layers
-      except Exception:
-        pass
-
       strategy_name = "LACP 3.0 (Multi-Resource + Latency Clustering)"
-      if topology and self.node.topology.nodes:
-        try:
-          partitions = self.node._compute_lacp_partition()
-        except Exception:
-          partitions = []
 
       # Lấy tailscale nodes để có tên thân thiện
       try:
-        ts_nodes = await self.node.get_tailscale_nodes()
+        ts_nodes = await asyncio.wait_for(self.node.get_tailscale_nodes(), timeout=2.0)
       except Exception:
         ts_nodes = []
       total_tailscale_devices = len(ts_nodes)
-      ts_map = {n.get("device_id", ""): n for n in ts_nodes if n.get("device_id")}
+      ts_map = {}
+      for n in ts_nodes:
+        for key in (n.get("device_id"), n.get("name"), n.get("node_id")):
+          if key:
+            ts_map[str(key)] = n
 
       # Lấy metrics máy này
       try:
@@ -2839,8 +2904,8 @@ class ChatGPTAPI:
       total_flops = sum(n[1].flops.fp16 for n in nodes_raw) if nodes_raw else 0
 
       result = []
-      for partition in partitions:
-        node_id = partition.node_id
+      for partition_row in partition_rows:
+        node_id = partition_row["node_id"]
         caps = topology.get_node(node_id) if topology else None
         is_self = (node_id == self.node.id)
 
@@ -2856,14 +2921,11 @@ class ChatGPTAPI:
         has_gpu = vram_gb > 0 and gpu_backend not in ("CPU (x86)", "CPU (ARM)", "Unknown")
 
         # Layer range: Chuyển đổi từ float range [0.0, 1.0] sang discrete indices [0, total_layers-1]
-        start_layer = int(partition.start * total_layers)
-        end_layer = max(start_layer, int(partition.end * total_layers) - 1)
-        # Ensure last partition covers everything
-        if partition == partitions[-1]:
-          end_layer = total_layers - 1
-        layer_count = (end_layer - start_layer + 1)
+        start_layer = partition_row["layer_start"]
+        end_layer = partition_row["layer_end"]
+        layer_count = partition_row["layer_count"]
         
-        share_pct = round((partition.end - partition.start) * 100, 1)
+        share_pct = partition_row["share_pct"]
         flops_share_pct = round(flops_fp16 / total_flops * 100, 1) if total_flops > 0 else share_pct
 
         # Real-time metrics (chỉ máy này)
@@ -2948,6 +3010,10 @@ class ChatGPTAPI:
         "total_nodes": len(result),
         "total_tailscale_devices": total_tailscale_devices,
         "total_layers": total_layers,
+        "topology_nodes": snapshot["topology_nodes"],
+        "lacp_nodes": snapshot["lacp_nodes"],
+        "partition_error": snapshot["partition_error"],
+        "partition_rows": snapshot["partition_rows"],
         "strategy_name": strategy_name,
         "peer_graph": peer_graph,
         "training_job": self._training_job,

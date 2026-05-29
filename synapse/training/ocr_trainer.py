@@ -121,8 +121,14 @@ async def train_crnn_ocr(job: Dict[str, Any], raw_data: List[Dict[str, Any]], no
     use_distributed = False
 
     if node is not None:
-        world_size = len(getattr(node, "peers", [])) + 1
-        ext = getattr(node, "_pipeline_extension", None)
+        try:
+            partitions = node._compute_lacp_partition()
+        except Exception:
+            partitions = []
+        world_size = len({p.node_id for p in partitions}) if partitions else 1
+        ext = node.distributed_pipeline if world_size > 1 else None
+        if ext is not None:
+            await ext.start()
         use_distributed = ext is not None and world_size > 1
 
     if use_distributed:
@@ -196,16 +202,19 @@ async def _train_step_distributed_ocr(
     from synapse.inference.shard import Shard
     from synapse.models import build_base_shard
 
-    ext = getattr(node, "_pipeline_extension", None)
-    if ext is None:
-        return 0.0
-
     base_shard = Shard(model_id="vietnamese_crnn", start_layer=0, end_layer=1)
+    try:
+        partitions = node._compute_lacp_partition(base_shard)
+    except Exception:
+        partitions = []
+    world_size = len({p.node_id for p in partitions}) if partitions else 1
+    ext = node.distributed_pipeline if world_size > 1 else None
+    if ext is not None:
+        await ext.start()
     imgs_np = imgs.numpy()
     labels_np = labels.numpy()
 
-    world_size = len(getattr(node, "peers", [])) + 1
-    if world_size > 1:
+    if ext is not None and world_size > 1:
         loss_val = await ext.train_step_distributed(
             base_shard, imgs_np, labels_np,
             request_id=f"{job_id}_{step_count}",

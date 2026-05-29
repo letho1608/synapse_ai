@@ -57,6 +57,9 @@ class DistributedPipelineExtension:
             await self._controller.stop()
             self._started = False
 
+    def handle_result_event(self, payload: Dict[str, Any], deliver_tokens: bool = True) -> bool:
+        return self._controller.receive_result_payload(payload, deliver_tokens=deliver_tokens)
+
     def _get_partition_assignments(self, base_shard: Shard) -> List[Tuple[str, Shard]]:
         num_layers = base_shard.n_layers if base_shard.n_layers > 0 else 32
 
@@ -78,6 +81,8 @@ class DistributedPipelineExtension:
     ) -> List[int]:
         if request_id is None:
             request_id = str(uuid.uuid4())
+
+        await self.start()
 
         token_limit = (
             max_generate_tokens
@@ -107,7 +112,9 @@ class DistributedPipelineExtension:
             "broadcast_start",
         )
 
-        on_token_cb = self._node._on_token_received
+        async def on_token_cb(rid: str, tokens: List[int], is_finished: bool) -> None:
+            self._node._on_token_received(rid, tokens, is_finished)
+            self._node.trigger_on_token_callbacks(rid, tokens, is_finished)
 
         tracer = getattr(self._node, "tracer", None)
         if tracer is not None:
@@ -263,6 +270,8 @@ class DistributedPipelineExtension:
     ) -> float:
         if request_id is None:
             request_id = str(uuid.uuid4())
+
+        await self.start()
 
         partitions = self._get_partition_assignments(base_shard)
         num_stages = len(partitions)

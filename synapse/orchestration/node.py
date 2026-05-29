@@ -432,6 +432,9 @@ class Node:
   async def on_p2p_result(self, event: Event):
     """Handle incoming inference results/tokens via P2P."""
     data = event.data
+    if self._distributed_pipeline and self._distributed_pipeline.handle_result_event(data):
+      return
+
     request_id = data.get("request_id")
     tokens = data.get("tokens", [])
     is_finished = data.get("is_finished", False)
@@ -629,8 +632,13 @@ class Node:
         result_payload = {
             "request_id": request_id,
             "tokens": intermediate_result,
-            "is_finished": is_finished
+            "is_finished": is_finished,
+            "orchestrator_id": orchestrator_id or self._orchestrator_id_for_request(request_id),
+            "micro_batch_id": 0,
+            "source_stage_id": getattr(shard, "start_layer", 0),
         }
+        if self._distributed_pipeline:
+            self._distributed_pipeline.handle_result_event(result_payload, deliver_tokens=False)
 
         # 1. Publish to request_id-based topic (general broadcast)
         await self.event_router.publish(f"synapse/inference/result/{request_id}", result_payload)

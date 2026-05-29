@@ -83,6 +83,8 @@ class DistributedPipelineController:
         self.forwarder = forwarder or AsyncTensorForwarder(node_id)
         self.result_router = ResultRouter(node_id)
         self._sessions: Dict[str, DistributedInferenceSession] = {}
+        self._received_results: Dict[str, List[RoutedResult]] = {}
+        self._result_events: Dict[str, asyncio.Event] = {}
         self._running = False
 
     async def start(self) -> None:
@@ -157,11 +159,15 @@ class DistributedPipelineController:
                 timeout=60.0,
             )
 
+            if result is None:
+                return []
+
             if result is not None and result.tokens:
                 all_generated_tokens.extend(result.tokens)
 
             for token_idx in range(1, max_generate_tokens):
-                session.is_finished or result.is_finished
+                if session.is_finished or result.is_finished or not all_generated_tokens:
+                    break
 
                 if len(all_generated_tokens) >= max_generate_tokens:
                     break
@@ -184,6 +190,7 @@ class DistributedPipelineController:
 
                 if next_result is None:
                     break
+                result = next_result
 
                 if next_result.tokens:
                     all_generated_tokens.extend(next_result.tokens)
@@ -208,6 +215,7 @@ class DistributedPipelineController:
                 traceback.print_exc()
         finally:
             self._sessions.pop(request_id, None)
+            self._received_results.pop(request_id, None)
             self.result_router.unregister_token_callback(request_id)
 
         return all_generated_tokens
@@ -239,34 +247,44 @@ class DistributedPipelineController:
         last_stage_shard: Shard,
         timeout: float = 30.0,
     ) -> Optional[RoutedResult]:
+        queued = self._received_results.get(request_id)
+        if queued:
+            return queued.pop(0)
+
         result_event = asyncio.Event()
-        collected_result: List[RoutedResult] = []
-
-        def on_result(req_id: str, tokens: List[int], is_finished: bool) -> None:
-            if req_id == request_id:
-                collected_result.append(
-                    RoutedResult(
-                        request_id=req_id,
-                        orchestrator_id=self.node_id,
-                        micro_batch_id=0,
-                        source_stage_id=last_stage_shard.start_layer,
-                        tokens=list(tokens),
-                        is_finished=is_finished,
-                    )
-                )
-                result_event.set()
-
-        self.result_router.register_token_callback(request_id, on_result)
-
+        self._result_events[request_id] = result_event
         try:
             await asyncio.wait_for(result_event.wait(), timeout=timeout)
-            return collected_result[0] if collected_result else None
+            queued = self._received_results.get(request_id)
+            return queued.pop(0) if queued else None
         except asyncio.TimeoutError:
             if DEBUG >= 1:
                 print(f"[{request_id}] Timeout waiting for result from stage on {last_stage_node_id}")
             return None
         finally:
-            self.result_router.unregister_token_callback(request_id)
+            self._result_events.pop(request_id, None)
+
+    def receive_result_payload(self, payload: Dict[str, Any], deliver_tokens: bool = True) -> bool:
+        request_id = payload.get("request_id")
+        if not request_id:
+            return False
+        if request_id not in self._sessions and request_id not in self._result_events:
+            return False
+
+        result = RoutedResult(
+            request_id=request_id,
+            orchestrator_id=payload.get("orchestrator_id") or self.node_id,
+            micro_batch_id=int(payload.get("micro_batch_id", 0) or 0),
+            source_stage_id=int(payload.get("source_stage_id", 0) or 0),
+            tokens=list(payload.get("tokens", []) or []),
+            is_finished=bool(payload.get("is_finished", False)),
+        )
+        delivered = self.result_router.receive_result(result) if deliver_tokens else [result]
+        self._received_results.setdefault(request_id, []).extend(delivered or [result])
+        event = self._result_events.get(request_id)
+        if event:
+            event.set()
+        return True
 
     def get_session(self, request_id: str) -> Optional[DistributedInferenceSession]:
         return self._sessions.get(request_id)
