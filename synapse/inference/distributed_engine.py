@@ -25,6 +25,10 @@ from synapse.transport.result_router import ResultRouter, RoutedResult
 from synapse.helpers import DEBUG
 
 
+class DistributedInferenceEmptyOutputError(RuntimeError):
+    """Raised when distributed inference completes before emitting any token."""
+
+
 class DistributedInferenceSession:
     """
     Per-request state for distributed inference across multiple nodes.
@@ -53,6 +57,9 @@ class DistributedInferenceSession:
 
         self.results: Dict[int, StageResult] = {}
         self.total_tokens_generated = 0
+        self.tokens_emitted = 0
+        self.last_stage_node_id: Optional[str] = None
+        self.empty_reason: Optional[str] = None
         self.is_finished = False
         self.error: Optional[Exception] = None
 
@@ -143,6 +150,7 @@ class DistributedPipelineController:
 
             first_stage_node_id, first_stage_shard = partition_assignments[0]
             last_stage_node_id, last_stage_shard = partition_assignments[-1]
+            session.last_stage_node_id = last_stage_node_id
 
             await self._send_input_to_stage(
                 first_stage_node_id,
@@ -160,10 +168,26 @@ class DistributedPipelineController:
             )
 
             if result is None:
-                return []
+                session.empty_reason = "no_first_result"
+                raise DistributedInferenceEmptyOutputError(
+                    "empty_distributed_output: no first result from distributed pipeline"
+                )
+
+            if result.metadata.get("error") == "empty_distributed_output":
+                session.empty_reason = str(result.metadata.get("empty_reason") or "worker_empty_output")
+                raise DistributedInferenceEmptyOutputError(
+                    f"empty_distributed_output: {session.empty_reason}"
+                )
+
+            if not result.tokens and result.is_finished:
+                session.empty_reason = "finished_before_first_token"
+                raise DistributedInferenceEmptyOutputError(
+                    "empty_distributed_output: distributed pipeline finished before emitting tokens"
+                )
 
             if result is not None and result.tokens:
                 all_generated_tokens.extend(result.tokens)
+                session.tokens_emitted = len(all_generated_tokens)
 
             for token_idx in range(1, max_generate_tokens):
                 if session.is_finished or result.is_finished or not all_generated_tokens:
@@ -192,11 +216,30 @@ class DistributedPipelineController:
                     break
                 result = next_result
 
+                if next_result.metadata.get("error") == "empty_distributed_output":
+                    session.empty_reason = str(next_result.metadata.get("empty_reason") or "worker_empty_output")
+                    raise DistributedInferenceEmptyOutputError(
+                        f"empty_distributed_output: {session.empty_reason}"
+                    )
+
                 if next_result.tokens:
                     all_generated_tokens.extend(next_result.tokens)
+                    session.tokens_emitted = len(all_generated_tokens)
+
+                if next_result.is_finished and not all_generated_tokens:
+                    session.empty_reason = "finished_without_tokens"
+                    raise DistributedInferenceEmptyOutputError(
+                        "empty_distributed_output: distributed pipeline finished without tokens"
+                    )
 
                 if next_result.is_finished:
                     break
+
+            if not all_generated_tokens:
+                session.empty_reason = session.empty_reason or "no_tokens_emitted"
+                raise DistributedInferenceEmptyOutputError(
+                    f"empty_distributed_output: {session.empty_reason}"
+                )
 
             session.is_finished = True
             if on_token_callback:
@@ -208,6 +251,9 @@ class DistributedPipelineController:
                 except Exception:
                     pass
 
+        except DistributedInferenceEmptyOutputError as e:
+            session.error = e
+            raise
         except Exception as e:
             session.error = e
             if DEBUG >= 1:
@@ -278,6 +324,7 @@ class DistributedPipelineController:
             source_stage_id=int(payload.get("source_stage_id", 0) or 0),
             tokens=list(payload.get("tokens", []) or []),
             is_finished=bool(payload.get("is_finished", False)),
+            metadata=dict(payload.get("metadata", {}) or {}),
         )
         delivered = self.result_router.receive_result(result) if deliver_tokens else [result]
         self._received_results.setdefault(request_id, []).extend(delivered or [result])

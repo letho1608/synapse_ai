@@ -1041,6 +1041,42 @@ class ChatGPTAPI:
         process_task = asyncio.create_task(
           self.node.process_prompt(base_shard, prompt, request_id=request_id, max_generate_tokens=max_tokens)
         )
+
+        def get_distribution_meta(rid: Optional[str]) -> dict:
+          getter = getattr(self.node, "get_request_distribution", None)
+          if not callable(getter):
+            return {}
+          return getter(rid)
+
+        def attach_distribution(completion: dict, rid: Optional[str]) -> dict:
+          completion["synapse_distribution"] = get_distribution_meta(rid)
+          return completion
+
+        def get_task_exception(task: asyncio.Task):
+          if not task.done() or task.cancelled():
+            return None
+          return task.exception()
+
+        def empty_output_response(rid: str, task: asyncio.Task):
+          distribution = get_distribution_meta(rid)
+          task_exc = get_task_exception(task)
+          code = "empty_completion"
+          if distribution.get("error") == "empty_distributed_output" or (
+            task_exc and "empty_distributed_output" in str(task_exc)
+          ):
+            code = "distributed_empty_output"
+          message = "Inference completed without emitting tokens."
+          if distribution.get("mode") == "distributed":
+            message = "Distributed inference completed without emitting tokens."
+          if task_exc:
+            message = f"Inference failed before emitting tokens: {task_exc}"
+          return web.json_response(
+            {
+              "error": {"message": message, "code": code},
+              "synapse_distribution": distribution,
+            },
+            status=502 if distribution.get("mode") == "distributed" else 500,
+          )
         try:
           if stream:
             # Thu thập full response trước (để kiểm tra tool call), sau đó stream
@@ -1165,6 +1201,13 @@ class ChatGPTAPI:
             all_tokens = []
             process_done_at: Optional[float] = None
             while True:
+              if process_task.done() and self.token_queues[request_id].empty():
+                task_exc = get_task_exception(process_task)
+                if task_exc:
+                  if DEBUG >= 1:
+                    print(f"Inference task failed for {request_id}: {task_exc}")
+                  return empty_output_response(request_id, process_task)
+                break
               try:
                 tokens, is_finished = await asyncio.wait_for(
                   self.token_queues[request_id].get(),
@@ -1191,6 +1234,8 @@ class ChatGPTAPI:
               if is_finished:
                 break
             decoded_first = tokenizer.decode(all_tokens)
+            if not all_tokens:
+              return empty_output_response(request_id, process_task)
             # Thử parse multiple tool calls trước
             tool_calls = parse_tool_calls(decoded_first)
             if tool_calls:
@@ -1227,9 +1272,24 @@ class ChatGPTAPI:
                   all_tokens_2.extend(tokens_2)
                   if is_finished_2:
                     break
+                if not all_tokens_2:
+                  if request_id_2 in self.token_queues:
+                    del self.token_queues[request_id_2]
+                  if not process_task_2.done():
+                    process_task_2.cancel()
+                    try:
+                      await process_task_2
+                    except asyncio.CancelledError:
+                      pass
+                    except Exception as cleanup_e:
+                      if DEBUG >= 1:
+                        print(f"[WARN] process_task_2 cleanup error for {request_id_2}: {cleanup_e}")
+                        traceback.print_exc()
+                  return empty_output_response(request_id_2, process_task_2)
                 completion = generate_completion(
                   chat_request, tokenizer, new_prompt, request_id_2, all_tokens_2, False, "stop", "chat.completion"
                 )
+                attach_distribution(completion, request_id_2)
                 if request_id_2 in self.token_queues:
                   del self.token_queues[request_id_2]
                 if not process_task_2.done():
@@ -1249,6 +1309,7 @@ class ChatGPTAPI:
                 completion = generate_completion(
                   chat_request, tokenizer, prompt, request_id, all_tokens, False, "stop", "chat.completion"
                 )
+                attach_distribution(completion, request_id)
                 return web.json_response(completion)
             completion = generate_completion(
               chat_request,
@@ -1260,6 +1321,7 @@ class ChatGPTAPI:
               "stop",
               "chat.completion",
             )
+            attach_distribution(completion, request_id)
             return web.json_response(completion)
         finally:
           if not process_task.done():

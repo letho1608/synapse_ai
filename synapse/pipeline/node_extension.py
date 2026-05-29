@@ -19,6 +19,7 @@ import numpy as np
 from synapse.inference.shard import Shard
 from synapse.inference.distributed_engine import (
     DistributedPipelineController,
+    DistributedInferenceEmptyOutputError,
     DistributedInferenceSession,
 )
 from synapse.transport.result_router import ResultRouter, RoutedResult
@@ -92,9 +93,28 @@ class DistributedPipelineExtension:
 
         partitions = self._get_partition_assignments(base_shard)
         num_stages = len(partitions)
+        node_ids = [pid for pid, _ in partitions]
 
         if num_stages <= 1:
+            self._node.mark_request_distribution(
+                request_id,
+                mode="single_node",
+                node_ids=node_ids,
+                stage_count=num_stages,
+                tokens_emitted=0,
+                fallback=True,
+            )
             return await self._run_single_node(base_shard, prompt, request_id, token_limit)
+
+        self._node.mark_request_distribution(
+            request_id,
+            mode="distributed",
+            node_ids=node_ids,
+            stage_count=num_stages,
+            tokens_emitted=0,
+            fallback=False,
+            last_stage_node_id=node_ids[-1] if node_ids else None,
+        )
 
         self._node._schedule_task(
             self._node.broadcast_opaque_status(
@@ -117,12 +137,24 @@ class DistributedPipelineExtension:
             self._node.trigger_on_token_callbacks(rid, tokens, is_finished)
 
         tracer = getattr(self._node, "tracer", None)
-        if tracer is not None:
-            from synapse.orchestration.tracing import TraceContext
-            tc = TraceContext(request_id=request_id, sequence_number=0)
-            tc.request_span = None
-            attrs = {"node_id": self._node.id, "num_stages": num_stages, "model_id": base_shard.model_id}
-            with tracer.start_span("node.process_prompt_distributed", tc, attrs) as span:
+        try:
+            if tracer is not None:
+                from synapse.orchestration.tracing import TraceContext
+                tc = TraceContext(request_id=request_id, sequence_number=0)
+                tc.request_span = None
+                attrs = {"node_id": self._node.id, "num_stages": num_stages, "model_id": base_shard.model_id}
+                with tracer.start_span("node.process_prompt_distributed", tc, attrs) as span:
+                    all_tokens = await self._controller.process_distributed_prompt(
+                        base_shard=base_shard,
+                        prompt=prompt,
+                        request_id=request_id,
+                        partition_assignments=partitions,
+                        max_generate_tokens=token_limit,
+                        on_token_callback=on_token_cb,
+                    )
+                    if span and all_tokens:
+                        span.set_attribute("num_tokens", len(all_tokens))
+            else:
                 all_tokens = await self._controller.process_distributed_prompt(
                     base_shard=base_shard,
                     prompt=prompt,
@@ -131,18 +163,17 @@ class DistributedPipelineExtension:
                     max_generate_tokens=token_limit,
                     on_token_callback=on_token_cb,
                 )
-                if span and all_tokens:
-                    span.set_attribute("num_tokens", len(all_tokens))
-                return all_tokens
-        else:
-            all_tokens = await self._controller.process_distributed_prompt(
-                base_shard=base_shard,
-                prompt=prompt,
-                request_id=request_id,
-                partition_assignments=partitions,
-                max_generate_tokens=token_limit,
-                on_token_callback=on_token_cb,
+        except DistributedInferenceEmptyOutputError as e:
+            self._node.mark_request_distribution(
+                request_id,
+                error="empty_distributed_output",
+                empty_reason=str(e),
+                tokens_emitted=0,
+                fallback=False,
             )
+            raise
+
+        self._node.mark_request_distribution(request_id, tokens_emitted=len(all_tokens), fallback=False)
 
         self._node._schedule_task(
             self._node.broadcast_opaque_status(
@@ -171,6 +202,14 @@ class DistributedPipelineExtension:
         all_tokens: List[int] = []
 
         try:
+            self._node.mark_request_distribution(
+                request_id,
+                mode="single_node",
+                node_ids=[self._node.id],
+                stage_count=1,
+                tokens_emitted=0,
+                fallback=True,
+            )
             prompt_ids = await self._node.inference_engine.encode(base_shard, prompt)
             self._node._prompt_token_ids[request_id] = prompt_ids
 
@@ -216,6 +255,11 @@ class DistributedPipelineExtension:
                 import traceback
                 traceback.print_exc()
         finally:
+            self._node.mark_request_distribution(
+                request_id,
+                tokens_emitted=len(all_tokens),
+                fallback=True,
+            )
             self._node._schedule_task(
                 self._node.event_router.publish(
                     "synapse/cluster/cache/clear",

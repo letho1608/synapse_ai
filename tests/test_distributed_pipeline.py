@@ -34,6 +34,11 @@ from synapse.pipeline.scheduler import (
 )
 from synapse.transport.result_router import ResultRouter, RoutedResult, ResultBuffer
 from synapse.transport.codec import encode_tensor, decode_tensor, TensorMessage
+from synapse.inference.distributed_engine import (
+    DistributedInferenceEmptyOutputError,
+    DistributedPipelineController,
+)
+from synapse.inference.shard import Shard
 
 
 class TestPipelineStage:
@@ -334,6 +339,71 @@ class TestResultRouter:
         assert len(delivered) == 2
         assert delivered[0].tokens == [1]
         assert delivered[1].tokens == [2]
+
+
+class TestDistributedEmptyOutput:
+    @pytest.mark.asyncio
+    async def test_first_stop_token_uses_best_non_stop_candidate(self):
+        from synapse.orchestration.node import Node
+        from synapse.routing.event_router import EventRouter
+
+        class MockTokenizer:
+            eos_token_id = 2
+
+        class MockEngine:
+            tokenizer = MockTokenizer()
+
+            async def sample(self, logits, temp=0.0, generated_ids=None):
+                return np.array([int(np.argmax(logits[0, -1, :]))], dtype=np.int64)
+
+            async def ensure_shard(self, shard):
+                return None
+
+        node = Node("node-0", EventRouter(), object(), MockEngine(), None, max_generate_tokens=5)
+        shard = Shard("model", 0, 0, 1)
+        logits = np.array([[[0.0, 1.0, 10.0, 9.0, 5.0]]], dtype=np.float32)
+
+        await node.process_inference_result(shard, logits, "req-stop", {})
+
+        assert node.buffered_token_output["req-stop"][0] == [3]
+
+    @pytest.mark.asyncio
+    async def test_first_empty_finished_result_raises(self):
+        class MockEngine:
+            async def encode(self, shard, prompt):
+                return np.array([[1, 2, 3]], dtype=np.int64)
+
+        class MockRouter:
+            def __init__(self):
+                self.controller = None
+
+            async def publish(self, topic, payload):
+                self.controller.receive_result_payload({
+                    "request_id": payload["request_id"],
+                    "orchestrator_id": "node-0",
+                    "micro_batch_id": 0,
+                    "source_stage_id": 1,
+                    "tokens": [],
+                    "is_finished": True,
+                })
+
+        router = MockRouter()
+        controller = DistributedPipelineController("node-0", MockEngine(), router)
+        router.controller = controller
+        shard0 = Shard("model", 0, 0, 2)
+        shard1 = Shard("model", 1, 1, 2)
+
+        await controller.start()
+        try:
+            with pytest.raises(DistributedInferenceEmptyOutputError):
+                await controller.process_distributed_prompt(
+                    shard0,
+                    "hello",
+                    "req-empty",
+                    [("node-0", shard0), ("node-1", shard1)],
+                )
+        finally:
+            await controller.stop()
 
 
 class TestLatencyMatrixIntegration:

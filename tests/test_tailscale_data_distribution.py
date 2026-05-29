@@ -620,10 +620,31 @@ async def phase4_e2e_inference(nodes: List[SynapseNode]) -> PhaseResult:
 
         choices = response.get("choices", [])
         content = ""
+        first_choice = choices[0] if choices else {}
         if choices:
-            first = choices[0]
+            first = first_choice
             message = first.get("message") or first.get("delta") or {}
             content = str(message.get("content") or first.get("text") or "")
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        try:
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            completion_tokens = 0
+        synapse_distribution = (
+            response.get("synapse_distribution")
+            if isinstance(response.get("synapse_distribution"), dict)
+            else {}
+        )
+        try:
+            stage_count = int(synapse_distribution.get("stage_count") or 0)
+        except (TypeError, ValueError):
+            stage_count = 0
+        try:
+            tokens_emitted = int(synapse_distribution.get("tokens_emitted") or 0)
+        except (TypeError, ValueError):
+            tokens_emitted = 0
+        fallback_raw = synapse_distribution.get("fallback")
+        fallback = fallback_raw is True or str(fallback_raw).lower() == "true"
 
         status2, dist_status = await fetch_json(
             session, "GET", f"{target.base_url}/v1/distributed/status", timeout_s=10
@@ -634,7 +655,31 @@ async def phase4_e2e_inference(nodes: List[SynapseNode]) -> PhaseResult:
 
     if not content.strip():
         log_warn(f"empty chat response body: {json.dumps(response, ensure_ascii=False)[:500]}")
+        log_warn(
+            "empty diagnostics: "
+            f"synapse_distribution={synapse_distribution}, finish_reason={first_choice.get('finish_reason')}, "
+            f"usage={usage}, first_choice={json.dumps(first_choice, ensure_ascii=False)[:500]}"
+        )
         return PhaseResult(False, "chat completed but returned empty assistant content", response)
+    if completion_tokens <= 0:
+        log_warn(
+            "chat returned text but completion token count is not positive: "
+            f"synapse_distribution={synapse_distribution}, finish_reason={first_choice.get('finish_reason')}, "
+            f"usage={usage}, first_choice={json.dumps(first_choice, ensure_ascii=False)[:500]}"
+        )
+        return PhaseResult(False, "chat completed but usage.completion_tokens <= 0", response)
+    if (
+        synapse_distribution.get("mode") != "distributed"
+        or stage_count < 2
+        or fallback
+        or tokens_emitted <= 0
+    ):
+        log_warn(
+            "chat response does not prove distributed execution: "
+            f"synapse_distribution={synapse_distribution}, finish_reason={first_choice.get('finish_reason')}, "
+            f"usage={usage}, first_choice={json.dumps(first_choice, ensure_ascii=False)[:500]}"
+        )
+        return PhaseResult(False, "chat completed but synapse_distribution does not prove distributed execution", response)
 
     partitions_count = dist_status.get("partitions_count", 0) if isinstance(dist_status, dict) else 0
     resources_summary = summarize_lacp_distribution(resources if isinstance(resources, dict) else {})
@@ -649,6 +694,7 @@ async def phase4_e2e_inference(nodes: List[SynapseNode]) -> PhaseResult:
     if status2 == 200 and partitions_count >= 2 and status3 == 200 and resources_summary["unique_node_count"] >= 2:
         log_ok(f"chat returned content and LACP resources still show {resources_summary['unique_node_count']} nodes")
         log_info(f"response: {content[:120]}")
+        log_info(f"synapse_distribution={synapse_distribution}")
         return PhaseResult(
             True,
             data={"response": response, "distributed_status": dist_status, "resources": resources},

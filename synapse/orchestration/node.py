@@ -95,6 +95,7 @@ class Node:
     self._background_tasks: Set[asyncio.Task] = set()
     # CRITICAL FIX: Map request_id -> orchestrator node_id for result routing
     self._request_orchestrator_map: Dict[str, str] = {}
+    self._request_distribution: Dict[str, Dict[str, Any]] = {}
     # CRITICAL FIX: Authoritative partition from master node for consistent shard assignment
     self._authoritative_partitions: Optional[List[Partition]] = None
     self._authoritative_base_shard: Optional[Shard] = None
@@ -505,6 +506,7 @@ class Node:
       self.buffered_token_output[request_id] = ([], False)
     
     is_finished = self.buffered_token_output[request_id][1] or (len(self.buffered_token_output[request_id][0]) >= self.max_generate_tokens)
+    empty_reason = None
 
     # Tokens generation logic: only needed for LLMs
     if shard.is_last_layer() and not is_finished:
@@ -512,6 +514,8 @@ class Node:
       if result.size == 0 or (len(result.shape) >= 2 and result.shape[1] == 0):
         if DEBUG >= 2:
           print(f"[{request_id}] Warning: Empty result from inference, cannot sample. Marking as finished.")
+        if not self.buffered_token_output[request_id][0]:
+          empty_reason = "empty_logits_before_first_token"
         is_finished = True
         self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
         forward = np.array([[]], dtype=np.int32).reshape(1, 0)
@@ -564,8 +568,16 @@ class Node:
             )
             token = retry_token
             token_value = token.item()
+            if token_value in stop_ids:
+              last_logits = retry_logits[0, -1, :] if len(retry_logits.shape) >= 3 else retry_logits.reshape(-1)
+              if last_logits.size and np.isfinite(last_logits).any():
+                token_value = int(np.argmax(last_logits))
+                token = np.array([token_value], dtype=np.int64)
           except Exception:
             pass
+
+        if len(buf) == 0 and token_value in stop_ids:
+          empty_reason = "first_token_stop_without_non_stop_candidate"
 
         # Add to buffer
         self.buffered_token_output[request_id][0].append(token_value)
@@ -601,6 +613,7 @@ class Node:
           if is_finished and not self.buffered_token_output[request_id][0]:
             if DEBUG >= 2:
               print(f"[{request_id}] Generation finished with no tokens, sending empty result with is_finished=True")
+            empty_reason = empty_reason or "finished_without_tokens"
     else:
       forward = result
       intermediate_result = []
@@ -621,6 +634,15 @@ class Node:
     else:
       if DEBUG >= 1:
         print(f"[{request_id}] [LAST_LAYER] Triggering callback: tokens={intermediate_result}, is_finished={is_finished}")
+      tokens_emitted = len(self.buffered_token_output.get(request_id, ([], False))[0])
+      self.mark_request_distribution(request_id, tokens_emitted=tokens_emitted)
+      if empty_reason:
+        self.mark_request_distribution(
+          request_id,
+          error="empty_distributed_output",
+          empty_reason=empty_reason,
+          tokens_emitted=tokens_emitted,
+        )
       self.trigger_on_token_callbacks(request_id, intermediate_result, is_finished)
       
       if intermediate_result or is_finished:
@@ -636,6 +658,7 @@ class Node:
             "orchestrator_id": orchestrator_id or self._orchestrator_id_for_request(request_id),
             "micro_batch_id": 0,
             "source_stage_id": getattr(shard, "start_layer", 0),
+            "metadata": self.get_request_distribution(request_id),
         }
         if self._distributed_pipeline:
             self._distributed_pipeline.handle_result_event(result_payload, deliver_tokens=False)
@@ -731,8 +754,30 @@ class Node:
           request_id=request_id,
           max_generate_tokens=max_generate_tokens,
         )
+        if not tokens:
+          self.mark_request_distribution(
+            request_id,
+            error="empty_distributed_output",
+            empty_reason="distributed_pipeline_returned_no_tokens",
+            tokens_emitted=0,
+            fallback=False,
+          )
+          raise RuntimeError(
+            "empty_distributed_output: distributed pipeline returned no tokens"
+          )
         return np.array(tokens) if tokens else None
       except Exception as e:
+        if e.__class__.__name__ == "DistributedInferenceEmptyOutputError" or "empty_distributed_output" in str(e):
+          self.mark_request_distribution(
+            request_id,
+            error="empty_distributed_output",
+            empty_reason=str(e),
+            fallback=False,
+          )
+          if DEBUG >= 1:
+            print(f"[{request_id}] Distributed pipeline produced empty output: {e}")
+          raise
+        self.mark_request_distribution(request_id, fallback=True)
         if DEBUG >= 1:
           print(f"[{request_id}] Distributed pipeline failed: {e}, falling back to single-node")
           traceback.print_exc()
@@ -1459,6 +1504,17 @@ class Node:
   @property
   def current_topology(self) -> Topology:
     return self.topology
+
+  def mark_request_distribution(self, request_id: Optional[str], **updates: Any) -> None:
+    if not request_id:
+      return
+    metadata = self._request_distribution.setdefault(request_id, {})
+    metadata.update({k: v for k, v in updates.items() if v is not None})
+
+  def get_request_distribution(self, request_id: Optional[str]) -> Dict[str, Any]:
+    if not request_id:
+      return {}
+    return dict(self._request_distribution.get(request_id, {}))
 
   def _orchestrator_id_for_request(self, request_id: str) -> str:
     """Return the orchestrator node_id that should receive results for this request.
