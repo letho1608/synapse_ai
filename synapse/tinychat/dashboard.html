@@ -452,18 +452,53 @@
                         </div>
                     </div>
 
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--spacing-lg);">
+                        <!-- Healthcheck Log -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">Log: Healthcheck</h2>
+                                <span class="badge badge-muted" x-text="healthcheckLines.length + ' dòng'"></span>
+                            </div>
+                            <div class="terminal-log" x-ref="hcLogContainer"
+                                x-effect="healthcheckLines.length && $nextTick(() => { const el = $refs.hcLogContainer; if (el) el.scrollTop = el.scrollHeight })">
+                                <template x-for="(line, i) in healthcheckLines" :key="i">
+                                    <div class="terminal-line" x-text="line"></div>
+                                </template>
+                                <div class="terminal-line terminal-prompt" x-show="healthcheckLines.length === 0"
+                                    x-text="(chưa có log healthcheck)"></div>
+                            </div>
+                        </div>
+
+                        <!-- Distributed Log -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">Log: Quá trình phân tán</h2>
+                                <span class="badge badge-muted" x-text="distributedLines.length + ' dòng'"></span>
+                            </div>
+                            <div class="terminal-log" x-ref="distLogContainer"
+                                x-effect="distributedLines.length && $nextTick(() => { const el = $refs.distLogContainer; if (el) el.scrollTop = el.scrollHeight })">
+                                <template x-for="(line, i) in distributedLines" :key="i">
+                                    <div class="terminal-line" x-text="line"></div>
+                                </template>
+                                <div class="terminal-line terminal-prompt" x-show="distributedLines.length === 0"
+                                    x-text="(chưa có log phân tán)"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- General Log (Other) -->
                     <div class="card">
                         <div class="card-header">
-                            <h2 class="card-title">Log (Terminal)</h2>
-                            <span class="badge badge-muted" x-text="terminalLines.length + ' dòng'"></span>
+                            <h2 class="card-title">Log: Hệ thống chung</h2>
+                            <span class="badge badge-muted" x-text="otherLines.length + ' dòng'"></span>
                         </div>
-                        <div class="terminal-log" x-ref="logContainer"
-                            x-effect="terminalLines.length && $nextTick(() => { const el = $refs.logContainer; if (el) el.scrollTop = el.scrollHeight })">
-                            <template x-for="(line, i) in terminalLines" :key="i">
+                        <div class="terminal-log" x-ref="otherLogContainer"
+                            x-effect="otherLines.length && $nextTick(() => { const el = $refs.otherLogContainer; if (el) el.scrollTop = el.scrollHeight })">
+                            <template x-for="(line, i) in otherLines" :key="i">
                                 <div class="terminal-line" x-text="line"></div>
                             </template>
-                            <div class="terminal-line terminal-prompt" x-show="terminalLines.length === 0"
-                                x-text="(chưa có log — chạy ứng dụng để xem output terminal)"></div>
+                            <div class="terminal-line terminal-prompt" x-show="otherLines.length === 0"
+                                x-text="(chưa có log chung)"></div>
                         </div>
                     </div>
                 </div>
@@ -2014,6 +2049,9 @@
                 settingsForm: { default_model: '', theme: 'light' },
                 settingsLoading: false,
                 terminalLines: [],
+                healthcheckLines: [],
+                distributedLines: [],
+                otherLines: [],
                 // === Cluster Resources ===
                 clusterResources: [],
                 clusterLoading: false,
@@ -2174,9 +2212,49 @@
                     try {
                         const res = await fetch('/v1/logs/terminal');
                         const data = await res.json();
-                        this.terminalLines = data.data || [];
+                        const allLines = data.data || [];
+                        
+                        const hc = [];
+                        const dist = [];
+                        const other = [];
+                        
+                        for (let line of allLines) {
+                            // Strip ANSI color codes
+                            line = line.replace(/\x1b\[[0-9;]*m/g, '');
+
+                            if (line.includes('call_id=') ||
+                                line.includes('publishing to event_router') ||
+                                line.includes('publish returned') ||
+                                line.includes('on_response fired!') ||
+                                line.includes('got result:') ||
+                                line.includes('Unsubscribed from topic:')) {
+                                continue;
+                            }
+                            
+                            const lowerLine = line.toLowerCase();
+                            if (lowerLine.includes('healthcheck')) {
+                                hc.push(line);
+                            } else if (line.includes('[DEBUG-RPC]') || 
+                                       lowerLine.includes('topology') || 
+                                       lowerLine.includes('synapse/rpc/') || 
+                                       lowerLine.includes('peer') || 
+                                       lowerLine.includes('node') || 
+                                       lowerLine.includes('tailscale')) {
+                                dist.push(line);
+                            } else {
+                                other.push(line);
+                            }
+                        }
+                        
+                        this.terminalLines = allLines;
+                        this.healthcheckLines = hc;
+                        this.distributedLines = dist;
+                        this.otherLines = other;
                     } catch (e) {
                         this.terminalLines = [];
+                        this.healthcheckLines = [];
+                        this.distributedLines = [];
+                        this.otherLines = [];
                     }
                 },
 
