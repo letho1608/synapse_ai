@@ -338,7 +338,7 @@ class Node:
         stuck_requests.append(request_id)
 
     if stuck_requests:
-      if DEBUG >= 1: print(f"!!! [FAULT_TOLERANCE] Found {len(stuck_requests)} stuck requests. Triggering topology refresh.")
+      logger.warning(f"[Phân tán] ⚠ Phát hiện {len(stuck_requests)} request bị kẹt — Đang cập nhật topology...")
       await self.collect_topology(set())
 
     # Phase 2: LACP 3.0 node failure detection + rebalancing
@@ -346,7 +346,7 @@ class Node:
       dead_nodes = self.fault_tolerance.get_dead_nodes()
       for dead_id in dead_nodes:
         if self.fault_tolerance._health.get(dead_id, None) and self.fault_tolerance._health[dead_id].is_blacklisted:
-          if DEBUG >= 1: print(f"!!! [LACP_FAULT] Node {dead_id} is dead, triggering rebalance")
+          logger.warning(f"[Phân tán] ⚠ Node {dead_id} mất kết nối! Đang phân chia lại layers cho các node còn lại...")
 
           current_assignments = {}
           partitions = self._compute_lacp_partition()
@@ -715,7 +715,7 @@ class Node:
     # LACP 3.0: Use distributed pipeline when multiple nodes are available
     node_count = len(self.topology.nodes) if self.topology.nodes else 0
     if node_count > 1 and self.is_orchestrator_for_request(request_id):
-      if DEBUG >= 1: print(f"[{request_id}] LACP 3.0: Using distributed pipeline across {node_count} nodes")
+      logger.info(f"[Phân tán] Chế độ: Distributed Pipeline — {node_count} node trong cluster")
       try:
         tokens = await self.distributed_pipeline.process_prompt_distributed(
           base_shard=base_shard,
@@ -735,6 +735,7 @@ class Node:
       resp = await self.forward_prompt(shard, prompt, request_id, 0, inference_state)
       return None
     else:
+      logger.info(f"[Phân tán] Chế độ: Single-Node — xử lý tất cả layers trên máy này")
       self.outstanding_requests[request_id] = "processing"
       try:
         token_limit = max_generate_tokens if isinstance(max_generate_tokens, int) and max_generate_tokens > 0 else self.max_generate_tokens
@@ -782,8 +783,10 @@ class Node:
             
           # Progress logging
           tokens = self.buffered_token_output[request_id][0]
-          if DEBUG >= 1:
-            print(f"[{request_id}] PROGRESS: Generated {len(tokens)}/{self.max_generate_tokens} tokens.")
+          if len(tokens) == 1:
+            logger.info(f"[Phân tán] Bắt đầu sinh text (request: {request_id[:8]})")
+          elif len(tokens) % 10 == 0:
+            logger.info(f"[Phân tán] Đã sinh {len(tokens)} token (request: {request_id[:8]})")
           
           # Check if we are finished
           if self.buffered_token_output[request_id][1] or len(tokens) >= self.max_generate_tokens:
@@ -799,6 +802,7 @@ class Node:
         if not finished:
           self.buffered_token_output[request_id] = (buffered_tokens, True)
           self.trigger_on_token_callbacks(request_id, [], True)
+        logger.info(f"[Phân tán] Hoàn thành sinh text — tổng {len(buffered_tokens)} token (request: {request_id[:8]})")
         self.outstanding_requests.pop(request_id, None)
         self._prompt_token_ids.pop(request_id, None)
         # Broadcast clear cache to cluster
@@ -1051,7 +1055,7 @@ class Node:
       if target_id == self.id:
           await self._process_prompt(next_shard, prompt, request_id, inference_state)
       else:
-          logger.info(f"[P2P_MESH] Publishing prompt to Node: {target_id}")
+          logger.debug(f"[P2P_MESH] Publishing prompt to Node: {target_id}")
           await self.event_router.publish(f"synapse/inference/prompt/{target_id}", {
               "request_id": request_id,
               "shard": next_shard.to_dict(),
@@ -1080,7 +1084,7 @@ class Node:
     if target_id == self.id:
       return await self.process_tensor(target_shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
     else:
-      logger.info(f"[P2P_MESH] Publishing work to Node: {target_id}")
+      logger.debug(f"[P2P_MESH] Publishing work to Node: {target_id}")
       # CRITICAL FIX: Use binary tensor encoding (tobytes + shape + dtype)
       # instead of tensor.tolist() which creates massive nested JSON arrays.
       await self.event_router.publish(f"synapse/inference/tensor/{target_id}", {

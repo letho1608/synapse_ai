@@ -484,21 +484,37 @@
                                     x-text="(chưa có log phân tán)"></div>
                             </div>
                         </div>
-                    </div>
 
-                    <!-- General Log (Other) -->
-                    <div class="card">
-                        <div class="card-header">
-                            <h2 class="card-title">Log: Hệ thống chung</h2>
-                            <span class="badge badge-muted" x-text="otherLines.length + ' dòng'"></span>
+                        <!-- Node Log -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">Log: Node</h2>
+                                <span class="badge badge-muted" x-text="nodeLines.length + ' dòng'"></span>
+                            </div>
+                            <div class="terminal-log" x-ref="nodeLogContainer"
+                                x-effect="nodeLines.length && $nextTick(() => { const el = $refs.nodeLogContainer; if (el) el.scrollTop = el.scrollHeight })">
+                                <template x-for="(line, i) in nodeLines" :key="i">
+                                    <div class="terminal-line" x-text="line"></div>
+                                </template>
+                                <div class="terminal-line terminal-prompt" x-show="nodeLines.length === 0"
+                                    x-text="(chưa có log node)"></div>
+                            </div>
                         </div>
-                        <div class="terminal-log" x-ref="otherLogContainer"
-                            x-effect="otherLines.length && $nextTick(() => { const el = $refs.otherLogContainer; if (el) el.scrollTop = el.scrollHeight })">
-                            <template x-for="(line, i) in otherLines" :key="i">
-                                <div class="terminal-line" x-text="line"></div>
-                            </template>
-                            <div class="terminal-line terminal-prompt" x-show="otherLines.length === 0"
-                                x-text="(chưa có log chung)"></div>
+
+                        <!-- General Log (Other) -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">Log: Hệ thống chung</h2>
+                                <span class="badge badge-muted" x-text="otherLines.length + ' dòng'"></span>
+                            </div>
+                            <div class="terminal-log" x-ref="otherLogContainer"
+                                x-effect="otherLines.length && $nextTick(() => { const el = $refs.otherLogContainer; if (el) el.scrollTop = el.scrollHeight })">
+                                <template x-for="(line, i) in otherLines" :key="i">
+                                    <div class="terminal-line" x-text="line"></div>
+                                </template>
+                                <div class="terminal-line terminal-prompt" x-show="otherLines.length === 0"
+                                    x-text="(chưa có log chung)"></div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -705,14 +721,14 @@
                                 <textarea class="chat-input" rows="1"
                                     :placeholder="(selectedModel && (selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr'))) ? 'Gửi ảnh để nhận diện...' : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'"
                                     x-model="testInput"
-                                    @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); if (isTesting) cancelTest(); else if (selectedModel && (testInput.trim() || testImageBase64)) runTest(); }"
+                                    @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); if (isTesting) cancelTest(); else runTest(); }"
                                     @input="$el.style.height = '44px'; $el.style.height = $el.scrollHeight + 'px'"
-                                    :disabled="isTesting || (selectedModel && (selectedModel.toLowerCase().includes('crnn') || selectedModel.toLowerCase().includes('ocr')) && !testImageBase64 && !testInput.trim())"></textarea>
+                                    :disabled="isTesting"></textarea>
                                     
                                 <button type="button" class="btn chat-send-btn"
                                     :class="isTesting ? 'btn-danger' : 'btn-primary'"
                                     @click="isTesting ? cancelTest() : runTest()"
-                                    :disabled="!isTesting && (!selectedModel || (!testInput.trim() && !testImageBase64))"
+                                    :disabled="!isTesting && !testInput.trim() && !testImageBase64"
                                     :title="isTesting ? 'Dừng (Enter)' : 'Gửi (Enter)'">
                                     <i class="fas fa-paper-plane" x-show="!isTesting" style="margin-left: -2px;"></i>
                                     <i class="fas fa-stop" x-show="isTesting"></i>
@@ -2051,6 +2067,7 @@
                 terminalLines: [],
                 healthcheckLines: [],
                 distributedLines: [],
+                nodeLines: [],
                 otherLines: [],
                 // === Cluster Resources ===
                 clusterResources: [],
@@ -2216,7 +2233,9 @@
                         
                         const hc = [];
                         const dist = [];
+                        const node = [];
                         const other = [];
+                        const seenMasters = {};
                         
                         for (let line of allLines) {
                             // Strip ANSI color codes
@@ -2227,18 +2246,59 @@
                                 line.includes('publish returned') ||
                                 line.includes('on_response fired!') ||
                                 line.includes('got result:') ||
-                                line.includes('Unsubscribed from topic:')) {
+                                line.includes('Unsubscribed from topic:') ||
+                                line.includes('[P2P_MESH]')) {
                                 continue;
                             }
                             
                             const lowerLine = line.toLowerCase();
-                            if (lowerLine.includes('healthcheck')) {
+                            if (lowerLine.includes('_election_loop') || lowerLine.includes('election')) {
+                                // "is still Master (stickiness active)" → skip repeats
+                                if (line.includes('is still Master (stickiness active)')) {
+                                    const m = line.match(/Node\s+(\S+)\s+is still Master/);
+                                    const nid = m ? m[1] : '';
+                                    if (!seenMasters[nid]) {
+                                        seenMasters[nid] = true;
+                                        node.push(line.replace('is still Master (stickiness active)', 'đã được bầu làm Master Node ✓'));
+                                    }
+                                    // else: skip duplicate
+                                }
+                                // Master went offline → always show + mark as unseen so re-election shows
+                                else if (line.includes('offline') || line.includes('electing new Master')) {
+                                    const m = line.match(/Master\s+(\S+)\s+offline/);
+                                    if (m) {
+                                        delete seenMasters[m[1]];
+                                        node.push('⚠ Master Node ' + m[1] + ' đã ngắt kết nối — đang chuẩn bị bầu Master Node mới...');
+                                    } else {
+                                        node.push(line);
+                                    }
+                                }
+                                // "went offline, waiting Xs" → show once
+                                else if (line.includes('went offline')) {
+                                    const m = line.match(/Previous Master\s+(\S+)\s+went offline/);
+                                    if (m) delete seenMasters[m[1]];
+                                    node.push(line);
+                                }
+                                // First recognition of a new master ("recognizes X as Master")
+                                else if (line.includes('recognizes') && line.includes('as Master')) {
+                                    const m = line.match(/recognizes\s+(\S+)\s+as Master/);
+                                    const nid = m ? m[1] : '';
+                                    if (!seenMasters[nid]) {
+                                        seenMasters[nid] = true;
+                                        node.push(line);
+                                    }
+                                }
+                                // Other election messages → always show
+                                else {
+                                    node.push(line);
+                                }
+                            } else if (lowerLine.includes('healthcheck')) {
                                 hc.push(line);
-                            } else if (line.includes('[DEBUG-RPC]') || 
+                            } else if (line.includes('[Phân tán]') ||
+                                       line.includes('[DEBUG-RPC]') || 
                                        lowerLine.includes('topology') || 
                                        lowerLine.includes('synapse/rpc/') || 
                                        lowerLine.includes('peer') || 
-                                       lowerLine.includes('node') || 
                                        lowerLine.includes('tailscale')) {
                                 dist.push(line);
                             } else {
@@ -2249,11 +2309,13 @@
                         this.terminalLines = allLines;
                         this.healthcheckLines = hc;
                         this.distributedLines = dist;
+                        this.nodeLines = node;
                         this.otherLines = other;
                     } catch (e) {
                         this.terminalLines = [];
                         this.healthcheckLines = [];
                         this.distributedLines = [];
+                        this.nodeLines = [];
                         this.otherLines = [];
                     }
                 },
@@ -2622,8 +2684,13 @@
                 },
 
                 async runTest() {
+                    const isValidModel = this.selectedModel && this.modelList.downloaded.some(m => m.name === this.selectedModel);
+                    if (!isValidModel) {
+                        alert('Vui lòng chọn một Model đã tải trước khi gửi tin nhắn!');
+                        return;
+                    }
                     // Check if either text or image is provided
-                    if (!this.selectedModel || (!this.testInput.trim() && !this.testImageBase64)) return;
+                    if (!this.testInput.trim() && !this.testImageBase64) return;
                     
                     const userText = this.testInput.trim();
                     this.testInput = '';

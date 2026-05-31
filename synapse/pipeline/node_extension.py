@@ -88,6 +88,15 @@ class DistributedPipelineExtension:
         partitions = self._get_partition_assignments(base_shard)
         num_stages = len(partitions)
 
+        # Log layer distribution
+        from loguru import logger
+        parts_desc = []
+        for node_id, shard in partitions:
+            short_name = node_id.split('.')[0] if '.' in node_id else node_id
+            n_layers = shard.end_layer - shard.start_layer + 1
+            parts_desc.append(f"{short_name} → Layer {shard.start_layer}-{shard.end_layer} ({n_layers} layers)")
+        logger.info(f"[Phân tán] Phân chia layers: {' | '.join(parts_desc)}")
+
         if num_stages <= 1:
             return await self._run_single_node(base_shard, prompt, request_id, token_limit)
 

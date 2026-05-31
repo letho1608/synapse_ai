@@ -55,30 +55,40 @@ class P2PPeerHandle(PeerHandle):
         # TCP connection handled by bridge, nothing to do here
         pass
 
+    _last_health_status: Dict[str, bool] = {}
+
     async def health_check(self) -> bool:
         try:
-            print(f"[DEBUG-HC] {self._id}: connecting to {self.address}...", flush=True)
             connected, actual_id = await self.libp2p_node.connect_to_peer(self._id, self.address)
-            print(f"[DEBUG-HC] {self._id}: connect_to_peer = {connected}, actual_id = {actual_id}", flush=True)
             if not connected:
-                if DEBUG >= 2: print(f"Health check failed to connect to {self._id}")
+                if P2PPeerHandle._last_health_status.get(self._id, True):
+                    logger.warning(f"[HealthCheck] Peer {self._id} disconnected (connect failed)")
+                P2PPeerHandle._last_health_status[self._id] = False
                 return False
 
             if actual_id and actual_id != self._id:
-                print(f"[DEBUG-HC] Updating peer ID from {self._id} to {actual_id}", flush=True)
+                logger.info(f"[HealthCheck] Peer ID updated: {self._id} -> {actual_id}")
                 self._id = actual_id
 
-            print(f"[DEBUG-HC] {self._id}: doing RPC health call...", flush=True)
             res = await self._rpc_call("synapse/rpc/health", {}, timeout=15.0)
-            print(f"[DEBUG-HC] {self._id}: RPC result = {res}", flush=True)
-            return res.get("status") == "ok"
+            is_ok = res.get("status") == "ok"
+
+            if is_ok and not P2PPeerHandle._last_health_status.get(self._id, True):
+                logger.info(f"[HealthCheck] Peer {self._id} reconnected")
+            elif not is_ok and P2PPeerHandle._last_health_status.get(self._id, True):
+                logger.warning(f"[HealthCheck] Peer {self._id} health check failed (status={res.get('status')})")
+
+            P2PPeerHandle._last_health_status[self._id] = is_ok
+            return is_ok
         except asyncio.TimeoutError:
-            print(f"[DEBUG-HC] {self._id}: RPC TIMEOUT!", flush=True)
-            if DEBUG >= 2: print(f"Health check RPC TIMEOUT for {self._id} - check P2P event routing")
+            if P2PPeerHandle._last_health_status.get(self._id, True):
+                logger.warning(f"[HealthCheck] Peer {self._id} disconnected (RPC timeout)")
+            P2PPeerHandle._last_health_status[self._id] = False
             return False
         except Exception as e:
-            print(f"[DEBUG-HC] {self._id}: ERROR {type(e).__name__}: {e}", flush=True)
-            if DEBUG >= 2: print(f"Health check error for {self._id}: {type(e).__name__}: {e}")
+            if P2PPeerHandle._last_health_status.get(self._id, True):
+                logger.warning(f"[HealthCheck] Peer {self._id} disconnected ({type(e).__name__}: {e})")
+            P2PPeerHandle._last_health_status[self._id] = False
             return False
 
     async def send_prompt(self, shard: Shard, prompt: str, request_id: Optional[str] = None) -> bool:
