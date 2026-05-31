@@ -746,6 +746,8 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             if self._model is None:
                 vocab_size = 32000
                 return np.zeros((1, 0, vocab_size), dtype=np.float32), inference_state
+            if inference_state.get("reset_cache"):
+                self.clear_cache(request_id)
             output = self._forward_transformer_range(shard, input_data, request_id=request_id)
             return output, inference_state
         except Exception as e:

@@ -148,6 +148,7 @@ class DistributedPipelineController:
             token_ids = await self.inference_engine.encode(base_shard, prompt)
             if token_ids is None or token_ids.size == 0:
                 return []
+            prompt_token_ids = token_ids.reshape(-1)
 
             first_stage_node_id, first_stage_shard = partition_assignments[0]
             last_stage_node_id, last_stage_shard = partition_assignments[-1]
@@ -160,6 +161,7 @@ class DistributedPipelineController:
                 request_id,
                 is_prompt=True,
                 sample_temperature=sample_temperature,
+                reset_cache=True,
             )
 
             result = await self._collect_result(
@@ -198,14 +200,18 @@ class DistributedPipelineController:
                 if len(all_generated_tokens) >= max_generate_tokens:
                     break
 
-                last_token = np.array([[all_generated_tokens[-1]]])
+                next_input = np.concatenate([
+                    prompt_token_ids,
+                    np.array(all_generated_tokens, dtype=prompt_token_ids.dtype),
+                ]).reshape(1, -1)
                 await self._send_input_to_stage(
                     first_stage_node_id,
                     first_stage_shard,
-                    last_token,
+                    next_input,
                     request_id,
                     is_prompt=False,
                     sample_temperature=sample_temperature,
+                    reset_cache=True,
                 )
 
                 next_result = await self._collect_result(
@@ -277,6 +283,7 @@ class DistributedPipelineController:
         request_id: str,
         is_prompt: bool = False,
         sample_temperature: Optional[float] = None,
+        reset_cache: bool = False,
     ) -> None:
         topic = f"synapse/inference/tensor/{target_node_id}"
         payload = {
@@ -285,7 +292,11 @@ class DistributedPipelineController:
             "tensor_data": input_data.tobytes(),
             "shape": list(input_data.shape),
             "dtype": str(input_data.dtype),
-            "inference_state": {"is_prompt": is_prompt, "sample_temperature": sample_temperature},
+            "inference_state": {
+                "is_prompt": is_prompt,
+                "sample_temperature": sample_temperature,
+                "reset_cache": reset_cache,
+            },
             "_orchestrator_id": self.node_id,
         }
         await self.event_router.publish(topic, payload)
