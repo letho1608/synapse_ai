@@ -269,6 +269,24 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         out = rotary_emb(hidden_states, position_ids)
         return out
 
+    def _build_causal_attention_mask(self, hidden_states, past_len: int, seq_len: int):
+        import torch
+
+        if seq_len <= 0:
+            return None
+
+        device = hidden_states.device
+        dtype = hidden_states.dtype if torch.is_floating_point(hidden_states) else torch.float32
+        mask_value = torch.finfo(dtype).min
+        key_len = past_len + seq_len
+
+        query_positions = torch.arange(past_len, key_len, device=device).view(seq_len, 1)
+        key_positions = torch.arange(0, key_len, device=device).view(1, key_len)
+        future_mask = key_positions > query_positions
+
+        attention_mask = torch.zeros((1, 1, seq_len, key_len), device=device, dtype=dtype)
+        return attention_mask.masked_fill(future_mask.view(1, 1, seq_len, key_len), mask_value)
+
     def _call_transformer_block(self, block, hidden_states, attention_mask=None, position_ids=None, position_embeddings=None, past_key_value=None, cache_position=None):
         # Gọi theo chữ ký thật của layer thay vì thử nhiều fallback.
         params = inspect.signature(block.forward).parameters
@@ -354,8 +372,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         # Build position embeddings (RoPE)
         position_embeddings = self._build_position_embeddings(hidden_states, position_ids)
 
-        # Prepare attention mask (optional, eager path might need it if not None but usually None is causal)
-        attention_mask = None
+        attention_mask = self._build_causal_attention_mask(hidden_states, past_len, seq_len)
 
         with torch.no_grad():
             for layer_index in range(shard.start_layer, shard.end_layer + 1):
@@ -371,7 +388,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 # Let's override the block call here to capture KV cache.
                 
                 params = inspect.signature(block.forward).parameters
-                kwargs: Dict[str, Any] = {
+                candidate_kwargs: Dict[str, Any] = {
                     "attention_mask": attention_mask,
                     "position_ids": position_ids,
                     "position_embeddings": position_embeddings,
@@ -379,7 +396,12 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                     "use_cache": True,
                 }
                 if "cache_position" in params:
-                    kwargs["cache_position"] = cache_position
+                    candidate_kwargs["cache_position"] = cache_position
+                kwargs = {
+                    name: value
+                    for name, value in candidate_kwargs.items()
+                    if name in params and value is not None
+                }
                 
                 # Actual block call
                 output = block(hidden_states, **kwargs)
@@ -416,6 +438,12 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         else:
             self._kv_caches.clear()
             if DEBUG >= 1: print("[PyTorchHF] Cleared all KV caches")
+
+    def has_cache(self, request_id: Optional[str]) -> bool:
+        if not request_id:
+            return False
+        cache = self._kv_caches.get(request_id)
+        return bool(cache)
 
     async def ensure_shard(self, shard: Shard) -> None:
         if self._model_id == shard.model_id and self._model is not None:

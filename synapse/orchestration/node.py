@@ -1059,7 +1059,9 @@ class Node:
     try:
       self.outstanding_requests[request_id] = "processing"
       input_data = tensor
-      if shard.is_first_layer() and request_id in self._prompt_token_ids and request_id in self.buffered_token_output:
+      has_cache = getattr(self.inference_engine, "has_cache", None)
+      cache_ready = callable(has_cache) and has_cache(request_id)
+      if shard.is_first_layer() and not cache_ready and request_id in self._prompt_token_ids and request_id in self.buffered_token_output:
         buf = self.buffered_token_output[request_id][0]
         if buf:
           full_ids = np.concatenate([
