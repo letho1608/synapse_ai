@@ -653,7 +653,15 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             return ""
         return self.tokenizer.decode(tokens.tolist(), skip_special_tokens=True)
 
-    async def sample(self, x: np.ndarray, temp: float = 0.0, generated_ids: Optional[List[int]] = None, repetition_penalty: float = 1.1) -> np.ndarray:
+    async def sample(
+        self,
+        x: np.ndarray,
+        temp: float = 0.0,
+        generated_ids: Optional[List[int]] = None,
+        repetition_penalty: float = 1.1,
+        top_k: int = 50,
+        top_p: float = 0.95,
+    ) -> np.ndarray:
         """Sample token từ logits (last position). Áp dụng repetition_penalty nếu có generated_ids."""
         try:
             import torch
@@ -672,7 +680,24 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             if temp <= 0:
                 token_id = logits.argmax(dim=-1).item()
             else:
-                probs = torch.softmax(logits / temp, dim=-1)
+                logits = logits / temp
+                if top_k and 0 < top_k < logits.shape[-1]:
+                    values, _ = torch.topk(logits, top_k)
+                    logits = logits.masked_fill(logits < values[-1], float("-inf"))
+                if top_p and 0.0 < top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+                    sorted_indices_to_remove[0] = False
+                    indices_to_remove = torch.zeros_like(sorted_indices_to_remove, dtype=torch.bool)
+                    indices_to_remove.scatter_(0, sorted_indices, sorted_indices_to_remove)
+                    logits = logits.masked_fill(indices_to_remove, float("-inf"))
+                probs = torch.softmax(logits, dim=-1)
+                if not torch.isfinite(probs).all() or probs.sum().item() <= 0:
+                    token_id = logits.argmax(dim=-1).item()
+                    return np.array([token_id], dtype=np.int32)
                 token_id = torch.multinomial(probs, 1).item()
             return np.array([token_id], dtype=np.int32)
         except Exception as e:

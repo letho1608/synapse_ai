@@ -408,10 +408,11 @@ class Node:
     shard_dict = data.get("shard")
     shard = Shard.from_dict(shard_dict)
     inference_state = data.get("inference_state")
+    sample_temperature = (inference_state or {}).get("sample_temperature")
 
     # CRITICAL FIX: Pass orchestrator_id so results are routed back correctly
     orchestrator_id = data.get("_orchestrator_id")
-    await self.process_tensor(shard, tensor_data, request_id, inference_state, orchestrator_id=orchestrator_id)
+    await self.process_tensor(shard, tensor_data, request_id, inference_state, orchestrator_id=orchestrator_id, sample_temperature=sample_temperature)
 
   async def on_p2p_prompt(self, event: Event):
     """Handle incoming prompt for inference via P2P."""
@@ -421,6 +422,7 @@ class Node:
     shard_dict = data.get("shard")
     shard = Shard.from_dict(shard_dict)
     inference_state = data.get("inference_state")
+    sample_temperature = (inference_state or {}).get("sample_temperature")
 
     # CRITICAL FIX: Store orchestrator_id so subsequent tensor forwarding
     # knows where to route results back
@@ -428,7 +430,7 @@ class Node:
     if orchestrator_id:
         self._request_orchestrator_map[request_id] = orchestrator_id
     
-    await self.process_prompt(shard, prompt, request_id, inference_state)
+    await self.process_prompt(shard, prompt, request_id, inference_state, sample_temperature=sample_temperature)
 
   async def on_p2p_result(self, event: Event):
     """Handle incoming inference results/tokens via P2P."""
@@ -497,6 +499,7 @@ class Node:
       request_id: Optional[str] = None,
       inference_state: Optional[dict] = None,
       orchestrator_id: Optional[str] = None,
+      sample_temperature: Optional[float] = None,
   ):
     # CRITICAL DEBUG: Print immediately when entering this function
     if DEBUG >= 2:
@@ -510,6 +513,7 @@ class Node:
 
     # Tokens generation logic: only needed for LLMs
     if shard.is_last_layer() and not is_finished:
+      effective_temperature = self.default_sample_temperature if sample_temperature is None else sample_temperature
       # Check for empty results before sampling
       if result.size == 0 or (len(result.shape) >= 2 and result.shape[1] == 0):
         if DEBUG >= 2:
@@ -534,7 +538,7 @@ class Node:
             top_indices = np.argsort(last_logits)[-top_k:][::-1]
             print(f"[{request_id}] [DEBUG] Top {top_k} logits: {[(int(idx), float(last_logits[idx])) for idx in top_indices]}")
         
-        token = await self.inference_engine.sample(result, temp=self.default_sample_temperature, generated_ids=buf if buf else None)
+        token = await self.inference_engine.sample(result, temp=effective_temperature, generated_ids=buf if buf else None)
         await self.inference_engine.ensure_shard(shard)
         token_value = token.item()
         
@@ -563,7 +567,7 @@ class Node:
                 retry_logits[0, -1, sid] = -1e9
             retry_token = await self.inference_engine.sample(
               retry_logits,
-              temp=self.default_sample_temperature,
+              temp=effective_temperature,
               generated_ids=buf if buf else None,
             )
             token = retry_token
@@ -627,6 +631,7 @@ class Node:
         request_id,
         self.get_partition_index(offset=1, base_shard=shard),
         inference_state,
+        sample_temperature=sample_temperature,
       )
       if forwarded_tokens is not None and forwarded_tokens.size > 0:
         self._on_token_received(request_id, forwarded_tokens.flatten().tolist(), False)
@@ -635,6 +640,7 @@ class Node:
       if DEBUG >= 1:
         print(f"[{request_id}] [LAST_LAYER] Triggering callback: tokens={intermediate_result}, is_finished={is_finished}")
       tokens_emitted = len(self.buffered_token_output.get(request_id, ([], False))[0])
+      result_sequence = tokens_emitted - 1 if intermediate_result else tokens_emitted
       self.mark_request_distribution(request_id, tokens_emitted=tokens_emitted)
       if empty_reason:
         self.mark_request_distribution(
@@ -656,7 +662,7 @@ class Node:
             "tokens": intermediate_result,
             "is_finished": is_finished,
             "orchestrator_id": orchestrator_id or self._orchestrator_id_for_request(request_id),
-            "micro_batch_id": 0,
+            "micro_batch_id": max(result_sequence, 0),
             "source_stage_id": getattr(shard, "start_layer", 0),
             "metadata": self.get_request_distribution(request_id),
         }
@@ -686,8 +692,9 @@ class Node:
     request_id: Optional[str] = None,
     inference_state: Optional[dict] = {},
     max_generate_tokens: Optional[int] = None,
+    sample_temperature: Optional[float] = None,
   ) -> Optional[np.ndarray]:
-    shard = self.get_current_shard(base_shard)
+    shard = self._resolve_processing_shard(base_shard)
     start_time = time.perf_counter_ns()
     self._schedule_task(
       self.broadcast_opaque_status(
@@ -709,7 +716,7 @@ class Node:
       trace_ctx.request_span = None
       with self.tracer.start_span("node.process_prompt", trace_ctx, {"node_id": self.id, "prompt_len": len(prompt)}) as span:
         _start = time.perf_counter_ns()
-        resp = await self._process_prompt(base_shard, prompt, request_id, inference_state, max_generate_tokens)
+        resp = await self._process_prompt(base_shard, prompt, request_id, inference_state, max_generate_tokens, sample_temperature)
         _elapsed = time.perf_counter_ns() - _start
         if span:
           span.set_attribute("request_id", request_id or "")
@@ -717,7 +724,7 @@ class Node:
         return resp
     else:
       _start = time.perf_counter_ns()
-      resp = await self._process_prompt(base_shard, prompt, request_id, inference_state, max_generate_tokens)
+      resp = await self._process_prompt(base_shard, prompt, request_id, inference_state, max_generate_tokens, sample_temperature)
       elapsed_time_ns = time.perf_counter_ns() - _start
     self._schedule_task(
       self.broadcast_opaque_status(
@@ -737,10 +744,10 @@ class Node:
     if DEBUG >= 2: print(f"[{request_id}] process prompt: {base_shard=} {shard=} {prompt=} {elapsed_time_ns=}")
     return resp
 
-  async def _process_prompt(self, base_shard: Shard, prompt: str, request_id: Optional[str] = None, inference_state: Optional[dict] = None, max_generate_tokens: Optional[int] = None) -> Optional[np.ndarray]:
+  async def _process_prompt(self, base_shard: Shard, prompt: str, request_id: Optional[str] = None, inference_state: Optional[dict] = None, max_generate_tokens: Optional[int] = None, sample_temperature: Optional[float] = None) -> Optional[np.ndarray]:
     if request_id is None:
       request_id = str(uuid.uuid4())
-    shard = self.get_current_shard(base_shard)
+    shard = self._resolve_processing_shard(base_shard)
     if DEBUG >= 2: print(f"[{request_id}] process prompt: {base_shard=} {shard=} {prompt=}")
 
     # LACP 3.0: Use distributed pipeline when multiple nodes are available
@@ -753,6 +760,7 @@ class Node:
           prompt=prompt,
           request_id=request_id,
           max_generate_tokens=max_generate_tokens,
+          sample_temperature=sample_temperature,
         )
         if not tokens:
           self.mark_request_distribution(
@@ -785,7 +793,7 @@ class Node:
     if not shard.is_first_layer():
       if DEBUG >= 2: print(f"[{request_id}] forwarding to next shard: {base_shard=} {shard=} {prompt=}")
       self.outstanding_requests[request_id] = "waiting"
-      resp = await self.forward_prompt(shard, prompt, request_id, 0, inference_state)
+      resp = await self.forward_prompt(shard, prompt, request_id, 0, inference_state, sample_temperature=sample_temperature)
       return None
     else:
       self.outstanding_requests[request_id] = "processing"
@@ -797,7 +805,7 @@ class Node:
         prompt_ids = await self.inference_engine.encode(shard, prompt)
         self._prompt_token_ids[request_id] = prompt_ids
         result, inference_state = await self.inference_engine.infer_prompt(request_id, shard, prompt, inference_state)
-        latest_result = await self.process_inference_result(shard, result, request_id, inference_state)
+        latest_result = await self.process_inference_result(shard, result, request_id, inference_state, sample_temperature=sample_temperature)
 
         # Next decoding steps are autoregressive from last generated token.
         prev_len = -1
@@ -823,10 +831,10 @@ class Node:
               # 2. Ta chỉ cần GỬI LẠI last_token, P2P Router sẽ tự đẩy task cho một Node khỏe (mới được bầu lên).
               last_token_for_retry = np.array([[buffered_tokens[-1]]]) if len(buffered_tokens) > 0 else prompt_ids
               if len(buffered_tokens) > 0:
-                  await self.process_tensor(base_shard, last_token_for_retry, request_id, inference_state)
+                  await self.process_tensor(base_shard, last_token_for_retry, request_id, inference_state, sample_temperature=sample_temperature)
               else: # Retry from process_prompt
                   # Lỗi ngay từ token đầu, encode lại prompt
-                  await self.process_tensor(base_shard, prompt_ids, request_id, inference_state)
+                  await self.process_tensor(base_shard, prompt_ids, request_id, inference_state, sample_temperature=sample_temperature)
                   
               wait_start = time.perf_counter() # Reset watchdog
 
@@ -846,7 +854,7 @@ class Node:
           last_token = np.array([[tokens[-1]]])
           
           # Continue autoregressive loop
-          latest_result = await self.process_tensor(base_shard, last_token, request_id, inference_state)
+          latest_result = await self.process_tensor(base_shard, last_token, request_id, inference_state, sample_temperature=sample_temperature)
 
         buffered_tokens, finished = self.buffered_token_output.get(request_id, ([], False))
         if not finished:
@@ -1021,10 +1029,11 @@ class Node:
     request_id: Optional[str] = None,
     inference_state: Optional[dict] = None,
     orchestrator_id: Optional[str] = None,
+    sample_temperature: Optional[float] = None,
   ) -> Optional[np.ndarray]:
-    shard = self.get_current_shard(base_shard)
+    shard = self._resolve_processing_shard(base_shard)
     start_time = time.perf_counter_ns()
-    resp = await self._process_tensor(shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
+    resp = await self._process_tensor(shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id, sample_temperature=sample_temperature)
     end_time = time.perf_counter_ns()
     elapsed_time_ns = end_time - start_time
     if DEBUG >= 2: print(f"[{request_id}] process_tensor: {base_shard=} {shard=} {tensor.size=} {tensor.shape=} {elapsed_time_ns=}")
@@ -1037,10 +1046,11 @@ class Node:
     request_id: Optional[str] = None,
     inference_state: Optional[dict] = None,
     orchestrator_id: Optional[str] = None,
+    sample_temperature: Optional[float] = None,
   ) -> Optional[np.ndarray]:
     if request_id is None:
       request_id = str(uuid.uuid4())
-    shard = self.get_current_shard(base_shard)
+    shard = self._resolve_processing_shard(base_shard)
 
     # CRITICAL FIX: Store orchestrator_id for downstream forwarding chain
     if orchestrator_id:
@@ -1060,7 +1070,7 @@ class Node:
           if DEBUG >= 2:
             print(f"[{request_id}] First layer: full sequence length {len(full_ids)} (prompt + {len(buf)} generated)")
       result, inference_state = await self.inference_engine.infer_tensor(request_id, shard, input_data, inference_state)
-      ret = await self.process_inference_result(shard, result, request_id, inference_state, orchestrator_id=orchestrator_id)
+      ret = await self.process_inference_result(shard, result, request_id, inference_state, orchestrator_id=orchestrator_id, sample_temperature=sample_temperature)
       return ret
     except Exception as e:
       self.outstanding_requests.pop(request_id, None)
@@ -1096,20 +1106,23 @@ class Node:
       request_id: str,
       target_index: int,
       inference_state: Optional[dict] = None,
+      sample_temperature: Optional[float] = None,
   ) -> None:
       if DEBUG >= 1: print(f"target partition index: {target_index}")
       target_id = self._compute_lacp_partition(base_shard)[target_index].node_id
       next_shard = self.get_current_shard(base_shard, target_index)
       if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. next shard: {next_shard}")
       if target_id == self.id:
-          await self._process_prompt(next_shard, prompt, request_id, inference_state)
+          await self._process_prompt(next_shard, prompt, request_id, inference_state, sample_temperature=sample_temperature)
       else:
+          outbound_state = dict(inference_state or {})
+          outbound_state["sample_temperature"] = sample_temperature
           logger.info(f"[P2P_MESH] Publishing prompt to Node: {target_id}")
           await self.event_router.publish(f"synapse/inference/prompt/{target_id}", {
               "request_id": request_id,
               "shard": next_shard.to_dict(),
               "prompt": prompt,
-              "inference_state": inference_state,
+              "inference_state": outbound_state,
               # CRITICAL FIX: Include orchestrator_id so downstream nodes know
               # where to route results and tokens back to the original requester
               "_orchestrator_id": self.id,
@@ -1122,6 +1135,7 @@ class Node:
     request_id: str,
     target_index: int,
     inference_state: Optional[dict] = None,
+    sample_temperature: Optional[float] = None,
   ) -> None:
     if DEBUG >= 1: print(f"target partition index: {target_index}")
     target_id = self._compute_lacp_partition(base_shard)[target_index].node_id
@@ -1131,8 +1145,10 @@ class Node:
     orchestrator_id = self._orchestrator_id_for_request(request_id)
 
     if target_id == self.id:
-      return await self.process_tensor(target_shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
+      return await self.process_tensor(target_shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id, sample_temperature=sample_temperature)
     else:
+      outbound_state = dict(inference_state or {})
+      outbound_state["sample_temperature"] = sample_temperature
       logger.info(f"[P2P_MESH] Publishing work to Node: {target_id}")
       # CRITICAL FIX: Use binary tensor encoding (tobytes + shape + dtype)
       # instead of tensor.tolist() which creates massive nested JSON arrays.
@@ -1142,7 +1158,7 @@ class Node:
         "tensor_data": tensor.tobytes(),
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype),
-        "inference_state": inference_state,
+        "inference_state": outbound_state,
         "_orchestrator_id": orchestrator_id,
       })
       return None
@@ -1173,6 +1189,11 @@ class Node:
         partitions = self._compute_lacp_partition(base_shard)
     shards = map_partitions_to_shards(partitions, base_shard.n_layers, base_shard.model_id)
     return shards[index]
+
+  def _resolve_processing_shard(self, shard: Shard) -> Shard:
+    if shard.is_first_layer() and shard.is_last_layer():
+      return self.get_current_shard(shard)
+    return shard
 
   async def update_peers(self, wait_for_peers: int = 0) -> bool:
     next_peers = await self.discovery.discover_peers(wait_for_peers) if hasattr(self, "discovery") else []

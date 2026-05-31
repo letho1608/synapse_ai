@@ -110,6 +110,7 @@ class DistributedPipelineController:
         partition_assignments: List[Tuple[str, Shard]],
         max_generate_tokens: int = 1024,
         on_token_callback: Optional[Callable] = None,
+        sample_temperature: Optional[float] = None,
     ) -> List[int]:
         """
         Run distributed inference across multiple nodes.
@@ -158,6 +159,7 @@ class DistributedPipelineController:
                 token_ids,
                 request_id,
                 is_prompt=True,
+                sample_temperature=sample_temperature,
             )
 
             result = await self._collect_result(
@@ -203,6 +205,7 @@ class DistributedPipelineController:
                     last_token,
                     request_id,
                     is_prompt=False,
+                    sample_temperature=sample_temperature,
                 )
 
                 next_result = await self._collect_result(
@@ -273,6 +276,7 @@ class DistributedPipelineController:
         input_data: np.ndarray,
         request_id: str,
         is_prompt: bool = False,
+        sample_temperature: Optional[float] = None,
     ) -> None:
         topic = f"synapse/inference/tensor/{target_node_id}"
         payload = {
@@ -281,7 +285,7 @@ class DistributedPipelineController:
             "tensor_data": input_data.tobytes(),
             "shape": list(input_data.shape),
             "dtype": str(input_data.dtype),
-            "inference_state": {"is_prompt": is_prompt},
+            "inference_state": {"is_prompt": is_prompt, "sample_temperature": sample_temperature},
             "_orchestrator_id": self.node_id,
         }
         await self.event_router.publish(topic, payload)

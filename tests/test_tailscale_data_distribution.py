@@ -680,6 +680,14 @@ async def phase4_e2e_inference(nodes: List[SynapseNode]) -> PhaseResult:
             f"usage={usage}, first_choice={json.dumps(first_choice, ensure_ascii=False)[:500]}"
         )
         return PhaseResult(False, "chat completed but synapse_distribution does not prove distributed execution", response)
+    if completion_tokens != tokens_emitted:
+        log_warn(
+            "chat token delivery mismatch: "
+            f"usage.completion_tokens={completion_tokens}, "
+            f"synapse_distribution.tokens_emitted={tokens_emitted}, "
+            f"content={content!r}, finish_reason={first_choice.get('finish_reason')}"
+        )
+        return PhaseResult(False, "chat completed but API received fewer tokens than distributed pipeline emitted", response)
 
     partitions_count = dist_status.get("partitions_count", 0) if isinstance(dist_status, dict) else 0
     resources_summary = summarize_lacp_distribution(resources if isinstance(resources, dict) else {})

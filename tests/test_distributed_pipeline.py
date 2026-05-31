@@ -406,6 +406,120 @@ class TestDistributedEmptyOutput:
             await controller.stop()
 
 
+class TestRemoteShardSelection:
+    def test_process_tensor_uses_received_shard_when_worker_topology_is_single_node(self):
+        from synapse.orchestration.node import Node
+        from synapse.routing.event_router import EventRouter
+        from synapse.topology.device_capabilities import UNKNOWN_DEVICE_CAPABILITIES
+
+        class RecordingEngine:
+            def __init__(self):
+                self.seen_shards = []
+
+            async def infer_tensor(self, request_id, shard, tensor, inference_state=None):
+                self.seen_shards.append(shard)
+                return np.array([[[0.0, 1.0]]], dtype=np.float32), inference_state or {}
+
+            async def sample(self, logits, temp=0.0, generated_ids=None):
+                return np.array([1], dtype=np.int64)
+
+            async def ensure_shard(self, shard):
+                return None
+
+        engine = RecordingEngine()
+        node = Node("msi", EventRouter(), object(), engine, None, max_generate_tokens=4)
+        node.topology.update_node("msi", UNKNOWN_DEVICE_CAPABILITIES)
+
+        received_shard = Shard("model", 10, 31, 32)
+
+        async def run_case():
+            await node.process_tensor(
+                received_shard,
+                np.array([[42]], dtype=np.int64),
+                request_id="req-remote-shard",
+                inference_state={"is_prompt": False},
+                orchestrator_id="duyhung",
+            )
+
+        asyncio.run(run_case())
+
+        assert engine.seen_shards == [received_shard]
+
+    def test_result_payload_micro_batch_id_advances_per_token(self):
+        from synapse.orchestration.node import Node
+        from synapse.routing.event_router import EventRouter
+
+        class CountingEngine:
+            def __init__(self):
+                self.next_token = 10
+
+            async def sample(self, logits, temp=0.0, generated_ids=None):
+                token = self.next_token
+                self.next_token += 1
+                return np.array([token], dtype=np.int64)
+
+            async def ensure_shard(self, shard):
+                return None
+
+        router = EventRouter()
+        payloads = []
+        router.subscribe("synapse/inference/result/orchestrator", lambda ev: payloads.append(ev.data))
+        node = Node("worker", router, object(), CountingEngine(), None, max_generate_tokens=4)
+        shard = Shard("model", 31, 31, 32)
+        logits = np.array([[[0.0, 1.0]]], dtype=np.float32)
+
+        async def run_case():
+            await node.process_inference_result(shard, logits, "req-seq", {}, orchestrator_id="orchestrator")
+            await node.process_inference_result(shard, logits, "req-seq", {}, orchestrator_id="orchestrator")
+
+        asyncio.run(run_case())
+
+        assert [payload["micro_batch_id"] for payload in payloads] == [0, 1]
+
+    def test_process_prompt_uses_request_temperature_for_sampling(self):
+        from synapse.orchestration.node import Node
+        from synapse.routing.event_router import EventRouter
+        from synapse.topology.device_capabilities import UNKNOWN_DEVICE_CAPABILITIES
+
+        class TempRecordingEngine:
+            def __init__(self):
+                self.temps = []
+
+            async def encode(self, shard, prompt):
+                return np.array([[1, 2]], dtype=np.int64)
+
+            async def infer_prompt(self, request_id, shard, prompt, inference_state=None):
+                return np.array([[[0.0, 1.0, 0.5]]], dtype=np.float32), inference_state or {}
+
+            async def infer_tensor(self, request_id, shard, tensor, inference_state=None):
+                return np.array([[[0.0, 1.0, 0.5]]], dtype=np.float32), inference_state or {}
+
+            async def sample(self, logits, temp=0.0, generated_ids=None):
+                self.temps.append(temp)
+                return np.array([1], dtype=np.int64)
+
+            async def ensure_shard(self, shard):
+                return None
+
+        engine = TempRecordingEngine()
+        node = Node("node", EventRouter(), object(), engine, None, max_generate_tokens=1, default_sample_temperature=0.7)
+        node.topology.update_node("node", UNKNOWN_DEVICE_CAPABILITIES)
+        shard = Shard("model", 0, 31, 32)
+
+        async def run_case():
+            await node.process_prompt(
+                shard,
+                "prompt",
+                request_id="req-temp",
+                sample_temperature=0.0,
+                max_generate_tokens=1,
+            )
+
+        asyncio.run(run_case())
+
+        assert engine.temps == [0.0]
+
+
 class TestLatencyMatrixIntegration:
     def test_node_latency_matrix_single_node(self):
         from synapse.orchestration.node import Node
@@ -419,7 +533,7 @@ class TestLatencyMatrixIntegration:
 
         class MockEngine(InferenceEngine):
             async def encode(self, shard, prompt): return np.array([])
-            async def sample(self, x): return np.array([1])
+            async def sample(self, x, temp=0.0, generated_ids=None): return np.array([1])
             async def decode(self, shard, tokens): return ""
             async def infer_tensor(self, rid, s, t, state=None): return np.array([]), {}
             async def load_checkpoint(self, s, p): pass

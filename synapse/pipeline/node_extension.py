@@ -79,6 +79,7 @@ class DistributedPipelineExtension:
         prompt: str,
         request_id: Optional[str] = None,
         max_generate_tokens: Optional[int] = None,
+        sample_temperature: Optional[float] = None,
     ) -> List[int]:
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -104,7 +105,7 @@ class DistributedPipelineExtension:
                 tokens_emitted=0,
                 fallback=True,
             )
-            return await self._run_single_node(base_shard, prompt, request_id, token_limit)
+            return await self._run_single_node(base_shard, prompt, request_id, token_limit, sample_temperature)
 
         self._node.mark_request_distribution(
             request_id,
@@ -151,6 +152,7 @@ class DistributedPipelineExtension:
                         partition_assignments=partitions,
                         max_generate_tokens=token_limit,
                         on_token_callback=on_token_cb,
+                        sample_temperature=sample_temperature,
                     )
                     if span and all_tokens:
                         span.set_attribute("num_tokens", len(all_tokens))
@@ -162,6 +164,7 @@ class DistributedPipelineExtension:
                     partition_assignments=partitions,
                     max_generate_tokens=token_limit,
                     on_token_callback=on_token_cb,
+                    sample_temperature=sample_temperature,
                 )
         except DistributedInferenceEmptyOutputError as e:
             self._node.mark_request_distribution(
@@ -197,6 +200,7 @@ class DistributedPipelineExtension:
         prompt: str,
         request_id: str,
         token_limit: int,
+        sample_temperature: Optional[float] = None,
     ) -> List[int]:
         self._node.outstanding_requests[request_id] = "processing"
         all_tokens: List[int] = []
@@ -217,7 +221,7 @@ class DistributedPipelineExtension:
                 request_id, base_shard, prompt_ids
             )
             await self._node.process_inference_result(
-                base_shard, result, request_id, inference_state
+                base_shard, result, request_id, inference_state, sample_temperature=sample_temperature
             )
 
             buffered_tokens, finished = self._node.buffered_token_output.get(
@@ -247,7 +251,7 @@ class DistributedPipelineExtension:
                         request_id, base_shard, last_token, inference_state
                     )
                     await self._node.process_inference_result(
-                        base_shard, result, request_id, inference_state
+                        base_shard, result, request_id, inference_state, sample_temperature=sample_temperature
                     )
 
         except Exception as e:

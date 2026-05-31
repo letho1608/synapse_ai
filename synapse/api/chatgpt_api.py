@@ -1039,7 +1039,7 @@ class ChatGPTAPI:
         if self.on_chat_completion_request:
           self.on_chat_completion_request(request_id, chat_request, prompt)
         process_task = asyncio.create_task(
-          self.node.process_prompt(base_shard, prompt, request_id=request_id, max_generate_tokens=max_tokens)
+          self.node.process_prompt(base_shard, prompt, request_id=request_id, max_generate_tokens=max_tokens, sample_temperature=chat_request.temperature)
         )
 
         def get_distribution_meta(rid: Optional[str]) -> dict:
@@ -1170,7 +1170,7 @@ class ChatGPTAPI:
                   new_prompt_s = build_prompt(tokenizer, new_messages_s, None)
                   request_id_s = str(uuid.uuid4())
                   self.token_queues[request_id_s] = asyncio.Queue()
-                  asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s, max_generate_tokens=max_tokens))
+                  asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s, max_generate_tokens=max_tokens, sample_temperature=chat_request.temperature))
                   
                   # Stream the follow-up response in real-time
                   while True:
@@ -1258,7 +1258,7 @@ class ChatGPTAPI:
                 request_id_2 = str(uuid.uuid4())
                 self.token_queues[request_id_2] = asyncio.Queue()
                 process_task_2 = asyncio.create_task(
-                  self.node.process_prompt(base_shard, new_prompt, request_id=request_id_2, max_generate_tokens=max_tokens)
+                  self.node.process_prompt(base_shard, new_prompt, request_id=request_id_2, max_generate_tokens=max_tokens, sample_temperature=chat_request.temperature)
                 )
                 all_tokens_2 = []
                 while True:
