@@ -2697,6 +2697,7 @@
                 },
 
                 renderClusterCharts() {
+                    if (this.currentPage !== 'cluster') return;
                     if (typeof Chart === 'undefined') return;
                     const nodes = this.clusterResources;
                     if (!nodes || nodes.length === 0) return;
