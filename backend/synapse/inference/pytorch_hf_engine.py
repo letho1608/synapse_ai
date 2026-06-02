@@ -433,6 +433,83 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             except Exception as e:
                 raise RuntimeError(f"PyTorchHF load vision {hf_id}: {e}") from e
 
+    
+        # --- Nhận diện phần cứng ---
+        hw = self._detect_hardware_profile(shard.model_id)
+        load_model_kw: Dict[str, Any] = {
+            "trust_remote_code": True,
+            "attn_implementation": hw["attn_implementation"],
+            "torch_dtype": hw["torch_dtype"],
+        }
+    
+        # Ưu tiên ÉP model vào GPU duy nhất nếu có thể để tránh device_map đẩy sang CPU
+        if hw["device"] == "cuda":
+            if hw["load_in_4bit"] or hw["load_in_8bit"]:
+                # Nếu dùng quantization, phải dùng device_map
+                load_model_kw["device_map"] = "auto"
+                from transformers import BitsAndBytesConfig
+                if hw["load_in_4bit"]:
+                    load_model_kw["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True, bnb_4bit_compute_dtype=hw["torch_dtype"],
+                        bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4"
+                    )
+                else:
+                    load_model_kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            else:
+                # KHÔNG dùng device_map='auto' cho 1 máy để tránh nó đẩy layer sang CPU
+                pass
+    
+        if DEBUG >= 1:
+            print(f"[PyTorchHF] Nạp model {shard.model_id} lên {hw['device']}...")
+    
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            loop = asyncio.get_event_loop()
+    
+            def _tok_local():
+                return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True, local_files_only=True)
+            def _model_local():
+                return AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw, local_files_only=True)
+            def _tok_remote():
+                return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+            def _model_remote():
+                return AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw)
+    
+            try:
+                self.tokenizer = await loop.run_in_executor(None, _tok_local)
+                self._model = await loop.run_in_executor(None, _model_local)
+            except (OSError, ValueError):
+                # --- [P2P LAN Cache Sync] ---
+                try:
+                    import aiohttp
+                    node_ref = getattr(self, "node", None)
+                    if node_ref:
+                        nodes = await node_ref.get_tailscale_nodes()
+                        from synapse.networking.tailscale.tailscale_helpers import get_synapse_api_urls_from_node_list
+                        from synapse.helpers import get_all_ip_addresses_and_interfaces
+                        self_ips = set(ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip)
+                        urls = get_synapse_api_urls_from_node_list(nodes, api_port=52415, only_synapse_nodes=True, exclude_ips=self_ips)
+                        if urls:
+                            master_url = urls[0]
+                            if DEBUG >= 1: print(f"[PyTorchHF] Requesting P2P LAN Cache sync from: {master_url}...")
+                except Exception as e:
+                    if DEBUG >= 2: print(f"[P2P Sync Exception]: {e}")
+    
+                self.tokenizer = await loop.run_in_executor(None, _tok_remote)
+                self._model = await loop.run_in_executor(None, _model_remote)
+    
+            # ÉP MODEL LÊN GPU (Nếu không dùng quantization/device_map)
+            if hw["device"] == "cuda" and "device_map" not in load_model_kw:
+                self._model = self._model.to("cuda")
+    
+            self._model_id = shard.model_id
+            self.shard = shard
+        except Exception as e:
+            if DEBUG >= 1:
+                import traceback
+                traceback.print_exc()
+            raise RuntimeError(f"PyTorchHF load {hf_id}: {e}") from e
+
     def _load_vision_model_sync(self, shard, hf_id: str):
         from huggingface_hub import snapshot_download
         import sys
@@ -470,81 +547,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self.shard = shard
         if DEBUG >= 1: print(f"[PyTorchHF] Loaded Vision local CRNN: {shard.model_id}")
 
-        # --- Nhận diện phần cứng ---
-        hw = self._detect_hardware_profile(shard.model_id)
-        load_model_kw: Dict[str, Any] = {
-            "trust_remote_code": True,
-            "attn_implementation": hw["attn_implementation"],
-            "torch_dtype": hw["torch_dtype"],
-        }
-
-        # Ưu tiên ÉP model vào GPU duy nhất nếu có thể để tránh device_map đẩy sang CPU
-        if hw["device"] == "cuda":
-            if hw["load_in_4bit"] or hw["load_in_8bit"]:
-                # Nếu dùng quantization, phải dùng device_map
-                load_model_kw["device_map"] = "auto"
-                from transformers import BitsAndBytesConfig
-                if hw["load_in_4bit"]:
-                    load_model_kw["quantization_config"] = BitsAndBytesConfig(
-                        load_in_4bit=True, bnb_4bit_compute_dtype=hw["torch_dtype"],
-                        bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4"
-                    )
-                else:
-                    load_model_kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-            else:
-                # KHÔNG dùng device_map='auto' cho 1 máy để tránh nó đẩy layer sang CPU
-                pass
-
-        if DEBUG >= 1:
-            print(f"[PyTorchHF] Nạp model {shard.model_id} lên {hw['device']}...")
-
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            loop = asyncio.get_event_loop()
-
-            def _tok_local():
-                return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True, local_files_only=True)
-            def _model_local():
-                return AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw, local_files_only=True)
-            def _tok_remote():
-                return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
-            def _model_remote():
-                return AutoModelForCausalLM.from_pretrained(hf_id, **load_model_kw)
-
-            try:
-                self.tokenizer = await loop.run_in_executor(None, _tok_local)
-                self._model = await loop.run_in_executor(None, _model_local)
-            except (OSError, ValueError):
-                # --- [P2P LAN Cache Sync] ---
-                try:
-                    import aiohttp
-                    node_ref = getattr(self, "node", None)
-                    if node_ref:
-                        nodes = await node_ref.get_tailscale_nodes()
-                        from synapse.networking.tailscale.tailscale_helpers import get_synapse_api_urls_from_node_list
-                        from synapse.helpers import get_all_ip_addresses_and_interfaces
-                        self_ips = set(ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip)
-                        urls = get_synapse_api_urls_from_node_list(nodes, api_port=52415, only_synapse_nodes=True, exclude_ips=self_ips)
-                        if urls:
-                            master_url = urls[0]
-                            if DEBUG >= 1: print(f"[PyTorchHF] Requesting P2P LAN Cache sync from: {master_url}...")
-                except Exception as e:
-                    if DEBUG >= 2: print(f"[P2P Sync Exception]: {e}")
-
-                self.tokenizer = await loop.run_in_executor(None, _tok_remote)
-                self._model = await loop.run_in_executor(None, _model_remote)
-
-            # ÉP MODEL LÊN GPU (Nếu không dùng quantization/device_map)
-            if hw["device"] == "cuda" and "device_map" not in load_model_kw:
-                self._model = self._model.to("cuda")
-
-            self._model_id = shard.model_id
-            self.shard = shard
-        except Exception as e:
-            if DEBUG >= 1:
-                import traceback
-                traceback.print_exc()
-            raise RuntimeError(f"PyTorchHF load {hf_id}: {e}") from e
 
     async def infer_vision(self, shard: Shard, image_bytes: bytes) -> str:
         await self.ensure_shard(shard)
