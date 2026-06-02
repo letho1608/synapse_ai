@@ -231,7 +231,7 @@ body {
 .content {
   flex: 1;
   padding: var(--spacing-lg);
-  overflow-y: auto;
+  overflow-y: auto !important;
   overflow-x: hidden;
   display: flex;
   flex-direction: column;
