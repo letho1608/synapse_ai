@@ -99,6 +99,9 @@ class Node:
     # CRITICAL FIX: Authoritative partition from master node for consistent shard assignment
     self._authoritative_partitions: Optional[List[Partition]] = None
     self._authoritative_base_shard: Optional[Shard] = None
+    self._last_multi_node_topology: Optional[Topology] = None
+    self._last_multi_node_topology_at: float = 0.0
+    self._topology_shrink_grace_seconds: float = 30.0
 
     self._on_token = AsyncCallbackSystem()
     self._request_semaphore = asyncio.Semaphore(max_concurrent_requests)
@@ -151,6 +154,10 @@ class Node:
   async def start(self, wait_for_peers: int = 0) -> None:
     if DEBUG >= 1: print("Starting node: Getting device capabilities...")
     self.device_capabilities = await device_capabilities()
+    self.election_manager.set_base_compute_weight(
+      self.device_capabilities.memory / 1024.0,
+      self.device_capabilities.flops.fp32,
+    )
     
     if DEBUG >= 1: print("Starting node: Starting Event Router and P2P Mesh...")
     await self.event_router.start()
@@ -1334,6 +1341,19 @@ class Node:
         else:
           print(f"Error collecting topology from {peer.id()}: {type(e).__name__}: {e}")
 
+    now = time.time()
+    if len(next_topology.nodes) > 1:
+      self._last_multi_node_topology = next_topology
+      self._last_multi_node_topology_at = now
+    elif (
+      self._last_multi_node_topology is not None
+      and now - self._last_multi_node_topology_at <= self._topology_shrink_grace_seconds
+    ):
+      next_topology = self._last_multi_node_topology
+
+    selected_master_id = self._select_master_from_topology(next_topology)
+    if selected_master_id:
+      self.election_manager.current_master_id = selected_master_id
     next_topology.active_node_id = self.election_manager.current_master_id
     self.topology = next_topology
     if self.topology_viz:
@@ -1556,6 +1576,44 @@ class Node:
       return self._request_orchestrator_map[request_id] == self.id
     return True
 
+  def _select_master_from_topology(self, topology: Optional[Topology]) -> Optional[str]:
+    if not topology or not getattr(topology, "nodes", None):
+      return self.election_manager.current_master_id or self.id
+
+    current_master_id = self.election_manager.current_master_id
+    if current_master_id in topology.nodes:
+      return current_master_id
+
+    active_node_id = getattr(topology, "active_node_id", None)
+    if active_node_id in topology.nodes:
+      return active_node_id
+
+    outgoing_counts: Dict[str, int] = {node_id: 0 for node_id in topology.nodes}
+    incoming_counts: Dict[str, int] = {node_id: 0 for node_id in topology.nodes}
+    for from_id, conns in getattr(topology, "peer_graph", {}).items():
+      outgoing_counts[from_id] = outgoing_counts.get(from_id, 0) + len(conns)
+      for conn in conns:
+        incoming_counts[conn.to_id] = incoming_counts.get(conn.to_id, 0) + 1
+
+    def sort_key(item):
+      node_id, caps = item
+      flops = getattr(caps, "flops", None)
+      fp32 = float(getattr(flops, "fp32", 0.0) or 0.0)
+      fp16 = float(getattr(flops, "fp16", 0.0) or 0.0)
+      int8 = float(getattr(flops, "int8", 0.0) or 0.0)
+      memory = int(getattr(caps, "memory", 0) or 0)
+      return (
+        -outgoing_counts.get(node_id, 0),
+        -incoming_counts.get(node_id, 0),
+        -fp32,
+        -fp16,
+        -int8,
+        -memory,
+        node_id,
+      )
+
+    return sorted(topology.nodes.items(), key=sort_key)[0][0]
+
   async def broadcast_authoritative_topology(self):
     """If this node is master, broadcast the authoritative topology to all peers."""
     if not self.election_manager.is_master():
@@ -1575,8 +1633,21 @@ class Node:
         if topology_data:
             received_topo = Topology.from_dict(topology_data)
             master_id = data.get("master_id")
-            if master_id == self.election_manager.current_master_id or not self.election_manager.current_master_id:
+            selected_master_id = self._select_master_from_topology(received_topo)
+            if selected_master_id:
+                received_topo.active_node_id = selected_master_id
+            should_accept = (
+                master_id == selected_master_id
+                or master_id == self.election_manager.current_master_id
+                or not self.election_manager.current_master_id
+                or len(received_topo.nodes) > len(self.topology.nodes)
+            )
+            if should_accept:
+                self.election_manager.current_master_id = selected_master_id or master_id
                 self.topology = received_topo
+                if len(received_topo.nodes) > 1:
+                    self._last_multi_node_topology = received_topo
+                    self._last_multi_node_topology_at = time.time()
                 if self.topology_viz:
                     self.topology_viz.update_visualization(
                         self.topology,
@@ -1605,7 +1676,12 @@ class Node:
     data = event.data
     if isinstance(data, dict):
         master_id = data.get("master_id")
-        if master_id == self.election_manager.current_master_id or not self.election_manager.current_master_id:
+        selected_master_id = self._select_master_from_topology(self.topology)
+        if (
+            master_id == self.election_manager.current_master_id
+            or master_id == selected_master_id
+            or not self.election_manager.current_master_id
+        ):
             partition_data = data.get("partitions", [])
             base_shard_dict = data.get("base_shard")
             self._authoritative_partitions = [Partition(**p) for p in partition_data]

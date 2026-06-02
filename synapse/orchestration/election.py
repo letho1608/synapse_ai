@@ -17,6 +17,7 @@ class ElectionManager:
     TICK_INTERVAL = 2.0
     TIMEOUT = 6.0
     MASTER_STICKINESS_GRACE_PERIOD = 30.0
+    MASTER_CLAIM_ADOPTION_DELAY = 4.0
 
     def __init__(self, node_id: str, event_router: EventRouter, compute_weight: float = 1.0,
                  dynamic_weight: bool = False):
@@ -29,6 +30,7 @@ class ElectionManager:
 
         self.active_nodes: Dict[str, Dict] = {}
         self.current_master_id: Optional[str] = None
+        self._master_since: Optional[float] = None
         self._running = False
         self._election_task: Optional[asyncio.Task] = None
         self._master_became_offline_at: Optional[float] = None
@@ -73,6 +75,8 @@ class ElectionManager:
 
         self.active_nodes[node_id] = {
             "weight": data.get("weight", 0.0),
+            "current_master_id": data.get("current_master_id"),
+            "master_since": data.get("master_since"),
             "last_seen": event.timestamp,
         }
 
@@ -84,16 +88,56 @@ class ElectionManager:
             pass
         self.compute_weight = self.base_compute_weight
 
+    def _ranked_candidates(self, all_candidates: Dict[str, Dict]) -> List[str]:
+        return sorted(
+            all_candidates.keys(),
+            key=lambda x: (-all_candidates[x]["weight"], x)
+        )
+
+    def _claim_winner(self, all_candidates: Dict[str, Dict], now: float) -> tuple[Optional[str], Optional[float]]:
+        active_ids = set(all_candidates.keys())
+        claims: Dict[str, Dict[str, float]] = {}
+
+        for reporter_id, info in all_candidates.items():
+            master_id = info.get("current_master_id")
+            if master_id not in active_ids:
+                continue
+            since = info.get("master_since")
+            if not isinstance(since, (int, float)):
+                since = now
+            if now - float(since) < self.MASTER_CLAIM_ADOPTION_DELAY:
+                continue
+            claim = claims.setdefault(master_id, {"support": 0, "oldest_since": float(since)})
+            claim["support"] += 1
+            claim["oldest_since"] = min(claim["oldest_since"], float(since))
+
+        if not claims:
+            return None, None
+
+        def key(item):
+            master_id, claim = item
+            return (
+                -claim["support"],
+                claim["oldest_since"],
+                -all_candidates[master_id]["weight"],
+                master_id,
+            )
+
+        master_id, claim = sorted(claims.items(), key=key)[0]
+        return master_id, claim["oldest_since"]
+
+    def _set_master(self, master_id: str, now: float, master_since: Optional[float] = None) -> None:
+        if self.current_master_id != master_id:
+            self.current_master_id = master_id
+            self._master_since = master_since if master_since is not None else now
+        elif self._master_since is None:
+            self._master_since = master_since if master_since is not None else now
+
     async def _election_loop(self):
         """Periodic loop to broadcast heartbeat and evaluate leadership."""
         while self._running:
             try:
                 self._update_compute_weight()
-
-                await self.event_router.publish("synapse/cluster/election", {
-                    "node_id": self.node_id,
-                    "weight": self.compute_weight
-                })
 
                 now = asyncio.get_event_loop().time()
                 self.active_nodes = {
@@ -101,38 +145,51 @@ class ElectionManager:
                     if now - info["last_seen"] < self.TIMEOUT
                 }
 
-                all_candidates = {**self.active_nodes, self.node_id: {"weight": self.compute_weight, "last_seen": now}}
+                all_candidates = {
+                    **self.active_nodes,
+                    self.node_id: {
+                        "weight": self.compute_weight,
+                        "current_master_id": self.current_master_id,
+                        "master_since": self._master_since,
+                        "last_seen": now,
+                    },
+                }
 
-                sorted_candidates = sorted(
-                    all_candidates.keys(),
-                    key=lambda x: (-all_candidates[x]["weight"], x)
-                )
-
+                sorted_candidates = self._ranked_candidates(all_candidates)
                 new_master_id = sorted_candidates[0] if sorted_candidates else self.node_id
+                claimed_master_id, claimed_master_since = self._claim_winner(all_candidates, now)
+                current_master_active = self.current_master_id in all_candidates
 
                 if self.current_master_id is None:
-                    self.current_master_id = new_master_id
+                    self._set_master(claimed_master_id or new_master_id, now, claimed_master_since)
                     if not self.is_master():
                         logger.info(f"Node {self.node_id} recognizes {self.current_master_id} as Master")
-                elif self.current_master_id == self.node_id:
-                    if new_master_id != self.node_id:
-                        logger.info(f"Node {self.node_id} is still Master (stickiness active)")
-                    self.current_master_id = self.node_id
-                elif self.current_master_id in self.active_nodes:
-                    self._master_became_offline_at = None
-                    if new_master_id != self.current_master_id:
-                        logger.info(f"Node {self.node_id} recognizes {self.current_master_id} as Master (sticky)")
-                    self.current_master_id = new_master_id
+                elif current_master_active:
+                    if claimed_master_id and claimed_master_id != self.current_master_id:
+                        logger.info(f"Node {self.node_id} adopts cluster Master {claimed_master_id}")
+                        self._set_master(claimed_master_id, now, claimed_master_since)
+                        self._master_became_offline_at = None
+                    else:
+                        self._master_became_offline_at = None
+                        if self._master_since is None:
+                            self._master_since = now
                 else:
                     if self._master_became_offline_at is None:
                         self._master_became_offline_at = now
                     elif now - self._master_became_offline_at > self.MASTER_STICKINESS_GRACE_PERIOD:
                         logger.warning(f"Master {self.current_master_id} offline for {now - self._master_became_offline_at:.0f}s, electing new Master")
-                        self.current_master_id = new_master_id
+                        self._set_master(claimed_master_id or new_master_id, now, claimed_master_since)
                         self._master_became_offline_at = None
                     else:
                         if new_master_id != self.current_master_id:
                             logger.info(f"Previous Master {self.current_master_id} went offline, waiting {self.MASTER_STICKINESS_GRACE_PERIOD - (now - self._master_became_offline_at):.0f}s before accepting new Master")
+
+                await self.event_router.publish("synapse/cluster/election", {
+                    "node_id": self.node_id,
+                    "weight": self.compute_weight,
+                    "current_master_id": self.current_master_id,
+                    "master_since": self._master_since,
+                })
 
                 await asyncio.sleep(self.TICK_INTERVAL)
             except asyncio.CancelledError:
