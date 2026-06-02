@@ -352,7 +352,7 @@
             </header>
 
             <!-- Content -->
-            <div class="content">
+            <div class="content" :class="{ 'chat-page-active': currentPage === 'test' }">
                 <!-- Dashboard Page -->
                 <div x-show="currentPage === 'dashboard'" x-cloak>
                     <!-- Cluster KPI Row -->
