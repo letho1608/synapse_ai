@@ -2042,6 +2042,12 @@
 
                     this.settingsForm.theme = localStorage.getItem('synapse_theme') || 'light';
                     this.applyTheme(this.settingsForm.theme);
+
+                    // Tự động cuộn trang lên đầu khi người dùng chuyển tab (tránh lỗi scroll kéo dài từ tab trước)
+                    this.$watch('currentPage', value => {
+                        const el = document.querySelector('.content');
+                        if (el) el.scrollTop = 0;
+                    });
                     setInterval(() => {
                         this.fetchStats();
                         this.fetchActivity();
