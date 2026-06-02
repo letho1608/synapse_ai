@@ -202,32 +202,62 @@
         </div>
     </div>
     
-    <div class="card" x-show="trainingJob && trainingJob.status !== 'idle' && trainingJob.status !== undefined" style="margin-top:var(--spacing-md);">
-        <div class="card-header" style="margin-bottom:8px">
-            <h2 class="card-title" style="font-size:14px; text-transform:uppercase;"><i class="fas fa-graduation-cap" style="color:var(--warning);margin-right:8px"></i>Training Process</h2>
-            <span class="badge-grafana" style="color:#F59E0B; border-color:#F59E0B" x-text="(trainingJob.status || 'STARTED').toUpperCase()"></span>
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px; font-size:12px;">
-            <div class="text-muted">
-                Model: <strong style="color:var(--text-primary)" x-text="trainingJob.model"></strong> | Dataset: <span x-text="trainingJob.dataset"></span>
+    <template x-if="trainingJob && trainingJob.status !== 'idle' && trainingJob.status !== undefined">
+        <div class="card" style="margin-top:var(--spacing-md);">
+            <div class="card-header" style="margin-bottom:8px">
+                <h2 class="card-title" style="font-size:14px; text-transform:uppercase;"><i class="fas fa-graduation-cap" style="color:var(--warning);margin-right:8px"></i>Training Process</h2>
+                <span class="badge-grafana" style="color:#F59E0B; border-color:#F59E0B" x-text="(trainingJob.status || 'STARTED').toUpperCase()"></span>
             </div>
-            <div style="font-family:monospace" x-text="(trainingJob.progress || 0) + '%'"></div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px; font-size:12px;">
+                <div class="text-muted">
+                    Model: <strong style="color:var(--text-primary)" x-text="trainingJob.model"></strong> | Dataset: <span x-text="trainingJob.dataset"></span>
+                </div>
+                <div style="font-family:monospace" x-text="(trainingJob.progress || 0) + '%'"></div>
+            </div>
+            <div style="height:6px; background:var(--divider); border-radius:3px; overflow:hidden; margin-bottom:8px">
+                <div style="height:100%; background:var(--warning); transition:width 0.3s;" :style="'width: ' + (trainingJob.progress || 0) + '%'"></div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:11px;color:var(--text-muted); font-family:monospace;">
+                <div>EPOCH: <strong style="color:var(--text-primary)" x-text="(trainingJob.current_epoch || 0) + '/' + trainingJob.epochs"></strong></div>
+                <div>LOSS: <strong style="color:#EF4444" x-text="trainingJob.loss || '-'"></strong></div>
+                <div style="text-align:right">START: <span x-text="trainingJob.started_at"></span></div>
+            </div>
         </div>
-        <div style="height:6px; background:var(--divider); border-radius:3px; overflow:hidden; margin-bottom:8px">
-            <div style="height:100%; background:var(--warning); transition:width 0.3s;" :style="'width: ' + (trainingJob.progress || 0) + '%'"></div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:11px;color:var(--text-muted); font-family:monospace;">
-            <div>EPOCH: <strong style="color:var(--text-primary)" x-text="(trainingJob.current_epoch || 0) + '/' + trainingJob.epochs"></strong></div>
-            <div>LOSS: <strong style="color:#EF4444" x-text="trainingJob.loss || '-'"></strong></div>
-            <div style="text-align:right">START: <span x-text="trainingJob.started_at"></span></div>
-        </div>
-    </div>
+    </template>
 </div>
 
 <!-- Empty State Overlays -->
-<div class="dashboard-loading" x-show="dashboardState === 'loading'" style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:60vh;">
-    <i class="fas fa-spinner fa-spin" style="font-size: 32px; color:var(--primary); margin-bottom: 16px;"></i>
-    <div style="font-size: 16px; color:var(--text-primary);">Waiting for metrics...</div>
+<div class="dashboard-wrapper" x-show="dashboardState === 'loading'">
+    <div class="dashboard-grid" style="margin-bottom: var(--spacing-md);">
+        <div class="skeleton-card">
+            <div class="skeleton skeleton-title"></div>
+            <div class="skeleton skeleton-box"></div>
+            <div class="skeleton skeleton-text"></div>
+            <div class="skeleton skeleton-text short"></div>
+        </div>
+        <div class="skeleton-card">
+            <div class="skeleton skeleton-title"></div>
+            <div class="skeleton skeleton-box"></div>
+            <div class="skeleton skeleton-text"></div>
+            <div class="skeleton skeleton-text short"></div>
+        </div>
+        <div class="skeleton-card">
+            <div class="skeleton skeleton-title"></div>
+            <div class="skeleton skeleton-box"></div>
+            <div class="skeleton skeleton-text"></div>
+            <div class="skeleton skeleton-text short"></div>
+        </div>
+        <div class="skeleton-card">
+            <div class="skeleton skeleton-title"></div>
+            <div class="skeleton skeleton-box"></div>
+            <div class="skeleton skeleton-text"></div>
+            <div class="skeleton skeleton-text short"></div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="skeleton skeleton-title"></div>
+        <div class="skeleton skeleton-chart"></div>
+    </div>
 </div>
 
 <div class="dashboard-error" x-show="dashboardState === 'error'" style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:60vh;">

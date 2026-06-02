@@ -427,44 +427,48 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         is_vision = shard.model_id in VISION_MODELS
         if is_vision:
             try:
-                from huggingface_hub import snapshot_download
-                import sys
-                import torch
-                import json
-                repo_path = snapshot_download(repo_id=hf_id)
-                if repo_path not in sys.path:
-                    sys.path.insert(0, repo_path)
-                import model as crnn_model
-                
-                with open(f"{repo_path}/vocab.json", "r", encoding="utf-8") as f:
-                    vocab = json.load(f)
-                
-                if "idx_to_char" in vocab:
-                    idx_dict = vocab["idx_to_char"]
-                else:
-                    idx_dict = vocab
-                    
-                num_classes = max([int(k) for k in idx_dict.keys()]) + 1
-                
-                self._model = crnn_model.CRNN(vocab_size=num_classes, hidden_size=256)
-                weights_path = f"{repo_path}/vietnamese_crnn_model.pth"
-                checkpoint = torch.load(weights_path, map_location=self._device, weights_only=False)
-                if 'model_state_dict' in checkpoint:
-                    self._model.load_state_dict(checkpoint['model_state_dict'])
-                    if 'img_width' in checkpoint:
-                        self.img_width = checkpoint['img_width']
-                else:
-                    self._model.load_state_dict(checkpoint)
-                self._model = self._model.to(self._device)
-                self._model.eval()
-                
-                self.tokenizer = vocab
-                self._model_id = shard.model_id
-                self.shard = shard
-                if DEBUG >= 1: print(f"[PyTorchHF] Loaded Vision local CRNN: {shard.model_id}")
+                import asyncio
+                await asyncio.to_thread(self._load_vision_model_sync, shard, hf_id)
                 return
             except Exception as e:
                 raise RuntimeError(f"PyTorchHF load vision {hf_id}: {e}") from e
+
+    def _load_vision_model_sync(self, shard, hf_id: str):
+        from huggingface_hub import snapshot_download
+        import sys
+        import torch
+        import json
+        repo_path = snapshot_download(repo_id=hf_id)
+        if repo_path not in sys.path:
+            sys.path.insert(0, repo_path)
+        import model as crnn_model
+        
+        with open(f"{repo_path}/vocab.json", "r", encoding="utf-8") as f:
+            vocab = json.load(f)
+        
+        if "idx_to_char" in vocab:
+            idx_dict = vocab["idx_to_char"]
+        else:
+            idx_dict = vocab
+            
+        num_classes = max([int(k) for k in idx_dict.keys()]) + 1
+        
+        _model = crnn_model.CRNN(vocab_size=num_classes, hidden_size=256)
+        weights_path = f"{repo_path}/vietnamese_crnn_model.pth"
+        checkpoint = torch.load(weights_path, map_location=self._device, weights_only=False)
+        if 'model_state_dict' in checkpoint:
+            _model.load_state_dict(checkpoint['model_state_dict'])
+            if 'img_width' in checkpoint:
+                self.img_width = checkpoint['img_width']
+        else:
+            _model.load_state_dict(checkpoint)
+        self._model = _model.to(self._device)
+        self._model.eval()
+        
+        self.tokenizer = vocab
+        self._model_id = shard.model_id
+        self.shard = shard
+        if DEBUG >= 1: print(f"[PyTorchHF] Loaded Vision local CRNN: {shard.model_id}")
 
         # --- Nhận diện phần cứng ---
         hw = self._detect_hardware_profile(shard.model_id)
@@ -545,73 +549,76 @@ class PyTorchHFInferenceEngine(InferenceEngine):
     async def infer_vision(self, shard: Shard, image_bytes: bytes) -> str:
         await self.ensure_shard(shard)
         try:
-            import torch
-            import cv2
-            import numpy as np
-            import torchvision.transforms as transforms
-            
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            img_array = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-            
-            if np.mean(img_array) < 127:
-                img_array = 255 - img_array
-            _, img_array = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            h, w = img_array.shape
-            new_h = 64
-            img_width = getattr(self, 'img_width', 448)
-            new_w = int(w * (new_h / h))
-            if new_w > img_width:
-                new_w = img_width
-                
-            img_resized = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            padded = np.full((new_h, img_width), 255, dtype=np.uint8)
-            padded[:, :new_w] = img_resized
-            
-            transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.5,), (0.5,))
-            ])
-            image_tensor = transform(padded.copy()).unsqueeze(0).to(self._device)
-            
-            with torch.no_grad():
-                logits = self._model(image_tensor)
-                
-            vocab = self.tokenizer
-            if "idx_to_char" in vocab:
-                idx_dict = vocab["idx_to_char"]
-            else:
-                idx_dict = vocab
-            idx_to_char = {int(k): v for k, v in idx_dict.items()}
-            
-            beam_width = 10
-            log_probs = logits.squeeze(1).cpu().numpy()
-            seq_len, num_classes = log_probs.shape
-            beams = [(0.0, [], -1)]
-            
-            for t in range(seq_len):
-                new_beams = []
-                for score, seq, last_idx in beams:
-                    for c in range(num_classes):
-                        new_score = score + log_probs[t, c]
-                        if c == 0:
-                            new_beams.append((new_score, seq[:], -1))
-                        elif c == last_idx:
-                            new_beams.append((new_score, seq[:], last_idx))
-                        else:
-                            new_beams.append((new_score, seq + [c], c))
-                new_beams.sort(key=lambda x: x[0], reverse=True)
-                beams = new_beams[:beam_width]
-                
-            best_seq = beams[0][1]
-            text = "".join([idx_to_char.get(i, '') for i in best_seq])
-            return text
+            import asyncio
+            return await asyncio.to_thread(self._infer_vision_sync, image_bytes)
         except Exception as e:
             if DEBUG >= 1:
                 import traceback
                 traceback.print_exc()
             raise Exception(f"Vision inference error: {e}")
 
+    def _infer_vision_sync(self, image_bytes: bytes) -> str:
+        import torch
+        import cv2
+        import numpy as np
+        import torchvision.transforms as transforms
+        
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img_array = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        
+        if np.mean(img_array) < 127:
+            img_array = 255 - img_array
+        _, img_array = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        h, w = img_array.shape
+        new_h = 64
+        img_width = getattr(self, 'img_width', 448)
+        new_w = int(w * (new_h / h))
+        if new_w > img_width:
+            new_w = img_width
+            
+        img_resized = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        padded = np.full((new_h, img_width), 255, dtype=np.uint8)
+        padded[:, :new_w] = img_resized
+        
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+        image_tensor = transform(padded.copy()).unsqueeze(0).to(self._device)
+        
+        with torch.no_grad():
+            logits = self._model(image_tensor)
+            
+        vocab = self.tokenizer
+        if "idx_to_char" in vocab:
+            idx_dict = vocab["idx_to_char"]
+        else:
+            idx_dict = vocab
+        idx_to_char = {int(k): v for k, v in idx_dict.items()}
+        
+        beam_width = 10
+        log_probs = logits.squeeze(1).cpu().numpy()
+        seq_len, num_classes = log_probs.shape
+        beams = [(0.0, [], -1)]
+        
+        for t in range(seq_len):
+            new_beams = []
+            for score, seq, last_idx in beams:
+                for c in range(num_classes):
+                    new_score = score + log_probs[t, c]
+                    if c == 0:
+                        new_beams.append((new_score, seq[:], -1))
+                    elif c == last_idx:
+                        new_beams.append((new_score, seq[:], last_idx))
+                    else:
+                        new_beams.append((new_score, seq + [c], c))
+            new_beams.sort(key=lambda x: x[0], reverse=True)
+            beams = new_beams[:beam_width]
+            
+        best_seq = beams[0][1]
+        text = "".join([idx_to_char.get(i, '') for i in best_seq])
+        return text
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
         await self.ensure_shard(shard)
         if self.tokenizer is None:
@@ -665,7 +672,12 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             if self._model is None:
                 vocab_size = 32000
                 return np.zeros((1, 0, vocab_size), dtype=np.float32), inference_state
-            output = self._forward_transformer_range(shard, input_data, request_id=request_id)
+            
+            import asyncio
+            output = await asyncio.to_thread(
+                self._forward_transformer_range,
+                shard, input_data, request_id
+            )
             return output, inference_state
         except Exception as e:
             if DEBUG >= 1:

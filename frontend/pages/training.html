@@ -90,21 +90,25 @@
                 <canvas id="lossChart"></canvas>
             </div>
             
-            <div class="training-progress-card" x-show="trainingJob && trainingJob.status !== 'idle'" style="margin-top:20px;background:transparent;border:none;padding:0">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                    <strong style="color:var(--primary)" x-text="trainingJob.job_id || 'Training Job'"></strong>
-                    <span class="badge" :class="trainingJob.status === 'completed' ? 'badge-success' : trainingJob.status === 'failed' || trainingJob.status === 'cancelled' ? 'badge-danger' : 'badge-warning'" x-text="trainingJob.status"></span>
+            <template x-if="trainingJob && trainingJob.status !== 'idle'">
+                <div class="training-progress-card" style="margin-top:20px;background:transparent;border:none;padding:0">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                        <strong style="color:var(--primary)" x-text="trainingJob.job_id || 'Training Job'"></strong>
+                        <span class="badge" :class="trainingJob.status === 'completed' ? 'badge-success' : trainingJob.status === 'failed' || trainingJob.status === 'cancelled' ? 'badge-danger' : 'badge-warning'" x-text="trainingJob.status"></span>
+                    </div>
+                    <div class="progress-bar-wrap" style="height:12px;margin-bottom:8px">
+                        <div class="progress-bar" :style="'width: ' + (trainingJob.progress || 0) + '%'"></div>
+                    </div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:12px;color:var(--text-muted)">
+                        <div>Tiến độ: <strong style="color:var(--text-primary)" x-text="(trainingJob.progress || 0) + '%'"></strong></div>
+                        <div>Epoch: <strong style="color:var(--text-primary)" x-text="(trainingJob.current_epoch || 0) + ' / ' + trainingJob.epochs"></strong></div>
+                        <div>Loss: <strong style="color:var(--danger)" x-text="trainingJob.loss || '-'"></strong></div>
+                    </div>
+                    <template x-if="trainingJob.error">
+                        <p class="text-danger" style="margin-top:8px;font-size:12px" x-text="'Lỗi: ' + trainingJob.error"></p>
+                    </template>
                 </div>
-                <div class="progress-bar-wrap" style="height:12px;margin-bottom:8px">
-                    <div class="progress-bar" :style="'width: ' + (trainingJob.progress || 0) + '%'"></div>
-                </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:12px;color:var(--text-muted)">
-                    <div>Tiến độ: <strong style="color:var(--text-primary)" x-text="(trainingJob.progress || 0) + '%'"></strong></div>
-                    <div>Epoch: <strong style="color:var(--text-primary)" x-text="(trainingJob.current_epoch || 0) + ' / ' + trainingJob.epochs"></strong></div>
-                    <div>Loss: <strong style="color:var(--danger)" x-text="trainingJob.loss || '-'"></strong></div>
-                </div>
-                <p x-show="trainingJob.error" class="text-danger" style="margin-top:8px;font-size:12px" x-text="'Lỗi: ' + trainingJob.error"></p>
-            </div>
+            </template>
         </div>
 
         <div class="card" style="margin-bottom:0;flex:1">

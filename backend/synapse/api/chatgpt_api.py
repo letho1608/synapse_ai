@@ -259,7 +259,29 @@ class ChatGPTAPI:
     self.inference_engine_classname = inference_engine_classname
     self.response_timeout = response_timeout
     self.on_chat_completion_request = on_chat_completion_request
-    self.app = web.Application(client_max_size=100*1024*1024)  # 100MB to support image upload
+    
+    @web.middleware
+    async def auth_middleware(request: web.Request, handler):
+        if request.method == "OPTIONS":
+            return await handler(request)
+            
+        api_key = os.getenv("SYNAPSE_API_KEY")
+        if not api_key:
+            return await handler(request)
+            
+        # Protect all /v1/ endpoints except the websocket (which needs its own handshake if secured)
+        if request.path.startswith("/v1/") and request.path != "/v1/ws/metrics":
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return web.json_response({"error": "Unauthorized. Missing or invalid Authorization Bearer token."}, status=401)
+                
+            token = auth_header.split(" ")[1]
+            if token != api_key:
+                return web.json_response({"error": "Forbidden. Invalid API Key."}, status=403)
+                
+        return await handler(request)
+
+    self.app = web.Application(client_max_size=100*1024*1024, middlewares=[auth_middleware])  # 100MB to support image upload
     self.prompts: PrefixDict[str, PromptSession] = PrefixDict()
     self.prev_token_lens: Dict[str, int] = {}
     self.stream_tasks: Dict[str, asyncio.Task] = {}
@@ -331,6 +353,7 @@ class ChatGPTAPI:
     
     # New endpoints for Dashboard
     cors.add(self.app.router.add_get("/v1/system/stats", self.handle_get_system_stats), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/ws/metrics", self.handle_ws_metrics), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/system/info", self.handle_get_system_info), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/model/check", self.handle_check_model_fit), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/models/compatibility", self.handle_get_models_compatibility), {"*": cors_options})
@@ -1423,7 +1446,7 @@ class ChatGPTAPI:
         pass
     return resp
 
-  async def handle_get_system_stats(self, request):
+  def get_system_stats_dict(self):
     try:
       if hasattr(self, "node") and self.node and self.node._current_metrics:
         m = self.node._current_metrics

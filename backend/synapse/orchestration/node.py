@@ -841,10 +841,6 @@ class Node:
         if not finished:
           self.buffered_token_output[request_id] = (buffered_tokens, True)
           self.trigger_on_token_callbacks(request_id, [], True)
-        self.outstanding_requests.pop(request_id, None)
-        self._prompt_token_ids.pop(request_id, None)
-        # Broadcast clear cache to cluster
-        self._schedule_task(self.event_router.publish("synapse/cluster/cache/clear", json.dumps({"request_id": request_id})))
         return latest_result if latest_result is not None else result
       except Exception as e:
         # CRITICAL FIX: If exception occurs, ensure API is notified
@@ -852,16 +848,31 @@ class Node:
           print(f"[{request_id}] Error in _process_prompt: {e}")
           import traceback
           traceback.print_exc()
-        # Broadcast clear cache on error too
-        self._schedule_task(self.event_router.publish("synapse/cluster/cache/clear", json.dumps({"request_id": request_id})))
         # Trigger callback with error state so API doesn't hang
         if shard.is_last_layer():
           if DEBUG >= 1:
             print(f"[{request_id}] Triggering error callback to notify API")
           self.trigger_on_token_callbacks(request_id, [], True)
+        raise
+      finally:
+        # Delete local tensor references explicitly to free PyTorch graphs
+        if 'latest_result' in locals(): del latest_result
+        if 'last_token' in locals(): del last_token
+        if 'buffered_tokens' in locals(): del buffered_tokens
+        if 'result' in locals(): del result
         self.outstanding_requests.pop(request_id, None)
         self._prompt_token_ids.pop(request_id, None)
-        raise
+        if hasattr(self.inference_engine, "clear_cache"):
+            self.inference_engine.clear_cache(request_id)
+        # Broadcast clear cache to cluster
+        self._schedule_task(self.event_router.publish("synapse/cluster/cache/clear", json.dumps({"request_id": request_id})))
+        # Ensure CUDA cache is freed
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except:
+            pass
 
   async def enqueue_example(
       self,

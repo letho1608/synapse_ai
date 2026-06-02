@@ -97,6 +97,9 @@ function appState() {
                 _ramChart: null,
                 _vramChart: null,
                 _lossChart: null,
+                _dashboardCpuChart: null,
+                _dashboardVramChart: null,
+                _layerChart: null,
                 _lossHistory: [],
                 _monitoringHistory: { labels: [], cpu: [], ram: [], vram: [] },
                 // === Model filter ===
@@ -105,6 +108,7 @@ function appState() {
                 
                 async loadPage(page) {
                     this.pageLoading = true;
+                    this.destroyAllCharts();
                     try {
                         let newContent = '';
                         const res = await fetch(`/_static/pages/${page}.html`);
@@ -138,6 +142,23 @@ function appState() {
                 },
                 // Khởi tạo
                 async init() {
+                    // Cài đặt Fetch Interceptor cho Authentication
+                    const originalFetch = window.fetch;
+                    const self = this;
+                    window.fetch = async function(...args) {
+                        let [resource, config] = args;
+                        if (self.settingsForm && self.settingsForm.api_auth_enabled === 'true' && self.settingsForm.api_key) {
+                            config = config || {};
+                            config.headers = config.headers || {};
+                            if (config.headers instanceof Headers) {
+                                config.headers.set('Authorization', 'Bearer ' + self.settingsForm.api_key);
+                            } else {
+                                config.headers['Authorization'] = 'Bearer ' + self.settingsForm.api_key;
+                            }
+                        }
+                        return originalFetch.call(this, resource, config);
+                    };
+
                     // Removed forced dark mode to allow white theme by default
                     this.$watch('currentPage', (val) => this.loadPage(val));
                     this.loadPage(this.currentPage);
@@ -159,26 +180,146 @@ function appState() {
                     this.settingsForm.theme = 'light';
                     localStorage.setItem('synapse_theme', 'light');
                     this.applyTheme(this.settingsForm.theme);
+                    
+                    // Khởi tạo WebSocket thay vì dùng Polling
+                    this.initWebSocket();
+                    
+                    // Thêm Watchdog Timer để chống "Silent Deadlock"
                     setInterval(() => {
-                        this.fetchStats();
-                        this.fetchActivity();
-                        this.fetchNetworkNodes();
-                        this.fetchDistributedStatus();
-                        if (this.currentPage === 'dashboard') {
-                            this.fetchTerminalLogs();
-                            this.fetchDatasets();
-                            this.fetchModelList();
+                        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                            if (Date.now() - this.lastApiUpdate > 15000) {
+                                console.warn("WebSocket data stale (>15s). Forcing reconnect...");
+                                this.ws.close();
+                            }
                         }
-                        if (this.currentPage === 'training' || this.currentPage === 'dashboard') this.fetchTrainingStatus();
-                        if (this.currentPage === 'datasets') this.fetchDatasets();
-                        if (this.currentPage === 'settings') this.fetchSettings();
-                        if (this.currentPage === 'test' || this.currentPage === 'models') this.fetchModelList();
-                        if (this.currentPage === 'cluster' || this.currentPage === 'dashboard') this.fetchClusterResources();
                     }, 5000);
-                    // Log terminal cập nhật nhanh hơn khi đang xem Dashboard để bám sát output thật
-                    setInterval(() => {
-                        if (this.currentPage === 'dashboard') this.fetchTerminalLogs();
-                    }, 800);
+                },
+                
+                // ===== WEBSOCKET =====
+                ws: null,
+                wsReconnectAttempts: 0,
+                initWebSocket() {
+                    if (this.ws) return;
+                    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const wsUrl = `${protocol}//${window.location.host}/v1/ws/metrics`;
+                    
+                    this.ws = new WebSocket(wsUrl);
+                    
+                    this.ws.onopen = () => {
+                        if (this.wsReconnectAttempts > 0) {
+                            this.showToast('Đã kết nối lại với máy chủ', 'success');
+                        }
+                        this.wsReconnectAttempts = 0;
+                        this.isOffline = false;
+                        if (this.dashboardState === 'loading' || this.dashboardState === 'error') {
+                            this.dashboardState = 'ready';
+                        }
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'metrics') {
+                                this.updateFromWebSocket(data);
+                            }
+                        } catch (e) {
+                            console.error('WS Parse Error', e);
+                        }
+                    };
+                    
+                    this.ws.onclose = () => {
+                        this.ws = null;
+                        this.isOffline = true;
+                        if (this.currentPage === 'dashboard') {
+                            this.dashboardState = 'error';
+                        }
+                        if (this.wsReconnectAttempts === 0) {
+                            this.showToast('Mất kết nối máy chủ. Đang thử lại...', 'error');
+                        }
+                        let delay = Math.min(1000 * Math.pow(2, this.wsReconnectAttempts), 10000);
+                        this.wsReconnectAttempts++;
+                        setTimeout(() => this.initWebSocket(), delay);
+                    };
+                    
+                    this.ws.onerror = (err) => {
+                        if (this.ws) this.ws.close();
+                    };
+                },
+                
+                showToast(message, type = 'info') {
+                    const container = document.getElementById('toast-container');
+                    if (!container) return;
+                    const toast = document.createElement('div');
+                    toast.className = `toast ${type}`;
+                    
+                    let icon = 'fa-info-circle';
+                    if (type === 'success') icon = 'fa-check-circle';
+                    if (type === 'error') icon = 'fa-exclamation-circle';
+                    if (type === 'warning') icon = 'fa-exclamation-triangle';
+
+                    toast.innerHTML = `<i class="fas ${icon}"></i> <span>${message}</span>`;
+                    container.appendChild(toast);
+                    
+                    setTimeout(() => {
+                        toast.classList.add('fade-out');
+                        setTimeout(() => toast.remove(), 300);
+                    }, 3000);
+                },
+                
+                updateFromWebSocket(data) {
+                    this.lastApiUpdate = Date.now();
+                    
+                    if (data.stats) {
+                        this.stats = { ...this.stats, ...data.stats };
+                        this.stats.models_count = data.stats.models_count ?? this.models.length;
+                        
+                        const maxPoints = 30;
+                        const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                        this._monitoringHistory.labels.push(now);
+                        this._monitoringHistory.cpu.push(this.stats.cpu || 0);
+                        this._monitoringHistory.ram.push(this.stats.memory || 0);
+                        this._monitoringHistory.vram.push(this.stats.gpu_vram_used_mb ? this.stats.gpu_vram_used_mb / 1024 : 0);
+                        
+                        if (this._monitoringHistory.labels.length > maxPoints) {
+                            this._monitoringHistory.labels.shift();
+                            this._monitoringHistory.cpu.shift();
+                            this._monitoringHistory.ram.shift();
+                            this._monitoringHistory.vram.shift();
+                        }
+                        
+                        if (this.currentPage === 'dashboard') {
+                            this.renderSparklines();
+                        } else if (this.currentPage === 'monitoring') {
+                            this.renderMonitoringCharts();
+                        }
+                    }
+                    
+                    if (data.training !== undefined) {
+                        this.trainingJob = data.training;
+                        if (this.currentPage === 'training' && this.trainingJob) {
+                            this.renderLossChart();
+                        }
+                    }
+                    
+                    if (data.terminal_logs !== undefined && this.currentPage === 'dashboard') {
+                        if (JSON.stringify(this.terminalLogs) !== JSON.stringify(data.terminal_logs)) {
+                            this.terminalLogs = data.terminal_logs;
+                            this.$nextTick(() => {
+                                const container = document.getElementById('terminalLogContainer');
+                                if (container) container.scrollTop = container.scrollHeight;
+                            });
+                        }
+                    }
+                    
+                    if (data.nodes) {
+                        this.networkNodes = data.nodes;
+                    }
+                    
+                    if (data.distributed) {
+                        this.clusterTotalNodes = data.distributed.total_nodes || 0;
+                        this.clusterOnlineNodes = data.distributed.nodes ? data.distributed.nodes.length : 0;
+                        this.clusterStrategyName = data.distributed.strategy || 'Unknown';
+                    }
                 },
                 applyTheme(theme) {
                     if (!theme) return;
@@ -977,6 +1118,17 @@ function appState() {
                         'about': 'Giới thiệu'
                     };
                     return titles[this.currentPage] || 'Synapse AI';
+                },
+
+                // ===== CHARTS & MONITORING =====
+                destroyAllCharts() {
+                    const charts = ['_dashCpuChart', '_dashVramChart', '_cpuChart', '_ramChart', '_vramChart', '_lossChart', '_layerChart', '_flopsChart'];
+                    charts.forEach(c => {
+                        if (this[c]) {
+                            this[c].destroy();
+                            this[c] = null;
+                        }
+                    });
                 },
 
                 // ===== CLUSTER RESOURCES =====
