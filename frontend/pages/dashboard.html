@@ -1,0 +1,240 @@
+<div class="dashboard-wrapper" x-show="dashboardState === 'ready'" x-cloak>
+    <div class="dashboard-grid" style="margin-bottom: var(--spacing-md);">
+        <!-- System Status -->
+        <div class="stat-card" style="position:relative; overflow:hidden;">
+            <div class="stat-label" style="position:relative; z-index:2; display:flex; justify-content:space-between;">
+                <span>SYSTEM STATUS</span>
+                <span style="font-size:9px; color:var(--text-muted); text-transform:none;" x-text="'v' + (systemInfo.version || '-')"></span>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; position:relative; z-index:2; margin-top: 8px;">
+                <div style="font-size: 24px; font-weight: bold; color:#38BDF8;" x-text="(stats.cpu || 0).toFixed(1) + '%'"></div>
+                <div class="text-muted" style="font-size: 10px;">CPU</div>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; position:relative; z-index:2; margin-top: 4px;">
+                <div style="font-size: 16px; font-weight: bold; color:#10B981;">
+                    <span x-text="(stats.memory || 0).toFixed(1) + '%'"></span>
+                    <span style="font-size: 11px; font-weight: normal; color:var(--text-muted); margin-left: 4px;" x-text="(stats.memory_used_gb || 0).toFixed(1) + ' / ' + (stats.memory_total_gb || 0).toFixed(1) + ' GB'"></span>
+                </div>
+                <div class="text-muted" style="font-size: 10px;">RAM</div>
+            </div>
+            
+            <div x-show="stats.gpu_name" style="margin-top: 12px; position:relative; z-index:2; border-top: 1px solid var(--border); padding-top: 8px;">
+                <div style="display:flex; justify-content:space-between; font-size:11px; margin-bottom:4px;">
+                    <strong style="color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:120px;" x-text="stats.gpu_name"></strong>
+                    <span style="color:#8B5CF6; font-weight:bold;" x-text="stats.gpu_vram_gb ? (stats.gpu_vram_used_mb/1024).toFixed(1) + ' / ' + stats.gpu_vram_gb.toFixed(1) + ' GB' : '0.0 GB'"></span>
+                </div>
+                <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; font-size:10px; color:var(--text-muted);">
+                    <div>Util: <span style="color:var(--text-primary)" x-text="stats.gpu_utilization !== null ? stats.gpu_utilization + '%' : '-'"></span></div>
+                    <div>Temp: <span style="color:var(--text-primary)" x-text="stats.gpu_temp_c !== null ? stats.gpu_temp_c + '°C' : '-'"></span></div>
+                    <div>Pwr: <span style="color:var(--text-primary)" x-text="stats.gpu_power_w !== null ? stats.gpu_power_w + 'W' : '-'"></span></div>
+                </div>
+            </div>
+            
+            <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:12px; position:relative; z-index:2; border-top: 1px solid var(--border); padding-top: 8px;">
+                <span class="text-muted">Uptime</span>
+                <span x-text="stats.uptime || '-'"></span>
+            </div>
+            <!-- Sparkline background -->
+            <div style="position:absolute; bottom:0; left:0; right:0; height:40px; z-index:1; opacity:0.3; display:flex;">
+                <div style="flex:1"><canvas id="dashCpuSparkline"></canvas></div>
+                <template x-if="stats.gpu_name">
+                    <div style="flex:1"><canvas id="dashVramSparkline"></canvas></div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Inference Status -->
+        <div class="stat-card">
+            <div class="stat-label">INFERENCE STATUS</div>
+            <template x-if="modelStatus.model">
+                <div>
+                    <div style="font-size: 16px; font-weight: bold; color:var(--primary); margin-top: 8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" x-text="modelStatus.model"></div>
+                    <div class="text-muted" style="font-size: 10px; margin-bottom: 8px;">Active Model</div>
+                    
+                    <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
+                        <span class="text-muted">Tokens/sec</span>
+                        <span x-text="(localInferenceStats.last_tps || 0).toFixed(1) + ' t/s'"></span>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
+                        <span class="text-muted">Time To First Token</span>
+                        <span x-text="(localInferenceStats.last_ttft || 0).toFixed(0) + ' ms'"></span>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
+                        <span class="text-muted">Queue / Total</span>
+                        <span><span :style="localInferenceStats.queue_length > 0 ? 'color:var(--warning)' : ''" x-text="localInferenceStats.queue_length || 0"></span> / <span x-text="localInferenceStats.total_requests || 0"></span></span>
+                    </div>
+                </div>
+            </template>
+            <template x-if="!modelStatus.model">
+                <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; padding: 16px 0;">
+                    <i class="fas fa-robot" style="font-size: 24px; color:var(--text-muted); margin-bottom: 8px;"></i>
+                    <div style="font-size: 12px; color:var(--text-muted); margin-bottom: 12px;">No model loaded</div>
+                    <button class="btn btn-outline" style="font-size:10px; padding:4px 8px; color:var(--primary); border-color:var(--primary);" @click="currentPage = 'models'">
+                        <i class="fas fa-download" style="margin-right:4px;"></i> Import Model
+                    </button>
+                </div>
+            </template>
+        </div>
+
+        <!-- Cluster Status -->
+        <div class="stat-card">
+            <div class="stat-label">CLUSTER STATUS</div>
+            <div style="font-size: 24px; font-weight: bold; color:#10B981; margin-top: 8px;" x-text="networkNodes.length || 0"></div>
+            <div class="text-muted" style="font-size: 10px; margin-bottom: 8px;">Active Nodes</div>
+            <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
+                <span class="text-muted">Network Health</span>
+                <span x-text="(systemInfo.network_discovery || 'Unknown').toUpperCase()"></span>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
+                <span class="text-muted">Partitions</span>
+                <span x-text="distributedStatus.partitions_count || 0"></span>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
+                <span class="text-muted">Dist. Inference</span>
+                <span :style="distributedStatus.multi_node_inference ? 'color:var(--success)' : 'color:var(--text-muted)'" x-text="distributedStatus.multi_node_inference ? 'Ready' : 'Disabled'"></span>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
+                <span class="text-muted">Dist. Training</span>
+                <span :style="distributedStatus.multi_node_training ? 'color:var(--success)' : 'color:var(--text-muted)'" x-text="distributedStatus.multi_node_training ? 'Ready' : 'Disabled'"></span>
+            </div>
+            
+            <template x-if="networkNodes.length === 0">
+                <div style="margin-top: 12px;">
+                    <button class="btn btn-outline" style="width:100%; font-size:10px; padding:4px 8px; color:var(--text-primary); border-color:var(--border);" @click="currentPage = 'cluster'">
+                        <i class="fas fa-network-wired" style="margin-right:4px;"></i> Connect Node
+                    </button>
+                </div>
+            </template>
+        </div>
+
+        <!-- Resources -->
+        <div class="stat-card">
+            <div class="stat-label">RESOURCES</div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top: 8px;">
+                <div style="font-size: 24px; font-weight: bold; color:#F59E0B;" x-text="stats.models_count || 0"></div>
+                <div class="text-muted" style="font-size: 10px;">Models</div>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top: 4px;">
+                <div style="font-size: 24px; font-weight: bold; color:#38BDF8;" x-text="stats.datasets_count || 0"></div>
+                <div class="text-muted" style="font-size: 10px;">Datasets</div>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top: 4px;">
+                <div style="font-size: 24px; font-weight: bold; color:#10B981;" x-text="stats.training_count || 0"></div>
+                <div class="text-muted" style="font-size: 10px;">Training Jobs</div>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top: 4px;">
+                <div style="font-size: 24px; font-weight: bold; color:#8B5CF6;" x-text="stats.tests_count || 0"></div>
+                <div class="text-muted" style="font-size: 10px;">Tests</div>
+            </div>
+            
+            <template x-if="(stats.datasets_count || 0) === 0">
+                <div style="margin-top: 12px; text-align:center;">
+                    <div style="font-size: 11px; color:var(--text-muted); margin-bottom: 8px;">No datasets available</div>
+                    <button class="btn btn-outline" style="width:100%; font-size:10px; padding:4px 8px; color:var(--text-primary); border-color:var(--border);" @click="currentPage = 'datasets'">
+                        <i class="fas fa-database" style="margin-right:4px;"></i> Add Dataset
+                    </button>
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <div class="dashboard-matrix">
+        <!-- Left Col: Cluster Map -->
+        <div class="card" style="margin-bottom:0">
+            <div class="card-header" style="margin-bottom:8px">
+                <h2 class="card-title" style="font-size:14px; text-transform:uppercase;"><i class="fas fa-network-wired" style="margin-right:6px;color:var(--primary)"></i>Cluster Map</h2>
+                <span class="badge badge-muted" style="font-size:10px" x-text="clusterResources.length + ' nodes'"></span>
+            </div>
+            <div style="overflow-y:auto; max-height:280px; padding-right: 4px;">
+                <div style="display:flex; flex-direction:column; gap: 8px;">
+                    <template x-for="(node, idx) in clusterResources" :key="node.node_id || idx">
+                        <div style="padding: 12px; border: 1px solid var(--border); border-radius: 6px; display:flex; justify-content:space-between; align-items:center; background: rgba(0,0,0,0.1);">
+                            <div style="display:flex; align-items:center; gap: 12px;">
+                                <div style="width: 8px; height: 8px; border-radius: 50%; background: #10B981; box-shadow: 0 0 8px #10B981;"></div>
+                                <div>
+                                    <div style="display:flex; align-items:center; gap: 8px;">
+                                        <div style="font-weight: 600; font-size: 13px; color:var(--text-primary)" x-text="node.name"></div>
+                                        <span x-show="node.is_self" class="badge-grafana" style="font-size:9px; padding:1px 4px; border-color:#0EA5E9; color:#0EA5E9">LOCAL</span>
+                                    </div>
+                                    <div style="font-size: 11px; color: var(--text-muted); margin-top:2px;">
+                                        <i class="fas fa-microchip" style="margin-right:4px"></i><span x-text="node.chip || 'Unknown'"></span>
+                                        <span style="margin: 0 4px">•</span>
+                                        <span x-text="node.ip || node.node_id.slice(0,12)"></span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="text-align:right">
+                                <div style="font-size: 11px; font-weight:bold; color: #8B5CF6;" x-show="node.vram_gb > 0" x-text="node.vram_gb + 'GB VRAM'"></div>
+                                <div style="font-size: 11px; font-weight:bold; color: #10B981;" x-show="!node.vram_gb || node.vram_gb === 0" x-text="node.ram_gb + 'GB RAM'"></div>
+                                <div style="font-size: 10px; color: var(--text-muted); margin-top:4px;" x-text="(node.flops_fp16||0).toFixed(1) + ' TFLOPS'"></div>
+                            </div>
+                        </div>
+                    </template>
+                    <div x-show="clusterResources.length === 0" style="text-align:center; padding: 32px 20px;">
+                        <i class="fas fa-network-wired" style="font-size: 24px; color:var(--text-muted); margin-bottom: 8px;"></i>
+                        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">No active nodes found</div>
+                        <button class="btn btn-outline" style="font-size:10px; padding:4px 8px; color:var(--text-primary); border-color:var(--border);" @click="currentPage = 'cluster'">
+                            <i class="fas fa-search" style="margin-right:4px;"></i> Discover Nodes
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Col: System Logs -->
+        <div class="card" style="margin-bottom:0">
+            <div class="card-header" style="margin-bottom:8px">
+                <h2 class="card-title" style="font-size:14px; text-transform:uppercase;"><i class="fas fa-terminal" style="margin-right:6px;color:var(--primary)"></i>System Logs</h2>
+                <span class="badge badge-muted" style="font-size:10px" x-text="terminalLines.length + ' lines'"></span>
+            </div>
+            <div class="terminal-log-box" x-ref="logContainer" x-effect="terminalLines.length && $nextTick(() => { const el = $refs.logContainer; if (el) el.scrollTop = el.scrollHeight })">
+                <template x-for="(line, i) in terminalLines" :key="i">
+                    <div x-html="parseAnsi(line)" style="margin-bottom:2px; white-space:pre-wrap; word-break:break-all;"></div>
+                </template>
+                <div x-show="terminalLines.length === 0" style="color:var(--text-muted); display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; padding: 32px 0;">
+                    <i class="fas fa-terminal" style="font-size: 24px; color:var(--text-muted); margin-bottom: 8px;"></i>
+                    <div style="font-size: 12px; margin-bottom: 12px;">Logs empty</div>
+                    <button class="btn btn-outline" style="font-size:10px; padding:4px 8px; color:var(--text-primary); border-color:var(--border);" @click="fetchTerminalLogs()">
+                        <i class="fas fa-sync" style="margin-right:4px;"></i> Refresh
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="card" x-show="trainingJob && trainingJob.status !== 'idle' && trainingJob.status !== undefined" style="margin-top:var(--spacing-md);">
+        <div class="card-header" style="margin-bottom:8px">
+            <h2 class="card-title" style="font-size:14px; text-transform:uppercase;"><i class="fas fa-graduation-cap" style="color:var(--warning);margin-right:8px"></i>Training Process</h2>
+            <span class="badge-grafana" style="color:#F59E0B; border-color:#F59E0B" x-text="(trainingJob.status || 'STARTED').toUpperCase()"></span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px; font-size:12px;">
+            <div class="text-muted">
+                Model: <strong style="color:var(--text-primary)" x-text="trainingJob.model"></strong> | Dataset: <span x-text="trainingJob.dataset"></span>
+            </div>
+            <div style="font-family:monospace" x-text="(trainingJob.progress || 0) + '%'"></div>
+        </div>
+        <div style="height:6px; background:var(--divider); border-radius:3px; overflow:hidden; margin-bottom:8px">
+            <div style="height:100%; background:var(--warning); transition:width 0.3s;" :style="'width: ' + (trainingJob.progress || 0) + '%'"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:11px;color:var(--text-muted); font-family:monospace;">
+            <div>EPOCH: <strong style="color:var(--text-primary)" x-text="(trainingJob.current_epoch || 0) + '/' + trainingJob.epochs"></strong></div>
+            <div>LOSS: <strong style="color:#EF4444" x-text="trainingJob.loss || '-'"></strong></div>
+            <div style="text-align:right">START: <span x-text="trainingJob.started_at"></span></div>
+        </div>
+    </div>
+</div>
+
+<!-- Empty State Overlays -->
+<div class="dashboard-loading" x-show="dashboardState === 'loading'" style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:60vh;">
+    <i class="fas fa-spinner fa-spin" style="font-size: 32px; color:var(--primary); margin-bottom: 16px;"></i>
+    <div style="font-size: 16px; color:var(--text-primary);">Waiting for metrics...</div>
+</div>
+
+<div class="dashboard-error" x-show="dashboardState === 'error'" style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:60vh;">
+    <i class="fas fa-exclamation-triangle" style="font-size: 32px; color:#EF4444; margin-bottom: 16px;"></i>
+    <div style="font-size: 16px; color:var(--text-primary); margin-bottom: 8px;">Unable to fetch metrics</div>
+    <div style="font-size: 12px; color:var(--text-muted); margin-bottom: 16px;">The API server might be down or unreachable.</div>
+    <button class="btn btn-outline" style="font-size:12px; padding:6px 12px; color:var(--primary); border-color:var(--primary);" @click="dashboardState = 'loading'; fetchStats()">
+        <i class="fas fa-sync" style="margin-right:4px;"></i> Retry Connection
+    </button>
+</div>

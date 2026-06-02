@@ -1,0 +1,90 @@
+<div class="card" style="margin-bottom:var(--spacing-md); padding:10px 16px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div>
+            <h2 style="margin:0;font-size:14px;color:var(--text-primary); text-transform:uppercase;"><i class="fas fa-cube" style="color:var(--primary);margin-right:8px"></i>Model Registry</h2>
+        </div>
+        <div style="display:flex; gap:10px; align-items:center">
+            <span class="badge-grafana" style="border-color:#10B981; color:#10B981">TOTAL: <span x-text="allFilteredModels().length"></span></span>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="padding: 12px;">
+    <!-- Status filter + search -->
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;align-items:center">
+        <label for="model-search-input" class="visually-hidden">Tìm kiếm model</label>
+        <input id="model-search-input" type="text" class="form-input" placeholder="Search by name, family..." x-model="modelSearch"
+            style="max-width:300px;height:30px;padding:4px 10px;font-size:12px">
+        
+        <button class="btn btn-outline btn-sm" :class="{active: modelStatusFilter==='all' || modelStatusFilter===''}"
+            @click="modelStatusFilter='all'" style="padding:4px 10px; font-size:11px; text-transform:uppercase">ALL</button>
+        <button class="btn btn-outline btn-sm" :class="{active: modelStatusFilter==='downloaded'}"
+            @click="modelStatusFilter='downloaded'" style="padding:4px 10px; font-size:11px; text-transform:uppercase">DOWNLOADED</button>
+        <button class="btn btn-outline btn-sm" :class="{active: modelStatusFilter==='available'}"
+            @click="modelStatusFilter='available'" style="padding:4px 10px; font-size:11px; text-transform:uppercase">AVAILABLE</button>
+    </div>
+
+    <div style="overflow-x: auto;">
+        <table class="table" style="table-layout: fixed; width: 100%; font-family:monospace; font-size:12px">
+            <thead>
+                <tr>
+                    <th style="width: 25%;">REPOSITORY NAME</th>
+                    <th style="width: 8%;">PARAMS</th>
+                    <th style="width: 10%;">ARCH</th>
+                    <th style="width: 12%;">FAMILY</th>
+                    <th style="width: 8%;">QUANT</th>
+                    <th style="width: 14%;">VRAM ESTIMATE</th>
+                    <th style="width: 9%;">TYPE</th>
+                    <th style="width: 10%;">ACTIONS</th>
+                </tr>
+            </thead>
+            <tbody>
+                <template x-for="m in allFilteredModels()" :key="m.name">
+                    <tr :style="m.isDownloaded ? 'background: rgba(16, 185, 129, 0.05);' : ''">
+                        <td>
+                            <span x-text="m.name" style="word-break:break-all;" :style="m.isDownloaded ? 'color: #10B981; font-weight: bold;' : ''"></span>
+                            <span class="badge-grafana" x-show="m.isDownloaded" style="margin-left:4px">LOCAL</span>
+                        </td>
+                        <td><span x-text="m.parameter_size || '-'"></span></td>
+                        <td class="text-muted"><span x-text="m.architecture || '-'"></span></td>
+                        <td class="text-muted"><span x-text="m.family || '-'"></span></td>
+                        <td><strong style="color:#0EA5E9" x-text="m.quantization_level || '-'"></strong></td>
+                        <td>
+                            <span x-text="m.memory || '-'" style="color:#10B981;font-weight:bold"></span>
+                            <span class="text-muted" x-show="m.isDownloaded"> | DISK: <span x-text="m.size_gb ? m.size_gb + 'GB' : '-'"></span></span>
+                        </td>
+                        <td>
+                            <span class="badge-grafana" style="color:#F59E0B; border-color:#F59E0B" x-show="m.pipeline_tag && (m.pipeline_tag.includes('text') || m.pipeline_tag.includes('chat'))">TEXT</span>
+                            <span class="badge-grafana" style="color:#8B5CF6; border-color:#8B5CF6" x-show="m.pipeline_tag && (m.pipeline_tag.includes('image') || m.pipeline_tag.includes('vision') || m.pipeline_tag.includes('video'))">VISION</span>
+                            <span class="badge-grafana" style="color:#0EA5E9; border-color:#0EA5E9" x-show="m.pipeline_tag && (m.pipeline_tag.includes('audio') || m.pipeline_tag.includes('speech') || m.pipeline_tag.includes('voice'))">AUDIO</span>
+                            <span class="badge-grafana" style="color:#cbd5e1; border-color:#cbd5e1" x-show="m.pipeline_tag && !m.pipeline_tag.includes('text') && !m.pipeline_tag.includes('chat') && !m.pipeline_tag.includes('image') && !m.pipeline_tag.includes('vision') && !m.pipeline_tag.includes('audio') && !m.pipeline_tag.includes('speech')" x-text="(m.pipeline_tag || '-').toUpperCase()"></span>
+                        </td>
+                        <td>
+                            <template x-if="m.isDownloaded">
+                                <button type="button" class="btn btn-outline btn-sm"
+                                    style="padding:2px 8px; font-size:10px"
+                                    :disabled="deleteLoading === m.name" @click="deleteModel(m.name)">
+                                    <i class="fas fa-spinner fa-spin" x-show="deleteLoading === m.name"></i>
+                                    <i class="fas fa-trash-alt" x-show="deleteLoading !== m.name"></i>
+                                    <span x-text="deleteLoading === m.name ? 'DEL...' : 'DELETE'"></span>
+                                </button>
+                            </template>
+                            <template x-if="!m.isDownloaded">
+                                <button type="button" class="btn btn-primary btn-sm"
+                                    style="padding:2px 8px; font-size:10px"
+                                    :disabled="pullLoading === m.name" @click="pullModel(m.name)">
+                                    <i class="fas fa-spinner fa-spin" x-show="pullLoading === m.name"></i>
+                                    <i class="fas fa-download" x-show="pullLoading !== m.name"></i>
+                                    <span x-text="pullLoading === m.name ? 'PULL...' : 'PULL'"></span>
+                                </button>
+                            </template>
+                        </td>
+                    </tr>
+                </template>
+                <tr x-show="allFilteredModels().length === 0">
+                    <td colspan="8" class="text-muted" style="text-align:center; padding:20px;">No models match filter criteria.</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>

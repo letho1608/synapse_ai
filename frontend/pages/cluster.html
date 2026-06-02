@@ -1,0 +1,148 @@
+<div class="card">
+    <div class="card-header" style="margin-bottom:8px">
+        <div style="display:flex; justify-content:space-between; align-items:center; width:100%">
+            <h2 class="card-title" style="font-size:14px; text-transform:uppercase;"><i class="fas fa-network-wired" style="margin-right:6px;color:var(--primary)"></i>Cluster Topology Matrix</h2>
+            <div style="display:flex; gap:10px; align-items:center">
+                <span class="badge-grafana">NETWORK: <span x-text="(systemInfo.network_discovery || 'Unknown').toUpperCase()"></span></span>
+                <span class="badge-grafana" style="color:#0EA5E9; border-color:#0EA5E9">STRATEGY: <span x-text="clusterStrategyName"></span></span>
+                <button class="btn btn-outline btn-sm" @click="fetchClusterResources()" :disabled="clusterLoading" style="padding: 2px 6px;" aria-label="Làm mới cluster">
+                    <i class="fas fa-sync-alt" :class="{'fa-spin':clusterLoading}"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <div class="stats-grid" style="grid-template-columns:repeat(5,1fr); gap:10px; margin-bottom:14px;">
+        <div class="stat-card" style="padding:8px">
+            <div class="stat-label">NODES</div>
+            <div class="stat-value" x-text="clusterResources.length">0</div>
+        </div>
+        <div class="stat-card" style="padding:8px">
+            <div class="stat-label">TFLOPS (FP16)</div>
+            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.flops_fp16||0),0).toFixed(1)">0</div>
+        </div>
+        <div class="stat-card" style="padding:8px">
+            <div class="stat-label">TOTAL VRAM (GB)</div>
+            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.vram_gb||0),0).toFixed(1)">0</div>
+        </div>
+        <div class="stat-card" style="padding:8px">
+            <div class="stat-label">SYSTEM RAM (GB)</div>
+            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.ram_gb||0),0).toFixed(1)">0</div>
+        </div>
+        <div class="stat-card" style="padding:8px">
+            <div class="stat-label">CPU CORES</div>
+            <div class="stat-value" x-text="clusterResources.reduce((s,n)=>s+(n.cpu_cores||0),0)">0</div>
+        </div>
+    </div>
+
+    <div style="overflow-x:auto;">
+        <table class="table" style="font-family: monospace;">
+            <thead>
+                <tr>
+                    <th>NODE NAME</th>
+                    <th>IP / IDENTIFIER</th>
+                    <th>HARDWARE</th>
+                    <th>VRAM / RAM</th>
+                    <th>TFLOPS</th>
+                    <th>LAYER SHARE</th>
+                    <th>LAYER RANGE</th>
+                </tr>
+            </thead>
+            <tbody>
+                <template x-for="(node, idx) in clusterResources" :key="node.node_id">
+                    <tr :style="node.is_self ? 'background: rgba(16, 185, 129, 0.05);' : ''">
+                        <td>
+                            <strong x-text="node.name"></strong>
+                            <span x-show="node.is_self" class="badge-grafana" style="margin-left:4px">LOCAL</span>
+                        </td>
+                        <td class="text-muted" x-text="node.ip || node.node_id.slice(0,12)"></td>
+                        <td>
+                            <span x-text="node.chip || 'Unknown'"></span>
+                            <span class="badge-grafana" style="border-color:#64748b; color:#cbd5e1" x-text="node.has_gpu ? 'GPU' : 'CPU'"></span>
+                        </td>
+                        <td>
+                            <span style="color:#34D399" x-show="node.vram_gb > 0" x-text="node.vram_gb + 'GB VRAM'"></span>
+                            <span x-show="node.vram_gb > 0" class="text-muted"> / </span>
+                            <span class="text-muted" x-text="node.ram_gb + 'GB RAM'"></span>
+                        </td>
+                        <td x-text="(node.flops_fp16||0).toFixed(1)"></td>
+                        <td>
+                            <div style="display:flex; align-items:center; gap:8px">
+                                <span style="color:var(--primary); font-weight:bold; width:35px" x-text="node.share_pct + '%'"></span>
+                                <div style="flex:1; height:6px; background:var(--border); border-radius:3px; overflow:hidden">
+                                    <div style="height:100%; background:var(--primary)" :style="'width:' + node.share_pct + '%'"></div>
+                                </div>
+                            </div>
+                        </td>
+                        <td class="text-muted">
+                            L<span x-text="node.layer_start"></span> - L<span x-text="node.layer_end"></span> (<span x-text="node.layer_count"></span>)
+                        </td>
+                    </tr>
+                </template>
+                <tr x-show="clusterResources.length === 0">
+                    <td colspan="7" class="text-muted" style="text-align:center; padding: 20px;">No nodes discovered in cluster.</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header" style="margin-bottom:8px">
+        <h2 class="card-title" style="font-size:14px; text-transform:uppercase;"><i class="fas fa-layer-group" style="margin-right:6px;color:var(--primary)"></i>Layer Distribution Map</h2>
+    </div>
+    <div class="layer-bar-wrap" x-show="clusterResources.length > 0" style="height: 30px; border-radius: 4px; border: 1px solid var(--border)">
+        <template x-for="(node, idx) in clusterResources" :key="node.node_id">
+            <div class="layer-bar-segment"
+                :style="`left:${(node.layer_start / clusterTotalLayers) * 100}%;width:${((node.layer_end - node.layer_start + 1) / clusterTotalLayers) * 100}%;background:${idx===0?'#10B981':idx===1?'#0EA5E9':idx===2?'#F59E0B':idx===3?'#8B5CF6':'#059669'}; border-right: 1px solid var(--border)`">
+                <span x-text="node.name.length>8 ? node.name.slice(0,8)+'…' : node.name" style="font-family:monospace; font-size:10px"></span>
+            </div>
+        </template>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;font-family:monospace;color:var(--text-muted);margin-top:4px">
+        <span>LAYER 0</span>
+        <span x-text="'TOTAL: ' + clusterTotalLayers"></span>
+    </div>
+</div>
+
+<div class="card" style="margin-top: 20px;">
+    <div class="card-header" style="margin-bottom:8px">
+        <div style="display:flex; justify-content:space-between; align-items:center; width:100%">
+            <h2 class="card-title" style="font-size:14px; text-transform:uppercase;"><i class="fas fa-globe" style="margin-right:6px;color:var(--primary)"></i><span x-text="'Network Discovery (' + (systemInfo.network_discovery || 'Unknown').toUpperCase() + ')'"></span></h2>
+            <button class="btn btn-outline btn-sm" @click="fetchNetworkNodes()" style="padding: 2px 6px;" aria-label="Làm mới mạng">
+                <i class="fas fa-sync-alt"></i>
+            </button>
+        </div>
+    </div>
+    
+    <div style="overflow-x:auto;">
+        <table class="table" style="font-family: monospace;">
+            <thead>
+                <tr>
+                    <th>DEVICE NAME</th>
+                    <th>ADDRESSES</th>
+                    <th>LAST SEEN</th>
+                    <th>STATUS</th>
+                </tr>
+            </thead>
+            <tbody>
+                <template x-for="node in networkNodes" :key="node.device_id || node.name">
+                    <tr :style="node.is_self ? 'background: rgba(16, 185, 129, 0.05);' : ''">
+                        <td>
+                            <strong x-text="node.name"></strong>
+                            <span x-show="node.is_self" class="badge-grafana" style="margin-left:4px">LOCAL</span>
+                        </td>
+                        <td class="text-muted" x-text="node.addresses ? node.addresses.join(', ') : '-'"></td>
+                        <td class="text-muted" x-text="node.last_seen ? new Date(node.last_seen).toLocaleString() : 'N/A'"></td>
+                        <td>
+                            <span class="badge-grafana" style="border-color:#10B981; color:#10B981">ONLINE</span>
+                        </td>
+                    </tr>
+                </template>
+                <tr x-show="!networkNodes || networkNodes.length === 0">
+                    <td colspan="4" class="text-muted" style="text-align:center; padding: 20px;">No other nodes found in the network.</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>

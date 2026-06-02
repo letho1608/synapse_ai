@@ -1,0 +1,13 @@
+{
+  "name": "synapse-ai-frontend",
+  "version": "1.0.0",
+  "description": "Frontend UI for Synapse AI",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}

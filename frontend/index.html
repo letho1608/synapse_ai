@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Synapse AI Server</title>
+    <link rel="stylesheet" href="/_static/production.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <link rel="stylesheet" href="/_static/css/main.css">
+</head>
+
+<body>
+    <div class="app-container" x-data="appState()" x-init="init()">
+        <!-- Overlay khi mở menu (mobile/desktop) -->
+        <div class="sidebar-overlay" :class="{ 'visible': sidebarOpen }" @click="sidebarOpen = false"
+            x-show="sidebarOpen" x-cloak aria-hidden="true"></div>
+        <!-- Sidebar dọc -->
+        <aside class="sidebar" :class="{ 'mobile-open': sidebarOpen, 'collapsed': !sidebarOpen }"
+            aria-label="Menu chính">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <i class="fas fa-brain"></i>
+                    </div>
+                    <span>Synapse AI</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'dashboard' }"
+                    @click="currentPage = 'dashboard'; sidebarOpen = false">
+                    <i class="fas fa-home"></i>
+                    <span>Dashboard</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'models' }"
+                    @click="currentPage = 'models'; sidebarOpen = false; fetchModelList()">
+                    <i class="fas fa-robot"></i>
+                    <span>Quản Lý Mô Hình</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'test' }"
+                    @click="currentPage = 'test'; sidebarOpen = false; fetchModelList(); applyDefaultModelForTest()">
+                    <i class="fas fa-comments"></i>
+                    <span>Kiểm thử</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'training' }"
+                    @click="currentPage = 'training'; sidebarOpen = false; fetchModelList(); applyDefaultModelForTraining()">
+                    <i class="fas fa-graduation-cap"></i>
+                    <span>Training</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'datasets' }"
+                    @click="currentPage = 'datasets'; sidebarOpen = false">
+                    <i class="fas fa-database"></i>
+                    <span>Dataset</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'cluster' }"
+                    @click="currentPage = 'cluster'; sidebarOpen = false; fetchClusterResources()">
+                    <i class="fas fa-network-wired"></i>
+                    <span>Cluster</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'monitoring' }"
+                    @click="currentPage = 'monitoring'; sidebarOpen = false">
+                    <i class="fas fa-chart-line"></i>
+                    <span>Giám Sát</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'settings' }"
+                    @click="currentPage = 'settings'; sidebarOpen = false; fetchModelList(); fetchSettings()">
+                    <i class="fas fa-cog"></i>
+                    <span>Cài Đặt</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'about' }"
+                    @click="currentPage = 'about'; sidebarOpen = false">
+                    <i class="fas fa-info-circle"></i>
+                    <span>Giới thiệu</span>
+                </a>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <header class="header">
+                <button class="btn btn-outline btn-icon menu-toggle" @click="sidebarOpen = !sidebarOpen"
+                    :aria-expanded="sidebarOpen"
+                    aria-label="Mở menu">
+                    <i class="fas fa-bars"></i>
+                </button>
+                <h1 class="header-title" x-text="getPageTitle()"></h1>
+            </header>
+
+            <!-- Content -->
+            <div class="content" id="page-container">
+                <!-- Dynamic Page Content -->
+                <div x-html="pageContent"></div>
+            </div>
+    </div>
+
+    <script src="/_static/js/app.js?v=2"></script>
+</body>
+
+</html>

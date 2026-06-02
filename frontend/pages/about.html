@@ -1,0 +1,121 @@
+<div class="about-wrap">
+    <!-- Hero (header gọn) -->
+    <section class="about-hero">
+        <div class="about-hero-bg"></div>
+        <div class="about-hero-inner">
+            <div class="about-logo"><i class="fas fa-brain"></i></div>
+            <h1 class="about-title">Synapse AI V2.0</h1>
+            <p class="about-tagline">Nền tảng MLOps Phân tán — Inference, Training & Quản trị Cluster AI</p>
+        </div>
+    </section>
+
+    <!-- Thông tin Môi trường (System Environment) -->
+    <section class="about-section">
+        <h2 class="about-h2"><i class="fas fa-server"></i> Môi trường Thực thi (Environment)</h2>
+        <table class="about-table">
+            <thead>
+                <tr>
+                    <th>Thành phần (Component)</th>
+                    <th>Phiên bản / Công nghệ</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Hệ điều hành / Kiến trúc</td>
+                    <td x-text="(stats.os || 'Windows/Linux') + ' ' + (stats.arch || '')"></td>
+                </tr>
+                <tr>
+                    <td>Network Discovery Mode</td>
+                    <td>
+                        <span class="badge" style="background: var(--surface-hover); color: var(--primary); padding: 4px 8px; border-radius: 4px;" x-text="systemInfo.network_discovery || 'Unknown'"></span>
+                    </td>
+                </tr>
+                <tr>
+                    <td>PyTorch Version</td>
+                    <td><strong style="color:var(--primary)" x-text="stats.pytorch_version || 'N/A'"></strong></td>
+                </tr>
+                <tr>
+                    <td>CUDA / GPU Backend</td>
+                    <td><strong style="color:var(--success)" x-text="stats.cuda_version || 'N/A'"></strong></td>
+                </tr>
+                <tr>
+                    <td>Transformers Library</td>
+                    <td x-text="stats.transformers_version || 'N/A'"></td>
+                </tr>
+                <tr>
+                    <td>Accelerate / PEFT</td>
+                    <td>Có sẵn (Built-in)</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <!-- Kiến trúc -->
+    <section class="about-section">
+        <h2 class="about-h2"><i class="fas fa-sitemap"></i> Kiến trúc cốt lõi</h2>
+        <div class="about-arch-block">
+            <p><strong>1. Latency-Aware Collaborative Partitioning (LACP)</strong><br>
+            Thuật toán tự động đo đạc độ trễ mạng, băng thông và năng lực tính toán (TFLOPS) của từng Node trong Cluster để phân chia (Shard) số lượng Layer phù hợp của LLM. Tránh hiện tượng nghẽn cổ chai (Bottleneck) ở các Node yếu.</p>
+            
+            <p style="margin-top:12px"><strong>2. Fault-Tolerant Distributed Pipeline</strong><br>
+            Cơ chế Pipeline Parallelism sử dụng gRPC với khả năng Retry và Auto-Discovery. Nếu một Node mất kết nối, Cluster sẽ tự động cấu hình lại (Re-partition) các Layer sang các Node còn lại trong vòng vài giây.</p>
+
+            <p style="margin-top:12px"><strong>3. Parameter-Efficient Fine-Tuning (PEFT/LoRA)</strong><br>
+            Hỗ trợ huấn luyện tinh chỉnh trực tiếp trên Web UI với kỹ thuật LoRA, tiết kiệm tối đa VRAM, xuất Checkpoint an toàn và tái sử dụng cho Inference.</p>
+        </div>
+    </section>
+
+    <!-- Mục tiêu dự án -->
+    <section class="about-section">
+        <h2 class="about-h2"><i class="fas fa-bullseye"></i> Mục tiêu dự án</h2>
+        <div class="about-goals">
+            <div class="about-goal">
+                <span class="about-goal-num">1</span>
+                <div>
+                    <strong>Phá vỡ giới hạn Phần cứng</strong> — Chạy các Model siêu lớn (70B, 405B) bằng cách gộp VRAM/RAM từ nhiều thiết bị cá nhân/IoT qua mạng nội bộ hoặc Tailscale.
+                </div>
+            </div>
+            <div class="about-goal">
+                <span class="about-goal-num">2</span>
+                <div>
+                    <strong>Quản trị AI All-in-One</strong> — Tích hợp đầy đủ quy trình MLOps: Quản lý Model, Đánh giá (Benchmark), Dataset, Huấn luyện và Triển khai API chuẩn OpenAI.
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Tác giả: Team NCKH_2026 -->
+    <section class="about-section">
+        <h2 class="about-h2"><i class="fas fa-users"></i> Đội ngũ Phát triển (Team NCKH_2026)</h2>
+        <table class="about-table">
+            <thead>
+                <tr>
+                    <th>Thành viên</th>
+                    <th>Vai trò chính (Core Role)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Lê Quang Thọ</td>
+                    <td>Team Lead / AI Architect / Core Algorithms</td>
+                </tr>
+                <tr>
+                    <td>Nguyễn Văn Sáng</td>
+                    <td>Model Inference Engine / GPU Optimization</td>
+                </tr>
+                <tr>
+                    <td>Đỗ Văn Đạt</td>
+                    <td>Distributed Cluster / Pipeline Parallelism</td>
+                </tr>
+                <tr>
+                    <td>Đoàn Văn Hùng</td>
+                    <td>Backend API / Tailscale Integration</td>
+                </tr>
+                <tr>
+                    <td>Nguyễn Như Duy Hưng</td>
+                    <td>UI/UX Engineering / Hardware Benchmarking</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+</div>

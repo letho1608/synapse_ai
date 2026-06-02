@@ -1,0 +1,12 @@
+[MAIN] step=0 seq_len=5 publishing
+[A] step=0 layers 0-1 33ms
+[B] step=0 layer 2 14ms
+[C] step=0 layer 3+head 88ms token=123846
+[MAIN] step=1 seq_len=6 publishing
+[A] step=1 layers 0-1 33ms
+[B] step=1 layer 2 16ms
+[C] step=1 layer 3+head 87ms token=55626
+[MAIN] step=2 seq_len=7 publishing
+[A] step=2 layers 0-1 40ms
+[B] step=2 layer 2 17ms
+[C] step=2 layer 3+head 126ms token=131717
