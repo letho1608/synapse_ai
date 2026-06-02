@@ -2820,7 +2820,17 @@ class ChatGPTAPI:
       except Exception:
         ts_nodes = []
       total_tailscale_devices = len(ts_nodes)
-      ts_map = {n.get("device_id", ""): n for n in ts_nodes if n.get("device_id")}
+      
+      # Ánh xạ cả theo synapse_node_id và device_id để đảm bảo lookup khớp chính xác
+      ts_map = {}
+      for n in ts_nodes:
+        if n.get("synapse_node_id"):
+          ts_map[n["synapse_node_id"]] = n
+        if n.get("device_id"):
+          ts_map[n["device_id"]] = n
+        for addr in n.get("addresses", []):
+          if addr:
+            ts_map[addr] = n
 
       # Lấy metrics máy này
       try:
@@ -2871,7 +2881,11 @@ class ChatGPTAPI:
         gpu_util = gpu_util_self if is_self else None
         ram_used = ram_used_self if is_self else None
 
-        node_ip = ts_info.get("addresses", [None])[0] or node_id
+        # Xác định IP của node một cách thông minh (từ Tailscale, P2P peer, hoặc fallback)
+        peer_obj = next((p for p in self.node.peers if p.id() == node_id), None) if not is_self else None
+        peer_ip = peer_obj.addr().split(':')[0] if peer_obj else None
+        
+        node_ip = ts_info.get("addresses", [None])[0] or peer_ip or ("127.0.0.1" if is_self else node_id)
         result.append({
           "node_id": node_id,
           "name": display_name,
