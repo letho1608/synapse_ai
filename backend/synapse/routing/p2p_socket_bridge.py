@@ -129,7 +129,10 @@ class P2PSocketBridge:
 
         try:
             host, port_str = address.split(":")
-            reader, writer = await asyncio.open_connection(host, int(port_str))
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, int(port_str)),
+                timeout=timeout
+            )
 
             await self._send_handshake(writer, PACKET_TYPE_HANDSHAKE)
 

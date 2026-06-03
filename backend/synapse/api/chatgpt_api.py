@@ -1558,7 +1558,7 @@ class ChatGPTAPI:
       except Exception:
         pass
 
-      return web.json_response({
+      return {
         "cpu": cpu_percent,
         "memory": memory_percent,
         "memory_used_gb": memory_used_gb,
@@ -1599,9 +1599,25 @@ class ChatGPTAPI:
         "disk_read_count": disk_read_count,
         "disk_write_count": disk_write_count,
         "process_count": process_count
-      })
+      }
     except Exception as e:
-      return web.json_response({"detail": str(e)}, status=500)
+      return {"detail": str(e), "error": True}
+
+  async def handle_get_system_stats(self, request):
+    return web.json_response(self.get_system_stats_dict())
+
+  async def handle_ws_metrics(self, request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    try:
+      while True:
+        stats = self.get_system_stats_dict()
+        # Wrap it in the format expected by frontend
+        await ws.send_json({"type": "metrics", "stats": stats})
+        await asyncio.sleep(1)
+    except Exception:
+      pass
+    return ws
 
   async def handle_get_system_info(self, request):
       """Thông tin dự án / phiên bản cho trang About."""
@@ -1626,8 +1642,10 @@ class ChatGPTAPI:
       # Detect network discovery mode
       try:
           discovery_type = "Unknown"
-          if hasattr(self.node, "discovery") and self.node.discovery:
-              discovery_type = self.node.discovery.__class__.__name__.replace("Discovery", "")
+          if hasattr(self, "discovery_module") and self.discovery_module:
+              discovery_type = self.discovery_module
+          elif hasattr(self.node, "discovery") and self.node.discovery:
+              discovery_type = self.node.discovery.__class__.__name__.replace("Discovery", "").lower()
       except Exception:
           discovery_type = "Unknown"
       return web.json_response({
@@ -1864,12 +1882,25 @@ class ChatGPTAPI:
         self.default_model = model
       
       discovery_module = (body.get("discovery_module") or "").strip()
+      requires_restart = False
       if discovery_module in ["udp", "tailscale", "manual"]:
+        old_module = getattr(self, "discovery_module", "tailscale")
         self.discovery_module = discovery_module
+        if old_module != discovery_module:
+            requires_restart = True
         
       self._save_settings()
       self.log_activity("Cài đặt đã lưu", "-", "success")
-      return web.json_response({"success": True, "default_model": self.default_model, "discovery_module": getattr(self, "discovery_module", "")})
+      
+      if requires_restart:
+          async def delayed_restart():
+              import asyncio, os
+              await asyncio.sleep(1.0)
+              os._exit(42)
+          asyncio.create_task(delayed_restart())
+          return web.json_response({"success": True, "restarted": True, "default_model": self.default_model, "discovery_module": getattr(self, "discovery_module", "")})
+      
+      return web.json_response({"success": True, "restarted": False, "default_model": self.default_model, "discovery_module": getattr(self, "discovery_module", "")})
     except Exception as e:
       if DEBUG >= 2:
         traceback.print_exc()
@@ -1877,9 +1908,11 @@ class ChatGPTAPI:
 
   async def handle_get_network_nodes(self, request):
     try:
-      discovery_type = "tailscale"
-      if hasattr(self.node, "discovery") and self.node.discovery:
-        discovery_type = self.node.discovery.__class__.__name__.replace("Discovery", "").lower()
+      discovery_type = "Unknown"
+      if hasattr(self, "discovery_module") and self.discovery_module:
+          discovery_type = self.discovery_module
+      elif hasattr(self.node, "discovery") and self.node.discovery:
+          discovery_type = self.node.discovery.__class__.__name__.replace("Discovery", "").lower()
         
       results = []
       if discovery_type == "tailscale":

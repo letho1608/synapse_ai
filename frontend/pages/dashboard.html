@@ -30,6 +30,11 @@
                 </div>
             </div>
             
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; position:relative; z-index:2; border-top: 1px solid var(--border); padding-top: 8px;">
+                <div style="font-size:10px; color:var(--text-muted);">Disk Util: <span style="color:var(--text-primary); font-weight:bold;" x-text="(stats.disk_percent || 0) + '%'"></span></div>
+                <div style="font-size:10px; color:var(--text-muted); text-align:right;">Swap: <span style="color:var(--text-primary); font-weight:bold;" x-text="(stats.swap_percent || 0) + '%'"></span></div>
+            </div>
+            
             <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:12px; position:relative; z-index:2; border-top: 1px solid var(--border); padding-top: 8px;">
                 <span class="text-muted">Uptime</span>
                 <span x-text="stats.uptime || '-'"></span>
@@ -37,9 +42,7 @@
             <!-- Sparkline background -->
             <div style="position:absolute; bottom:0; left:0; right:0; height:40px; z-index:1; opacity:0.3; display:flex;">
                 <div style="flex:1"><canvas id="dashCpuSparkline"></canvas></div>
-                <template x-if="stats.gpu_name">
-                    <div style="flex:1"><canvas id="dashVramSparkline"></canvas></div>
-                </template>
+                <div style="flex:1" x-show="stats.gpu_name"><canvas id="dashVramSparkline"></canvas></div>
             </div>
         </div>
 

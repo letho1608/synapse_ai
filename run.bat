@@ -5,12 +5,10 @@ color 0A
 echo ===================================================
 echo               SYNAPSE AI LAUNCHER                  
 echo ===================================================
-echo.
-echo Starting Backend Server...
-start /b cmd /c "cd backend && set PYTHONPATH=. && python synapse/main.py"
+echo Starting Synapse Server (Backend + Frontend)...
+python main.py
 
-echo Starting Frontend Dev Server...
-start /b cmd /c "cd frontend && npm install && npm run dev"
+echo.
 
 echo.
 echo Both servers are starting in the background of this window.

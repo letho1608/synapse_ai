@@ -92,14 +92,7 @@ function appState() {
                 clusterStrategyName: '',
                 clusterTotalLayers: 32,
                 clusterPeerGraph: {},
-                _flopsChart: null,
-                _cpuChart: null,
-                _ramChart: null,
-                _vramChart: null,
-                _lossChart: null,
-                _dashboardCpuChart: null,
-                _dashboardVramChart: null,
-                _layerChart: null,
+                // Removed chart refs to avoid Alpine Proxy issues
                 _lossHistory: [],
                 _monitoringHistory: { labels: [], cpu: [], ram: [], vram: [] },
                 // === Model filter ===
@@ -365,7 +358,13 @@ function appState() {
                             await this.fetchModelStatus();
                             await this.fetchModelList();
                             await this.fetchActivity();
-                            alert("Cài đặt đã được lưu. Lưu ý: Thay đổi Network Discovery Mode cần phải khởi động lại Server để có hiệu lực.");
+                            if (data.restarted) {
+                                alert("Cài đặt đã được lưu. Hệ thống đang tự động khởi động lại mạng dưới nền để áp dụng phương thức kết nối mới. Vui lòng đợi trong giây lát...");
+                                this.isOffline = true;
+                                setTimeout(() => { this.fetchSystemInfo(); }, 3000);
+                            } else {
+                                alert("Cài đặt đã được lưu thành công.");
+                            }
                         } else {
                             alert(data.message || 'Lưu thất bại');
                         }
@@ -800,77 +799,71 @@ function appState() {
 
                 renderDashboardSparklines() {
                     if (typeof Chart === 'undefined') return;
-                    
-                    const createSparkline = (canvasId, chartRefKey, dataColor, dataArr, maxVal) => {
-                        const canvas = document.getElementById(canvasId);
-                        if (!canvas) return this[chartRefKey];
-                        if (this[chartRefKey] && this[chartRefKey].canvas !== canvas) {
-                            this[chartRefKey].destroy();
-                            this[chartRefKey] = null;
-                        }
-                        if (this[chartRefKey]) {
-                            this[chartRefKey].data.labels = this._monitoringHistory.labels;
-                            this[chartRefKey].data.datasets[0].data = dataArr;
-                            this[chartRefKey].update('none');
-                            return this[chartRefKey];
-                        } else {
-                            const ctx = canvas.getContext('2d');
-                            // Create gradient
-                            let gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
-                            gradient.addColorStop(0, dataColor + '40'); // 25% opacity
-                            gradient.addColorStop(1, dataColor + '00'); // 0% opacity
+                    setTimeout(() => {
+                        const createSparkline = (canvasId, dataColor, dataArr, maxVal) => {
+                            const canvas = document.getElementById(canvasId);
+                            if (!canvas) return;
+                            let chartRef = Chart.getChart(canvas);
+                            if (chartRef) {
+                                chartRef.data.labels = this._monitoringHistory.labels;
+                                chartRef.data.datasets[0].data = dataArr;
+                                chartRef.update('none');
+                            } else {
+                                const ctx = canvas.getContext('2d');
+                                // Create gradient
+                                let gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+                                gradient.addColorStop(0, dataColor + '40'); // 25% opacity
+                                gradient.addColorStop(1, dataColor + '00'); // 0% opacity
 
-                            return new Chart(canvas, {
-                                type: 'line',
-                                data: {
-                                    labels: this._monitoringHistory.labels,
-                                    datasets: [{
-                                        data: dataArr,
-                                        borderColor: dataColor,
-                                        backgroundColor: gradient,
-                                        borderWidth: 1.5,
-                                        pointRadius: 0,
-                                        fill: true,
-                                        tension: 0.3
-                                    }]
-                                },
-                                options: {
-                                    responsive: true,
-                                    maintainAspectRatio: false,
-                                    animation: false,
-                                    plugins: { legend: { display: false }, tooltip: { enabled: false } },
-                                    scales: {
-                                        x: { display: false },
-                                        y: { display: false, min: 0, max: maxVal }
+                                new Chart(canvas, {
+                                    type: 'line',
+                                    data: {
+                                        labels: this._monitoringHistory.labels,
+                                        datasets: [{
+                                            data: dataArr,
+                                            borderColor: dataColor,
+                                            backgroundColor: gradient,
+                                            borderWidth: 1.5,
+                                            pointRadius: 0,
+                                            fill: true,
+                                            tension: 0.3
+                                        }]
                                     },
-                                    layout: { padding: 0 }
-                                }
-                            });
-                        }
-                    };
+                                    options: {
+                                        responsive: true,
+                                        maintainAspectRatio: false,
+                                        animation: false,
+                                        plugins: { legend: { display: false }, tooltip: { enabled: false } },
+                                        scales: {
+                                            x: { display: false },
+                                            y: { display: false, min: 0, max: maxVal }
+                                        },
+                                        layout: { padding: 0 }
+                                    }
+                                });
+                            }
+                        };
 
-                    this._dashboardCpuChart = createSparkline('dashCpuSparkline', '_dashboardCpuChart', '#38BDF8', this._monitoringHistory.cpu, 100);
-                    const vramMax = this.stats.gpu_vram_gb ? this.stats.gpu_vram_gb : 24;
-                    this._dashboardVramChart = createSparkline('dashVramSparkline', '_dashboardVramChart', '#8B5CF6', this._monitoringHistory.vram, vramMax);
+                        createSparkline('dashCpuSparkline', '#38BDF8', this._monitoringHistory.cpu, 100);
+                        const vramMax = this.stats.gpu_vram_gb ? this.stats.gpu_vram_gb : 24;
+                        createSparkline('dashVramSparkline', '#8B5CF6', this._monitoringHistory.vram, vramMax);
+                    }, 50);
                 },
 
                 renderMonitoringCharts() {
                     if (typeof Chart === 'undefined') return;
+                    setTimeout(() => {
 
-                    const updateOrCreate = (canvasId, chartRef, label, dataColor, dataArr, maxVal) => {
+                    const updateOrCreate = (canvasId, label, dataColor, dataArr, maxVal) => {
                         const canvas = document.getElementById(canvasId);
-                        if (!canvas) return chartRef;
-                        if (chartRef && chartRef.canvas !== canvas) {
-                            chartRef.destroy();
-                            chartRef = null;
-                        }
+                        if (!canvas) return;
+                        let chartRef = Chart.getChart(canvas);
                         if (chartRef) {
                             chartRef.data.labels = this._monitoringHistory.labels;
                             chartRef.data.datasets[0].data = dataArr;
                             chartRef.update('none');
-                            return chartRef;
                         } else {
-                            return new Chart(canvas, {
+                            new Chart(canvas, {
                                 type: 'line',
                                 data: {
                                     labels: this._monitoringHistory.labels,
@@ -898,10 +891,11 @@ function appState() {
                         }
                     };
 
-                    this._cpuChart = updateOrCreate('cpuChart', this._cpuChart, 'CPU (%)', '#0EA5E9', this._monitoringHistory.cpu, 100);
-                    this._ramChart = updateOrCreate('ramChart', this._ramChart, 'RAM (%)', '#10B981', this._monitoringHistory.ram, 100);
+                    updateOrCreate('cpuChart', 'CPU (%)', '#0EA5E9', this._monitoringHistory.cpu, 100);
+                    updateOrCreate('ramChart', 'RAM (%)', '#10B981', this._monitoringHistory.ram, 100);
                     const vramMax = this.stats.gpu_vram_gb ? this.stats.gpu_vram_gb : 24;
-                    this._vramChart = updateOrCreate('vramChart', this._vramChart, 'VRAM (GB)', '#8B5CF6', this._monitoringHistory.vram, vramMax);
+                    updateOrCreate('vramChart', 'VRAM (GB)', '#8B5CF6', this._monitoringHistory.vram, vramMax);
+                    }, 50);
                 },
 
                 renderLossChart() {
@@ -917,11 +911,12 @@ function appState() {
                         }
                     }
 
-                    if (this._lossChart) {
-                        this._lossChart.data.datasets[0].data = this._lossHistory;
-                        this._lossChart.update('none');
-                    } else if (this._lossHistory.length > 0) {
-                        this._lossChart = new Chart(canvas, {
+                    let chartRef = Chart.getChart(canvas);
+                    if (chartRef) {
+                        chartRef.data.datasets[0].data = this._lossHistory;
+                        chartRef.update('none');
+                    } else {
+                        new Chart(canvas, {
                             type: 'line',
                             data: {
                                 datasets: [{
@@ -1122,13 +1117,12 @@ function appState() {
 
                 // ===== CHARTS & MONITORING =====
                 destroyAllCharts() {
-                    const charts = ['_dashCpuChart', '_dashVramChart', '_cpuChart', '_ramChart', '_vramChart', '_lossChart', '_layerChart', '_flopsChart'];
-                    charts.forEach(c => {
-                        if (this[c]) {
-                            this[c].destroy();
-                            this[c] = null;
-                        }
-                    });
+                    if (typeof Chart !== 'undefined') {
+                        Object.values(Chart.instances).forEach(chart => {
+                            chart.destroy();
+                        });
+                    }
+                },
                 },
 
                 // ===== CLUSTER RESOURCES =====
@@ -1159,8 +1153,9 @@ function appState() {
 
                     const layerCanvas = document.getElementById('layerChart');
                     if (layerCanvas) {
-                        if (this._layerChart) { this._layerChart.destroy(); this._layerChart = null; }
-                        this._layerChart = new Chart(layerCanvas, {
+                        let chartRef = Chart.getChart(layerCanvas);
+                        if (chartRef) { chartRef.destroy(); }
+                        new Chart(layerCanvas, {
                             type: 'bar',
                             data: {
                                 labels: nodes.map(n => n.name),

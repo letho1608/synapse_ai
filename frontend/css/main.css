@@ -423,37 +423,7 @@
             border-bottom: none;
             padding-bottom: 0;
         }
-/* === HARDCORE MLOPS GRAFANA-STYLE OVERRIDES === */
-.theme-dark {
-    --primary: #10B981; /* Grafana Green */
-    --primary-dark: #059669;
-    --primary-light: #34D399;
-    --primary-bg: rgba(16, 185, 129, 0.1);
-    --secondary: #334155;
-    --secondary-light: #475569;
-    --background: #0f172a; /* Deep dark blue */
-    --surface: #1e293b;
-    --surface-hover: #334155;
-    --text-primary: #f8fafc;
-    --text-secondary: #cbd5e1;
-    --text-muted: #64748b;
-    --border: #334155;
-    --divider: #1e293b;
-    --spacing-md: 10px; /* Denser padding */
-    --spacing-lg: 14px;
-    --spacing-xl: 20px;
-    --font-size-md: 13px; /* Smaller font */
-    --font-size-sm: 12px;
-    --font-size-xs: 11px;
-    --font-family: 'Inter', -apple-system, monospace;
-}
-
-body {
-    font-family: var(--font-family);
-    background-color: var(--background);
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-}
+/* Legacy overrides removed in favor of production.css dark theme */
 
 .card {
     background: var(--surface);

@@ -8,8 +8,8 @@ Synapse.CONFIG = {
   POLL_INTERVAL_FAST: 800,
   CACHE_TTL_MS: 30000,
   STALE_THRESHOLD_MS: 30000,
-  WS_URL: null,
-  WS_ENABLED: false,
+  WS_URL: (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/v1/ws/metrics',
+  WS_ENABLED: true,
   TERMINAL_MAX_LINES: 1000,
   CLUSTER_COLORS: [
     '#0F766E', '#0EA5E9', '#D97706', '#7C3AED', '#059669',

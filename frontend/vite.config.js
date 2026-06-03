@@ -8,6 +8,7 @@ export default defineConfig({
         target: 'http://127.0.0.1:52415',
         changeOrigin: true,
         secure: false,
+        ws: true,
       },
       '/_static': {
         target: 'http://localhost:5173',
