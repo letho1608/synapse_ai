@@ -126,15 +126,14 @@ def encode_tensor(
     else:
         meta_bytes = struct.pack("!H", 0)
 
-    # Header now includes a bit for 'H' meta len (high bit of ndim or reserved)
-    # Actually just use 2 bytes for meta len consistently for simplicity
+    # Header now uses 2 bits for compression flag (0=none, 1=zlib, 2=lz4)
     header = struct.pack(
         "!4sHHII",
         MAGIC,
         dtype_code,
         ndim,
         uncompressed_size,
-        (compressed_size << 1) | is_compressed_flag,
+        (compressed_size << 2) | is_compressed_flag,
     )
 
     return header + shape_bytes + meta_bytes + data_payload
@@ -151,8 +150,8 @@ def decode_tensor(data: bytes) -> Tuple[np.ndarray, Optional[Dict]]:
     magic, dtype_code, ndim, uncompressed_size, compr_field = struct.unpack(
         "!4sHHII", data[:HEADER_SIZE]
     )
-    is_compressed = compr_field & 1
-    compressed_size = compr_field >> 1
+    is_compressed = compr_field & 3
+    compressed_size = compr_field >> 2
 
     if magic != MAGIC:
         raise ValueError(f"Invalid magic bytes: {magic!r}")

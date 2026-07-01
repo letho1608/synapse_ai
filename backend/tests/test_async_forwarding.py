@@ -53,7 +53,8 @@ class TestBinaryCodec:
         assert returned_meta["request_id"] == "abc-123"
 
     def test_compression_large_tensor(self):
-        t = np.random.randn(512, 4096).astype(np.float32)
+        # Use repetitive data that compresses well (constant column pattern)
+        t = np.ones((512, 4096), dtype=np.float32)
         uncompressed = encode_tensor(t, compress=False)
         compressed = encode_tensor(t, compress=True)
         assert len(compressed) < len(uncompressed), f"{len(compressed)} >= {len(uncompressed)}"
@@ -94,7 +95,7 @@ class TestBinaryCodec:
         t = np.ones((3, 4), dtype=np.float32)
         encoded = encode_tensor(t)
         assert encoded[:4] == MAGIC
-        assert len(encoded) == HEADER_SIZE + 2 * len(t.shape) + 1 + t.nbytes
+        assert len(encoded) == HEADER_SIZE + 2 * len(t.shape) + 2 + t.nbytes
 
     def test_large_shape(self):
         t = np.ones((128, 512, 768), dtype=np.float32)
