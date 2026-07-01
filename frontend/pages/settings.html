@@ -70,6 +70,42 @@
 
     <div class="card" style="margin-bottom:0;grid-column: 1 / -1">
         <div class="card-header" style="margin-bottom:8px">
+            <h2 class="card-title" style="font-size:12px; text-transform:uppercase;"><i class="fas fa-rocket" style="margin-right:6px;color:var(--warning)"></i>Distributed Engine Optimization</h2>
+        </div>
+        <div style="padding: 0; display:grid; grid-template-columns: repeat(3, 1fr); gap:20px;">
+            <div class="form-group">
+                <label class="form-label" style="font-size:11px; text-transform:uppercase">Load Quantization</label>
+                <select class="form-select" x-model="settingsForm.load_quantization" style="font-size:12px; padding:6px 10px">
+                    <option value="auto">Auto (Recommended)</option>
+                    <option value="4bit">Force 4-bit (VRAM Saver)</option>
+                    <option value="8bit">Force 8-bit</option>
+                    <option value="none">Disabled (Full Precision)</option>
+                </select>
+                <p class="text-muted" style="font-size:9px; margin-top:4px">Reduces VRAM usage on weak nodes.</p>
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label" style="font-size:11px; text-transform:uppercase">Lookahead Window</label>
+                <div style="display:flex;align-items:center;gap:10px">
+                    <input type="range" class="form-range" min="1" max="10" step="1" x-model.number="settingsForm.lookahead_window" style="flex:1">
+                    <span style="font-family:monospace;font-size:12px;width:30px" x-text="settingsForm.lookahead_window || 3"></span>
+                </div>
+                <p class="text-muted" style="font-size:9px; margin-top:4px">Number of tokens to speculate. High value increases speed on laggy networks.</p>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" style="font-size:11px; text-transform:uppercase">Transport Quantization</label>
+                <select class="form-select" x-model="settingsForm.transport_quantization" style="font-size:12px; padding:6px 10px">
+                    <option value="int8">INT8 (4x Bandwidth Saving)</option>
+                    <option value="none">None (Full Precision)</option>
+                </select>
+                <p class="text-muted" style="font-size:9px; margin-top:4px">Speeds up Tailscale/WAN transfers.</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="card" style="margin-bottom:0;grid-column: 1 / -1">
+        <div class="card-header" style="margin-bottom:8px">
             <h2 class="card-title" style="font-size:12px; text-transform:uppercase;"><i class="fas fa-sliders-h" style="margin-right:6px;color:#10B981"></i>General</h2>
         </div>
         <div style="padding: 0; display:flex; gap:20px;">

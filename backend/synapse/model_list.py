@@ -11,7 +11,6 @@ from typing import Dict
 HF_MODELS: Dict[str, str] = {}
 HF_MODEL_PARAMS: Dict[str, str] = {}
 HF_MODEL_LAYERS: Dict[str, int] = {}
-VISION_MODELS = set()
 DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 def _load_dynamic_config():
@@ -33,9 +32,6 @@ def _load_dynamic_config():
 
                 if entry.get("num_hidden_layers"):
                     HF_MODEL_LAYERS[repo_id] = entry["num_hidden_layers"]
-
-                if "vision" in entry.get("capabilities", []) or "vision" in entry.get("pipeline_tag", "").lower():
-                    VISION_MODELS.add(repo_id)
     except Exception:
         pass
 
@@ -57,10 +53,24 @@ def resolve_hf_id(model_name: str) -> str:
     for k, v in HF_MODELS.items():
         if k.lower() == key.lower():
             return v
-
+            
+    norm_key = key.lower().replace("-", "").replace("_", "")
+    key_parts = key.lower().split(":")
+    norm_parts = norm_key.split(":")
+    
+    best_match = None
     for k, v in HF_MODELS.items():
-        if key.split(":")[0].lower() in k.lower():
-            if ":" in key and key.split(":")[1].lower() in v.lower():
-                return v
+        norm_k = k.lower().replace("-", "").replace("_", "")
+        
+        if norm_parts[0] in norm_k:
+            if len(norm_parts) > 1 and norm_parts[1] in v.lower():
+                if "coder" not in norm_key and "coder" in v.lower():
+                    if best_match is None:
+                        best_match = v
+                    continue
+                if best_match is None or ("instruct" in v.lower() and "instruct" not in best_match.lower()):
+                    best_match = v
+                if "instruct" in v.lower() and "coder" not in v.lower():
+                    return v
 
-    return DEFAULT_MODEL
+    return best_match if best_match else model_name

@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+venv/
 checkpoints/
 logs/
 data/models/
@@ -13,6 +14,10 @@ data/models/
 .code-graph-review/
 test_logs/
 .synapse_checkpoints/
-
 .hf_cache/
 .env
+node_modules/
+dist/
+*.egg-info/
+.DS_Store
+Thumbs.db

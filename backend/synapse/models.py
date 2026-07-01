@@ -6,7 +6,7 @@ Thay thế model_cards cũ bằng hệ thống registry linh hoạt hơn
 
 from synapse.inference.shard import Shard
 from typing import Optional, List, Dict, Any
-from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS
+from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id
 
 
 # Registry đơn giản để quản lý mô hình
@@ -50,6 +50,9 @@ def get_repo(model_id: str, inference_engine_classname: str) -> Optional[str]:
         # Dự phòng: Nếu có trong danh sách HF thì dùng chính model_id làm path
         if model_id in HF_MODELS or any(v == model_id for v in HF_MODELS.values()):
             return model_id
+        resolved = resolve_hf_id(model_id)
+        if resolved:
+            return resolved
         return None
     
     model_info = _MODEL_REGISTRY[model_id]
@@ -84,6 +87,9 @@ def build_base_shard(model_id: str, inference_engine_classname: str) -> Optional
     Returns:
         Shard object hoặc None
     """
+    if model_id == "__none__":
+        return None
+        
     n_layers = 0
     
     if model_id in _MODEL_REGISTRY:
@@ -92,23 +98,27 @@ def build_base_shard(model_id: str, inference_engine_classname: str) -> Optional
     elif model_id in HF_MODEL_LAYERS:
         n_layers = HF_MODEL_LAYERS[model_id]
     else:
-        normalized = model_id.lower().replace(":", "-").replace("_", "-")
-        if normalized in HF_MODEL_LAYERS:
-            n_layers = HF_MODEL_LAYERS[normalized]
+        resolved = resolve_hf_id(model_id)
+        if resolved in HF_MODEL_LAYERS:
+            n_layers = HF_MODEL_LAYERS[resolved]
         else:
-            for k, v in HF_MODEL_LAYERS.items():
-                if k.lower() == normalized:
-                    n_layers = v
-                    break
-            # Also check registered models with normalized key
-            if n_layers < 1:
-                if normalized in _MODEL_REGISTRY:
-                    n_layers = _MODEL_REGISTRY[normalized].get("layers", 0)
-                else:
-                    for reg_key, reg_info in _MODEL_REGISTRY.items():
-                        if reg_key.lower() == normalized:
-                            n_layers = reg_info.get("layers", 0)
-                            break
+            normalized = model_id.lower().replace(":", "-").replace("_", "-")
+            if normalized in HF_MODEL_LAYERS:
+                n_layers = HF_MODEL_LAYERS[normalized]
+            else:
+                for k, v in HF_MODEL_LAYERS.items():
+                    if k.lower() == normalized:
+                        n_layers = v
+                        break
+                # Also check registered models with normalized key
+                if n_layers < 1:
+                    if normalized in _MODEL_REGISTRY:
+                        n_layers = _MODEL_REGISTRY[normalized].get("layers", 0)
+                    else:
+                        for reg_key, reg_info in _MODEL_REGISTRY.items():
+                            if reg_key.lower() == normalized:
+                                n_layers = reg_info.get("layers", 0)
+                                break
     
     if n_layers < 1:
         return None
@@ -151,11 +161,16 @@ def get_model_info(model_id: str) -> Optional[Dict[str, Any]]:
     if model_id in _MODEL_REGISTRY:
         return _MODEL_REGISTRY[model_id]
     
-    if model_id in HF_MODELS.values():
+    # Don't resolve dummy test strings
+    if model_id == "__none__":
+        return None
+        
+    resolved = resolve_hf_id(model_id)
+    if resolved in HF_MODELS.values() or resolved in HF_MODELS:
         # Tạo info cơ bản cho model từ HF
         return {
-            "layers": HF_MODEL_LAYERS.get(model_id, 0),
-            "pretty_name": model_id
+            "layers": HF_MODEL_LAYERS.get(resolved, 0),
+            "pretty_name": resolved
         }
     return None
 

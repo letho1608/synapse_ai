@@ -142,13 +142,27 @@ def _fit_emoji(fit: str) -> str:
 
 
 def _load_model_db() -> list:
-    """Load hf_models.json from synapse/data/."""
+    """Load hf_models.json from synapse/config/."""
     try:
         data_path = os.path.join(os.path.dirname(__file__), "config", "hf_models.json")
-        with open(data_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if os.path.exists(data_path):
+            with open(data_path, "r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception:
-        return []
+        pass
+    return []
+
+def _save_model_db(db: list) -> bool:
+    """Save hf_models.json to synapse/config/."""
+    try:
+        data_path = os.path.join(os.path.dirname(__file__), "config", "hf_models.json")
+        os.makedirs(os.path.dirname(data_path), exist_ok=True)
+        with open(data_path, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        if DEBUG >= 1: print(f"[helpers] Failed to save model db: {e}")
+        return False
 
 
 def _fuzzy_find_model(model_name: str, db: list) -> Optional[dict]:

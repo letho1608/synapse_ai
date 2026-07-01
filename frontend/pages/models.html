@@ -9,6 +9,58 @@
     </div>
 </div>
 
+<!-- Hugging Face Search -->
+<div class="card" style="margin-bottom: var(--spacing-md); padding: 12px; background: var(--primary-bg); border-color: var(--primary-light)">
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom: 12px;">
+        <i class="fab fa-hugging-face" style="color:var(--primary); font-size:18px"></i>
+        <h3 style="margin:0; font-size:12px; text-transform:uppercase; color:var(--primary)">Search Hugging Face</h3>
+    </div>
+    <div style="display:flex; gap:8px">
+        <input type="text" class="form-input" placeholder="Search HF for models (e.g. llama-3, qwen-2.5)..." x-model="hfSearchQuery" @keyup.enter="searchHuggingFace()" style="font-size:12px; height:32px">
+        <button class="btn btn-primary btn-sm" @click="searchHuggingFace()" :disabled="hfSearchLoading" style="height:32px; padding:0 16px">
+            <i class="fas fa-search" x-show="!hfSearchLoading"></i>
+            <i class="fas fa-spinner fa-spin" x-show="hfSearchLoading"></i>
+        </button>
+    </div>
+
+    <!-- Search Results -->
+    <div x-show="hfSearchResults.length > 0" x-cloak style="margin-top:12px; border-top: 1px solid var(--border); padding-top:12px">
+        <div style="max-height: 250px; overflow-y: auto;">
+            <table class="table" style="font-size:11px">
+                <thead>
+                    <tr>
+                        <th>HF REPOSITORY</th>
+                        <th>TAGS</th>
+                        <th>DOWNLOADS</th>
+                        <th>ACTION</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="r in hfSearchResults" :key="r.name">
+                        <tr>
+                            <td style="font-weight:600" x-text="r.name"></td>
+                            <td><span class="badge badge-muted" style="font-size:9px" x-text="r.pipeline_tag"></span></td>
+                            <td class="text-muted" x-text="r.downloads.toLocaleString()"></td>
+                            <td>
+                                <button class="btn btn-primary btn-sm" style="padding:2px 8px; font-size:10px" 
+                                        :disabled="pullLoading === r.name || r.isDownloaded"
+                                        @click="pullModel(r.name)">
+                                    <i class="fas fa-download" x-show="!r.isDownloaded"></i>
+                                    <i class="fas fa-check" x-show="r.isDownloaded"></i>
+                                    <span x-text="r.isDownloaded ? 'LOCAL' : 'PULL'"></span>
+                                </button>
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+        <div style="text-align:right; margin-top:8px">
+            <button class="btn btn-outline btn-sm" @click="hfSearchResults = []" style="padding:2px 8px; font-size:10px">CLEAR RESULTS</button>
+        </div>
+    </div>
+</div>
+
 <div class="card" style="padding: 12px;">
     <!-- Status filter + search -->
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;align-items:center">
@@ -55,9 +107,7 @@
                         </td>
                         <td>
                             <span class="badge-grafana" style="color:#F59E0B; border-color:#F59E0B" x-show="m.pipeline_tag && (m.pipeline_tag.includes('text') || m.pipeline_tag.includes('chat'))">TEXT</span>
-                            <span class="badge-grafana" style="color:#8B5CF6; border-color:#8B5CF6" x-show="m.pipeline_tag && (m.pipeline_tag.includes('image') || m.pipeline_tag.includes('vision') || m.pipeline_tag.includes('video'))">VISION</span>
-                            <span class="badge-grafana" style="color:#0EA5E9; border-color:#0EA5E9" x-show="m.pipeline_tag && (m.pipeline_tag.includes('audio') || m.pipeline_tag.includes('speech') || m.pipeline_tag.includes('voice'))">AUDIO</span>
-                            <span class="badge-grafana" style="color:#cbd5e1; border-color:#cbd5e1" x-show="m.pipeline_tag && !m.pipeline_tag.includes('text') && !m.pipeline_tag.includes('chat') && !m.pipeline_tag.includes('image') && !m.pipeline_tag.includes('vision') && !m.pipeline_tag.includes('audio') && !m.pipeline_tag.includes('speech')" x-text="(m.pipeline_tag || '-').toUpperCase()"></span>
+                            <span class="badge-grafana" style="color:#cbd5e1; border-color:#cbd5e1" x-show="m.pipeline_tag && !m.pipeline_tag.includes('text') && !m.pipeline_tag.includes('chat')" x-text="(m.pipeline_tag || '-').toUpperCase()"></span>
                         </td>
                         <td>
                             <template x-if="m.isDownloaded">

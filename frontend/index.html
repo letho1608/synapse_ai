@@ -8,6 +8,10 @@
     <link rel="stylesheet" href="/_static/production.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <script src="/_static/unpkg.com/marked@13.0.0/marked.min.js"></script>
+    <script src="/_static/unpkg.com/dompurify@3.1.5/dist/purify.min.js"></script>
+    <script src="/_static/unpkg.com/@highlightjs/cdn-assets@11.9.0/highlight.min.js"></script>
+    <link rel="stylesheet" href="/_static/unpkg.com/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
     <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <link rel="stylesheet" href="/_static/css/main.css">
 </head>
@@ -49,6 +53,11 @@
                     @click="currentPage = 'training'; sidebarOpen = false; fetchModelList(); applyDefaultModelForTraining()">
                     <i class="fas fa-graduation-cap"></i>
                     <span>Training</span>
+                </a>
+                <a href="#" class="nav-item" :class="{ 'active': currentPage === 'merging' }"
+                    @click="currentPage = 'merging'; sidebarOpen = false">
+                    <i class="fas fa-object-group"></i>
+                    <span>Merging</span>
                 </a>
                 <a href="#" class="nav-item" :class="{ 'active': currentPage === 'datasets' }"
                     @click="currentPage = 'datasets'; sidebarOpen = false">

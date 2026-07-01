@@ -579,3 +579,55 @@
 .skeleton-box { height: 60px; width: 100%; margin-bottom: 12px; }
 .skeleton-card { background: var(--surface); border: 1px solid var(--border); padding: var(--spacing-md); border-radius: 8px; }
 .skeleton-chart { height: 260px; width: 100%; border-radius: 8px; }
+
+/* === Markdown styles in chat === */
+.markdown {
+    line-height: 1.6;
+    word-break: break-word;
+}
+.markdown p {
+    margin-bottom: 12px;
+}
+.markdown p:last-child {
+    margin-bottom: 0;
+}
+.markdown code {
+    background: var(--surface-hover);
+    padding: 2px 4px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 0.9em;
+}
+.markdown pre {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 12px;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin: 12px 0;
+}
+.markdown pre code {
+    background: transparent;
+    padding: 0;
+    color: inherit;
+}
+.markdown h1, .markdown h2, .markdown h3 {
+    margin: 16px 0 8px;
+    font-weight: 600;
+}
+.markdown ul, .markdown ol {
+    padding-left: 20px;
+    margin-bottom: 12px;
+}
+.markdown blockquote {
+    border-left: 4px solid var(--primary-light);
+    padding-left: 12px;
+    color: var(--text-secondary);
+    margin: 12px 0;
+}
+
+.badge-muted { background: var(--secondary-light); color: #fff; }
+.badge-primary { background: var(--primary); color: #fff; }
+.badge-warning { background: var(--warning); color: #fff; }
+.badge-success { background: var(--success); color: #fff; }
+.badge-error { background: var(--error); color: #fff; }

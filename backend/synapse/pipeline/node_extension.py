@@ -80,6 +80,9 @@ class DistributedPipelineExtension:
         if request_id is None:
             request_id = str(uuid.uuid4())
 
+        # Update controller settings from node before processing
+        self._controller.lookahead_window = getattr(self._node, "lookahead_window", 3)
+
         token_limit = (
             max_generate_tokens
             if isinstance(max_generate_tokens, int) and max_generate_tokens > 0
@@ -305,16 +308,23 @@ class DistributedPipelineExtension:
                 grad = {}
 
             async def send_grads(target_id: str, gradients):
-                data = {k: v.tobytes() for k, v in gradients.items()}
-                shapes = {k: list(v.shape) for k, v in gradients.items()}
-                dtypes = {k: str(v.dtype) for k, v in gradients.items()}
-                payload = json.dumps({
+                # Use binary codec for gradients (huge performance boost)
+                from synapse.transport.codec import encode_tensor
+                
+                # Combine all gradients into one binary blob or send one by one
+                # For simplicity and to reuse encode_tensor, we'll wrap them
+                encoded_grads = {}
+                for k, v in gradients.items():
+                    # Gradients are always Float32/Float16, we can quantize if needed
+                    # but usually we want high precision for grads. 
+                    # Let's use FP16 for transport if not already.
+                    encoded_grads[k] = encode_tensor(v.astype(np.float16), metadata={"param": k})
+
+                payload = {
                     "from_node": self._node.id,
                     "step": self._trainer._train_step,
-                    "data": {k: v.hex() for k, v in data.items()},
-                    "shapes": shapes,
-                    "dtypes": dtypes,
-                })
+                    "bin_grads": encoded_grads, # Map of param_name -> bytes
+                }
                 await self._node.event_router.publish(
                     f"synapse/training/gradient/{target_id}",
                     payload,
@@ -328,15 +338,14 @@ class DistributedPipelineExtension:
                     if recv_future.done():
                         return
                     try:
-                        msg = json.loads(event.data) if isinstance(event.data, str) else event.data
+                        msg = event.data
                         if msg.get("from_node") == source_id:
-                            data = msg.get("data", {})
-                            shapes = msg.get("shapes", {})
-                            dtypes = msg.get("dtypes", {})
+                            from synapse.transport.codec import decode_tensor
+                            bin_grads = msg.get("bin_grads", {})
                             gradients = {}
-                            for k, v in data.items():
-                                raw = bytes.fromhex(v)
-                                gradients[k] = np.frombuffer(raw, dtype=np.dtype(dtypes.get(k, "float32"))).reshape(shapes.get(k, []))
+                            for k, v in bin_grads.items():
+                                tensor, _ = decode_tensor(v)
+                                gradients[k] = tensor.astype(np.float32)
                             recv_future.set_result(gradients)
                     except Exception:
                         if not recv_future.done():

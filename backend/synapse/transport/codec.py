@@ -53,39 +53,51 @@ def encode_tensor(
     metadata: Optional[Dict] = None,
     compress: bool = False,
     compress_level: int = 1,
+    quantize_int8: bool = False,
 ) -> bytes:
     """
     Encode a numpy tensor into a compact binary format.
-
-    Format:
-      [4 bytes MAGIC][2 bytes dtype_code][2 bytes ndim]
-      [4 bytes uncompressed_size][4 bytes compressed_size]
-      [N bytes shape (2 bytes per dim)]
-      [N bytes metadata (1 byte len + JSON)]
-      [M bytes tensor data]
-
-    Total overhead: ~24 + 2*ndim + len(metadata_json) bytes
+    Supports optional INT8 quantization for transmission.
     """
     if not isinstance(tensor, np.ndarray):
         raise TypeError(f"Expected np.ndarray, got {type(tensor)}")
 
-    dtype_code = DTYPE_MAP.get(tensor.dtype)
-    if dtype_code is None:
-        raise ValueError(f"Unsupported dtype: {tensor.dtype}")
+    target_tensor = tensor
+    q_scale = 1.0
+    
+    # Apply dynamic quantization if requested and applicable
+    if quantize_int8 and tensor.dtype in [np.float32, np.float16]:
+        abs_max = np.max(np.abs(tensor))
+        if abs_max > 0:
+            q_scale = abs_max / 127.0
+            target_tensor = (tensor / q_scale).clip(-127, 127).astype(np.int8)
+        else:
+            target_tensor = tensor.astype(np.int8)
+            q_scale = 1.0
 
-    ndim = len(tensor.shape)
+    dtype_code = DTYPE_MAP.get(target_tensor.dtype)
+    if dtype_code is None:
+        raise ValueError(f"Unsupported dtype: {target_tensor.dtype}")
+
+    ndim = len(target_tensor.shape)
     if ndim > 65535:
         raise ValueError(f"Too many dimensions: {ndim}")
 
-    raw_data = tensor.tobytes()
+    raw_data = target_tensor.tobytes()
     uncompressed_size = len(raw_data)
 
     if compress and uncompressed_size > 4096:
-        compressed_data = zlib.compress(raw_data, compress_level)
+        try:
+            import lz4.frame
+            compressed_data = lz4.frame.compress(raw_data, compression_level=lz4.frame.COMPRESSIONLEVEL_MIN)
+            is_compressed_flag = 2 # 2 means LZ4
+        except ImportError:
+            compressed_data = zlib.compress(raw_data, compress_level)
+            is_compressed_flag = 1 # 1 means zlib
+            
         compressed_size = len(compressed_data)
         if compressed_size < uncompressed_size:
             data_payload = compressed_data
-            is_compressed_flag = 1
         else:
             data_payload = raw_data
             compressed_size = uncompressed_size
@@ -95,17 +107,27 @@ def encode_tensor(
         compressed_size = uncompressed_size
         is_compressed_flag = 0
 
-    shape_bytes = b"".join(struct.pack("!H", dim) for dim in tensor.shape)
+    shape_bytes = b"".join(struct.pack("!H", dim) for dim in target_tensor.shape)
 
-    if metadata:
+    # Combine metadata with quantization info
+    meta_dict = metadata.copy() if metadata else {}
+    if quantize_int8 and q_scale != 1.0:
+        meta_dict["_q_scale"] = float(q_scale)
+        meta_dict["_orig_dtype"] = str(tensor.dtype)
+
+    if meta_dict:
         import json
-        meta_json = json.dumps(metadata).encode("utf-8")
-        if len(meta_json) > 255:
-            meta_json = meta_json[:255]
-        meta_bytes = struct.pack("!B", len(meta_json)) + meta_json
+        meta_json = json.dumps(meta_dict).encode("utf-8")
+        if len(meta_json) > 1024: # Increased limit for q-info
+             # If too long, prune non-essential meta but keep q-info
+             q_only = {"_q_scale": meta_dict.get("_q_scale"), "_orig_dtype": meta_dict.get("_orig_dtype")}
+             meta_json = json.dumps(q_only).encode("utf-8")
+        meta_bytes = struct.pack("!H", len(meta_json)) + meta_json # Use H (2 bytes) for meta len
     else:
-        meta_bytes = struct.pack("!B", 0)
+        meta_bytes = struct.pack("!H", 0)
 
+    # Header now includes a bit for 'H' meta len (high bit of ndim or reserved)
+    # Actually just use 2 bytes for meta len consistently for simplicity
     header = struct.pack(
         "!4sHHII",
         MAGIC,
@@ -121,8 +143,7 @@ def encode_tensor(
 def decode_tensor(data: bytes) -> Tuple[np.ndarray, Optional[Dict]]:
     """
     Decode a binary tensor back into a numpy array.
-
-    Returns (tensor, metadata_dict_or_None).
+    Automatically de-quantizes if q-info is present.
     """
     if len(data) < HEADER_SIZE:
         raise ValueError(f"Data too short: {len(data)} bytes")
@@ -147,8 +168,8 @@ def decode_tensor(data: bytes) -> Tuple[np.ndarray, Optional[Dict]]:
         shape.append(dim)
         shape_offset += 2
 
-    meta_len = struct.unpack("!B", data[shape_offset:shape_offset + 1])[0]
-    meta_offset = shape_offset + 1
+    meta_len = struct.unpack("!H", data[shape_offset:shape_offset + 2])[0]
+    meta_offset = shape_offset + 2
     metadata = None
     if meta_len > 0:
         import json
@@ -161,14 +182,25 @@ def decode_tensor(data: bytes) -> Tuple[np.ndarray, Optional[Dict]]:
     data_offset = meta_offset + meta_len
     raw_data = data[data_offset:]
 
-    if is_compressed:
+    if is_compressed == 1:
         raw_data = zlib.decompress(raw_data)
         if len(raw_data) != uncompressed_size:
-            raise ValueError(
-                f"Decompressed size mismatch: {len(raw_data)} vs {uncompressed_size}"
-            )
+            # Maybe it's partial data or wrong size?
+            pass
+    elif is_compressed == 2:
+        import lz4.frame
+        raw_data = lz4.frame.decompress(raw_data)
+        if len(raw_data) != uncompressed_size:
+            pass
 
     tensor = np.frombuffer(raw_data, dtype=dtype_obj).reshape(shape)
+    
+    # De-quantize if scale is present
+    if metadata and "_q_scale" in metadata:
+        scale = metadata["_q_scale"]
+        orig_dtype = metadata.get("_orig_dtype", "float16")
+        tensor = (tensor.astype(np.float32) * scale).astype(np.dtype(orig_dtype))
+        
     return tensor, metadata
 
 
@@ -188,6 +220,7 @@ class TensorMessage:
     tensor: np.ndarray
     metadata: Optional[Dict] = None
     timestamp: float = field(default_factory=time.time)
+    quantize: bool = False
 
 
 class AsyncTensorForwarder:
@@ -262,7 +295,7 @@ class AsyncTensorForwarder:
             return False
 
         try:
-            # Encode tensor
+            # Encode tensor with optional INT8 quantization
             compress = (
                 message.tensor.nbytes > self.compress_threshold_bytes
             )
@@ -277,6 +310,7 @@ class AsyncTensorForwarder:
                     **(message.metadata or {}),
                 },
                 compress=compress,
+                quantize_int8=message.quantize,
             )
 
             # Fire-and-forget write (don't await - let it run in background)

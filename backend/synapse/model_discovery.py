@@ -209,9 +209,8 @@ def discover_and_save_model(repo_id: str) -> dict | None:
             existing_data.append(model_data)
         
         # Save back
-        HF_MODELS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(HF_MODELS_JSON_PATH, "w", encoding="utf-8") as f:
-            json.dump(existing_data, f, indent=2, ensure_ascii=False)
+        from synapse.helpers import _save_model_db
+        _save_model_db(existing_data)
             
         if DEBUG >= 1: print(f"[Discovery] Successfully locally cached {repo_id}")
         return model_data
@@ -219,4 +218,27 @@ def discover_and_save_model(repo_id: str) -> dict | None:
     except Exception as e:
         if DEBUG >= 1: print(f"[Discovery] Failed to write cache for {repo_id}: {e}")
         return model_data
+
+def search_hugging_face(query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Tìm kiếm models trên Hugging Face API."""
+    try:
+        url = f"{HF_API}?search={urllib.parse.quote(query)}&limit={limit}&full=true&config=true"
+        with urllib.request.urlopen(url) as response:
+            data = json.loads(response.read().decode())
+            results = []
+            for m in data:
+                results.append({
+                    "name": m.get("modelId"),
+                    "repo": m.get("modelId"),
+                    "pipeline_tag": m.get("pipeline_tag"),
+                    "downloads": m.get("downloads", 0),
+                    "likes": m.get("likes", 0),
+                    "last_modified": m.get("lastModified"),
+                    "isDownloaded": False
+                })
+            return results
+    except Exception as e:
+        if DEBUG >= 1: print(f"[Discovery] Search failed: {e}")
+        return []
+
 

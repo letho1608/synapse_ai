@@ -23,6 +23,7 @@ from synapse.orchestration.election import ElectionManager
 from synapse.networking.peer_handle import PeerHandle
 from synapse.shared.state import ClusterState, NodeState
 from synapse.monitoring.realtime import RealtimeMonitor, NodeMetrics
+from synapse.transport.codec import encode_tensor, decode_tensor
 
 try:
     from synapse.orchestration.tracing import tracer
@@ -49,6 +50,15 @@ class Node:
     self.shard_downloader = shard_downloader
     self.topology: Topology = Topology()
     self.device_capabilities = UNKNOWN_DEVICE_CAPABILITIES
+    
+    # Adaptive LACP: Real-time latency tracking
+    self._last_forward_latencies: Dict[str, float] = {}
+    self._adaptive_rebalance_threshold = 0.5 # 500ms jitter triggers rebalance
+    
+    # Distributed Engine Optimization Settings
+    self.load_quantization = "auto"
+    self.lookahead_window = 3
+    self.transport_quantization = "int8"
     
     # Initialize Election Manager
     self.election_manager = ElectionManager(self.id, self.event_router)
@@ -408,35 +418,48 @@ class Node:
   async def on_p2p_tensor(self, event: Event):
     """Handle incoming tensor for inference via P2P."""
     data = event.data
-    request_id = data.get("request_id")
-
-    # CRITICAL FIX: Support both binary (tobytes) and legacy list-based format
-    tensor_data_raw = data.get("tensor_data")
-    shape = data.get("shape")
-    dtype = data.get("dtype")
-
-    if tensor_data_raw is not None and shape is not None:
-        # Binary format: tainted from bytes
-        import numpy as np
-        if isinstance(tensor_data_raw, bytes):
-            tensor_data = np.frombuffer(tensor_data_raw, dtype=np.dtype(dtype))
-        elif isinstance(tensor_data_raw, str):
-            tensor_data = np.frombuffer(bytes.fromhex(tensor_data_raw), dtype=np.dtype(dtype))
-        else:
-            tensor_data = np.frombuffer(tensor_data_raw, dtype=np.dtype(dtype))
-        tensor_data = tensor_data.reshape(shape)
+    
+    # Check for new binary format (LACP 3.0 High-Perf)
+    if isinstance(data, dict) and "bin" in data:
+        tensor_data, metadata = decode_tensor(data["bin"])
+        request_id = metadata.get("request_id")
+        shard = Shard.from_dict(metadata.get("shard"))
+        inference_state = metadata.get("inference_state")
+        orchestrator_id = metadata.get("_orchestrator_id")
+        
+        # Adaptive LACP: Calculate Jitter and inform cluster if rebalance needed
+        sent_at = metadata.get("_sent_at", 0)
+        if sent_at > 0:
+            latency = time.time() - sent_at
+            if latency > self._adaptive_rebalance_threshold:
+                if DEBUG >= 1: print(f"[ADAPTIVE] Latency spike: {latency:.2f}s! Peer may be lagging.")
+                # We could broadcast a "rebalance hint" here
     else:
-        # Legacy format: list-based
-        tensor_data = np.array(data.get("tensor"))
-        if dtype:
-            tensor_data = tensor_data.astype(np.dtype(dtype))
+        # Legacy/JSON format fallback
+        request_id = data.get("request_id")
+        tensor_data_raw = data.get("tensor_data")
+        shape = data.get("shape")
+        dtype = data.get("dtype")
 
-    shard_dict = data.get("shard")
-    shard = Shard.from_dict(shard_dict)
-    inference_state = data.get("inference_state")
+        if tensor_data_raw is not None and shape is not None:
+            import numpy as np
+            if isinstance(tensor_data_raw, bytes):
+                tensor_data = np.frombuffer(tensor_data_raw, dtype=np.dtype(dtype))
+            elif isinstance(tensor_data_raw, str):
+                tensor_data = np.frombuffer(bytes.fromhex(tensor_data_raw), dtype=np.dtype(dtype))
+            else:
+                tensor_data = np.frombuffer(tensor_data_raw, dtype=np.dtype(dtype))
+            tensor_data = tensor_data.reshape(shape)
+        else:
+            tensor_data = np.array(data.get("tensor"))
+            if dtype:
+                tensor_data = tensor_data.astype(np.dtype(dtype))
 
-    # CRITICAL FIX: Pass orchestrator_id so results are routed back correctly
-    orchestrator_id = data.get("_orchestrator_id")
+        shard_dict = data.get("shard")
+        shard = Shard.from_dict(shard_dict)
+        inference_state = data.get("inference_state")
+        orchestrator_id = data.get("_orchestrator_id")
+
     await self.process_tensor(shard, tensor_data, request_id, inference_state, orchestrator_id=orchestrator_id)
 
   async def on_p2p_prompt(self, event: Event):
@@ -1133,18 +1156,32 @@ class Node:
     if target_id == self.id:
       return await self.process_tensor(target_shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
     else:
-      logger.info(f"[P2P_MESH] Publishing work to Node: {target_id}")
-      # CRITICAL FIX: Use binary tensor encoding (tobytes + shape + dtype)
-      # instead of tensor.tolist() which creates massive nested JSON arrays.
-      await self.event_router.publish(f"synapse/inference/tensor/{target_id}", {
-        "request_id": request_id,
-        "shard": target_shard.to_dict(),
-        "tensor_data": tensor.tobytes(),
-        "shape": list(tensor.shape),
-        "dtype": str(tensor.dtype),
-        "inference_state": inference_state,
-        "_orchestrator_id": orchestrator_id,
-      })
+      logger.info(f"[P2P_MESH] Publishing work to Node: {target_id} (INT8 Quantized)")
+      
+      start_send = time.perf_counter()
+      is_hidden_states = np.issubdtype(tensor.dtype, np.floating)
+      quantize = is_hidden_states 
+      
+      encoded_payload = encode_tensor(
+        tensor,
+        metadata={
+          "request_id": request_id,
+          "shard": target_shard.to_dict(),
+          "inference_state": inference_state,
+          "_orchestrator_id": orchestrator_id,
+          "_sent_at": time.time(),
+        },
+        quantize_int8=quantize
+      )
+      
+      await self.event_router.publish(f"synapse/inference/tensor/{target_id}", {"bin": encoded_payload})
+      
+      elapsed = time.perf_counter() - start_send
+      if target_id not in self._last_forward_latencies:
+          self._last_forward_latencies[target_id] = elapsed
+      else:
+          self._last_forward_latencies[target_id] = 0.7 * self._last_forward_latencies[target_id] + 0.3 * elapsed
+          
       return None
 
   def get_partition_index(self, offset: int = 0, base_shard: Optional[Shard] = None):
@@ -1410,9 +1447,10 @@ class Node:
     return partitions
 
   def _build_latency_matrix(self) -> Optional[Dict[str, Dict[str, float]]]:
-    """Build latency matrix.
-    Returns cached/default matrix synchronously.
-    Triggers background TCP RTT probing to update cache for next call."""
+    """
+    Build latency matrix for LACP partitioning.
+    Uses real-time EWMA forward latencies (Adaptive LACP) to react to network jitter.
+    """
     node_ids = list(self.topology.nodes.keys())
     if len(node_ids) < 2:
       return None
@@ -1421,6 +1459,12 @@ class Node:
       self._latency_cache: Dict[str, Dict[str, float]] = {}
       for nid in node_ids:
         self._latency_cache[nid] = {other: 0.0 if other == nid else 50.0 for other in node_ids}
+
+    # Inject real-time forward latencies into cache
+    for peer_id, lat_sec in self._last_forward_latencies.items():
+        if self.id in self._latency_cache and peer_id in self._latency_cache[self.id]:
+            self._latency_cache[self.id][peer_id] = lat_sec * 1000.0 # Convert to ms
+            self._latency_cache[peer_id][self.id] = lat_sec * 1000.0
 
     async def probe_peers_background():
       for peer in self.peers:

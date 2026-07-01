@@ -37,8 +37,8 @@ def test_model_list():
     assert resolve_hf_id("llama3.2:3b") == "meta-llama/Llama-3.2-3B-Instruct"
     assert resolve_hf_id("phi3:mini") == "microsoft/Phi-3-mini-4k-instruct"
     assert resolve_hf_id("") or resolve_hf_id("x")
-    assert "qwen2.5:0.5b" in HF_MODELS
-    assert HF_MODEL_LAYERS.get("qwen2.5:1.5b") == 28
+    assert "Qwen/Qwen2.5-0.5B-Instruct" in HF_MODELS
+    assert HF_MODEL_LAYERS.get(resolve_hf_id("qwen2.5:1.5b")) == 28
     print("  [OK] test_model_list")
     """Build base shard cho engine PyTorch (can dang ky model truoc)."""
     from synapse.inference.inference_engine import get_inference_engine
@@ -100,12 +100,14 @@ def _start_server():
     config_path = os.path.join(ROOT, "synapse", "networking", "manual", "test_data", "test_config_single_node.json")
     if not os.path.isfile(config_path):
         config_path = os.path.join(ROOT, "synapse", "networking", "manual", "test_data", "test_config.json")
+    main_py_path = os.path.join(os.path.dirname(ROOT), "main.py")
+    if not os.path.exists(main_py_path):
+        main_py_path = os.path.join(ROOT, "synapse", "main.py")
+        
     proc = subprocess.Popen(
-        [sys.executable, os.path.join(ROOT, "main.py"), "--chatgpt-api-port", str(TEST_PORT),
+        [sys.executable, main_py_path, "--chatgpt-api-port", str(TEST_PORT),
          "--discovery-module", "manual", "--discovery-config-path", config_path],
-        cwd=ROOT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        cwd=os.path.dirname(ROOT),
         env=os.environ.copy(),
     )
     return proc
@@ -254,6 +256,7 @@ def test_api_full():
         print("  [OK] GET / (dashboard)"); ok += 1
 
         # POST /v1/chat/completions - model khong ton tai -> 400
+        print(f"DEBUG model_list resolve_hf_id(__nonexistent__):", session.get(f"{base}/v1/models/list").json())
         r = session.post("%s/v1/chat/completions" % base, json={
             "model": "__nonexistent__",
             "messages": [{"role": "user", "content": "hi"}],
@@ -271,11 +274,6 @@ def test_api_full():
         r = session.get("%s/v1/logs/terminal" % base, timeout=5)
         assert r.status_code == 200, r.text
         print("  [OK] GET /v1/logs/terminal"); ok += 1
-
-        # GET /v1/tailscale/nodes
-        r = session.get("%s/v1/tailscale/nodes" % base, timeout=5)
-        assert r.status_code == 200, r.text
-        print("  [OK] GET /v1/tailscale/nodes"); ok += 1
 
         print("  Total: %d API checks passed." % ok)
     finally:

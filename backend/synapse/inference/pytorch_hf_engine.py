@@ -12,7 +12,7 @@ from typing import Optional, Tuple, Dict, Any, List
 from synapse.helpers import DEBUG
 from synapse.inference.inference_engine import InferenceEngine
 from synapse.inference.shard import Shard
-from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id, VISION_MODELS
+from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id
 
 
 def register_pytorch_models() -> None:
@@ -73,9 +73,19 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self._model = None
         self._model_id: Optional[str] = None
         self._device = "cuda" if self._has_cuda() else "cpu"
-        self._kv_caches: Dict[str, Any] = {} # request_id -> list of past_key_values per layer
+        # request_id -> list of hashes for prefix lengths
+        self._request_cache_hashes: Dict[str, List[str]] = {}
+        # hash -> dict of layer_index -> kv_state
+        self._content_kv_cache: Dict[str, Dict[int, Any]] = {}
         # Cache kết quả nhận diện phần cứng để không phải phát hiện lại nhiều lần
         self._hw_profile: Optional[Dict[str, Any]] = None
+
+    def _get_sequence_hash(self, data: np.ndarray, length: int) -> str:
+        """Tạo hash cho một đoạn sequence (ids hoặc hidden states)."""
+        import hashlib
+        # Dùng byteview để hash nhanh
+        chunk = data[:, :length].copy()
+        return hashlib.blake2b(chunk.tobytes(), digest_size=16).hexdigest()
 
     @staticmethod
     def _has_cuda() -> bool:
@@ -313,66 +323,60 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         device = next(self._model.parameters()).device
         dtype = next(self._model.parameters()).dtype
 
-        if np.issubdtype(input_data.dtype, np.floating):
+        is_hidden_states = np.issubdtype(input_data.dtype, np.floating)
+        if is_hidden_states:
             if input_data.ndim == 2:
                 input_data = input_data[np.newaxis, :]
-            hidden_states = torch.from_numpy(input_data).to(device=device, dtype=dtype)
+            hidden_states_full = torch.from_numpy(input_data).to(device=device, dtype=dtype)
         else:
-            input_ids = torch.from_numpy(input_data.astype(np.int64)).to(device)
-            if input_ids.dim() == 1:
-                input_ids = input_ids.unsqueeze(0)
+            input_ids_full = torch.from_numpy(input_data.astype(np.int64)).to(device)
+            if input_ids_full.dim() == 1:
+                input_ids_full = input_ids_full.unsqueeze(0)
             embed = components["embed"]
             if embed is None:
                 raise RuntimeError(f"Model {shard.model_id} does not expose input embeddings")
-            hidden_states = embed(input_ids)
+            hidden_states_full = embed(input_ids_full)
 
         # ---------------------------------------------------------------------
-        # KV Cache & Position ID Management
+        # Hierarchical KV Cache Management (Content-based)
         # ---------------------------------------------------------------------
-        request_id = request_id or "default"
-        if request_id not in self._kv_caches:
-            self._kv_caches[request_id] = {}
+        full_seq_len = hidden_states_full.shape[1]
+        best_hash = None
+        best_len = 0
+        granularity = 16 
         
-        # Determine sequence length and offset
-        # We look at the cache of the first layer in our shard to see how many tokens we've seen
-        cache = self._kv_caches[request_id]
-        past_len = 0
-        if shard.start_layer in cache and cache[shard.start_layer] is not None:
-            # past_key_value format: (key, value) or tuple(tuple...)
-            # We assume (batch, num_heads, seq_len, head_dim) for most HF models
-            k = cache[shard.start_layer][0]
-            past_len = k.shape[-2]
+        # Search for longest cached prefix
+        for l in range(full_seq_len - 1, 0, -1):
+            if l % granularity == 0 or l == full_seq_len - 1:
+                h = self._get_sequence_hash(input_data, l)
+                if h in self._content_kv_cache:
+                    best_hash = h
+                    best_len = l
+                    break
+
+        if best_len > 0:
+            hidden_states = hidden_states_full[:, best_len:, :]
+            past_len = best_len
+            cache = self._content_kv_cache[best_hash]
+            if DEBUG >= 2: print(f"[Cache] Hit! Reusing prefix length {best_len}")
+        else:
+            hidden_states = hidden_states_full
+            past_len = 0
+            cache = {}
 
         seq_len = hidden_states.shape[1]
-        
-        # position_ids must start from past_len
         position_ids = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=device).unsqueeze(0)
-        
-        # Some newer models use cache_position
         cache_position = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=device)
-
-        # Build position embeddings (RoPE)
-        position_embeddings = self._build_position_embeddings(hidden_states, position_ids)
-
-        # Prepare attention mask (optional, eager path might need it if not None but usually None is causal)
-        attention_mask = None
+        position_embeddings = self._build_position_embeddings(hidden_states_full, position_ids)
 
         with torch.no_grad():
             for layer_index in range(shard.start_layer, shard.end_layer + 1):
                 layer_cache = cache.get(layer_index)
-                
-                # Forward pass for a single layer block
-                # Output might be (hidden_states, next_kv_cache, ...)
-                # But since use_cache=True, we expect a tuple back.
                 block = layers[layer_index]
-                
-                # Our helper _call_transformer_block will call the block and return JUST hidden_states
-                # We need to manually capture the KV cache if it's returned.
-                # Let's override the block call here to capture KV cache.
                 
                 params = inspect.signature(block.forward).parameters
                 kwargs: Dict[str, Any] = {
-                    "attention_mask": attention_mask,
+                    "attention_mask": None,
                     "position_ids": position_ids,
                     "position_embeddings": position_embeddings,
                     "past_key_value": layer_cache,
@@ -381,7 +385,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 if "cache_position" in params:
                     kwargs["cache_position"] = cache_position
                 
-                # Actual block call
                 output = block(hidden_states, **kwargs)
                 
                 if isinstance(output, tuple):
@@ -394,6 +397,15 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                         cache[layer_index] = output.past_key_value
                 else:
                     hidden_states = output
+
+            # Update cache with new full sequence hash
+            new_hash = self._get_sequence_hash(input_data, full_seq_len)
+            self._content_kv_cache[new_hash] = cache
+            
+            if request_id:
+                if request_id not in self._request_cache_hashes:
+                    self._request_cache_hashes[request_id] = []
+                self._request_cache_hashes[request_id].append(new_hash)
 
             if not shard.is_last_layer():
                 return hidden_states.float().cpu().numpy()
@@ -411,11 +423,13 @@ class PyTorchHFInferenceEngine(InferenceEngine):
 
     def clear_cache(self, request_id: Optional[str] = None):
         if request_id:
-            self._kv_caches.pop(request_id, None)
-            if DEBUG >= 2: print(f"[PyTorchHF] Cleared KV cache for request: {request_id}")
+            # For content-based caching, we don't necessarily clear on request end.
+            # We could prune if memory is tight.
+            pass
         else:
-            self._kv_caches.clear()
-            if DEBUG >= 1: print("[PyTorchHF] Cleared all KV caches")
+            self._content_kv_cache.clear()
+            self._request_cache_hashes.clear()
+            if DEBUG >= 1: print("[PyTorchHF] Cleared all content KV caches")
 
     async def ensure_shard(self, shard: Shard) -> None:
         if self._model_id == shard.model_id and self._model is not None:
@@ -424,16 +438,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         if DEBUG >= 1:
             print(f"[PyTorchHF] Loading {shard.model_id} -> {hf_id}")
 
-        is_vision = shard.model_id in VISION_MODELS
-        if is_vision:
-            try:
-                import asyncio
-                await asyncio.to_thread(self._load_vision_model_sync, shard, hf_id)
-                return
-            except Exception as e:
-                raise RuntimeError(f"PyTorchHF load vision {hf_id}: {e}") from e
-
-    
         # --- Nhận diện phần cứng ---
         hw = self._detect_hardware_profile(shard.model_id)
         load_model_kw: Dict[str, Any] = {
@@ -510,117 +514,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 traceback.print_exc()
             raise RuntimeError(f"PyTorchHF load {hf_id}: {e}") from e
 
-    def _load_vision_model_sync(self, shard, hf_id: str):
-        from huggingface_hub import snapshot_download
-        import sys
-        import torch
-        import json
-        repo_path = snapshot_download(repo_id=hf_id)
-        if repo_path not in sys.path:
-            sys.path.insert(0, repo_path)
-        import model as crnn_model
-        
-        with open(f"{repo_path}/vocab.json", "r", encoding="utf-8") as f:
-            vocab = json.load(f)
-        
-        if "idx_to_char" in vocab:
-            idx_dict = vocab["idx_to_char"]
-        else:
-            idx_dict = vocab
-            
-        num_classes = max([int(k) for k in idx_dict.keys()]) + 1
-        
-        _model = crnn_model.CRNN(vocab_size=num_classes, hidden_size=256)
-        weights_path = f"{repo_path}/vietnamese_crnn_model.pth"
-        checkpoint = torch.load(weights_path, map_location=self._device, weights_only=False)
-        if 'model_state_dict' in checkpoint:
-            _model.load_state_dict(checkpoint['model_state_dict'])
-            if 'img_width' in checkpoint:
-                self.img_width = checkpoint['img_width']
-        else:
-            _model.load_state_dict(checkpoint)
-        self._model = _model.to(self._device)
-        self._model.eval()
-        
-        self.tokenizer = vocab
-        self._model_id = shard.model_id
-        self.shard = shard
-        if DEBUG >= 1: print(f"[PyTorchHF] Loaded Vision local CRNN: {shard.model_id}")
-
-
-    async def infer_vision(self, shard: Shard, image_bytes: bytes) -> str:
-        await self.ensure_shard(shard)
-        try:
-            import asyncio
-            return await asyncio.to_thread(self._infer_vision_sync, image_bytes)
-        except Exception as e:
-            if DEBUG >= 1:
-                import traceback
-                traceback.print_exc()
-            raise Exception(f"Vision inference error: {e}")
-
-    def _infer_vision_sync(self, image_bytes: bytes) -> str:
-        import torch
-        import cv2
-        import numpy as np
-        import torchvision.transforms as transforms
-        
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img_array = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        
-        if np.mean(img_array) < 127:
-            img_array = 255 - img_array
-        _, img_array = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        h, w = img_array.shape
-        new_h = 64
-        img_width = getattr(self, 'img_width', 448)
-        new_w = int(w * (new_h / h))
-        if new_w > img_width:
-            new_w = img_width
-            
-        img_resized = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        padded = np.full((new_h, img_width), 255, dtype=np.uint8)
-        padded[:, :new_w] = img_resized
-        
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
-        ])
-        image_tensor = transform(padded.copy()).unsqueeze(0).to(self._device)
-        
-        with torch.no_grad():
-            logits = self._model(image_tensor)
-            
-        vocab = self.tokenizer
-        if "idx_to_char" in vocab:
-            idx_dict = vocab["idx_to_char"]
-        else:
-            idx_dict = vocab
-        idx_to_char = {int(k): v for k, v in idx_dict.items()}
-        
-        beam_width = 10
-        log_probs = logits.squeeze(1).cpu().numpy()
-        seq_len, num_classes = log_probs.shape
-        beams = [(0.0, [], -1)]
-        
-        for t in range(seq_len):
-            new_beams = []
-            for score, seq, last_idx in beams:
-                for c in range(num_classes):
-                    new_score = score + log_probs[t, c]
-                    if c == 0:
-                        new_beams.append((new_score, seq[:], -1))
-                    elif c == last_idx:
-                        new_beams.append((new_score, seq[:], last_idx))
-                    else:
-                        new_beams.append((new_score, seq + [c], c))
-            new_beams.sort(key=lambda x: x[0], reverse=True)
-            beams = new_beams[:beam_width]
-            
-        best_seq = beams[0][1]
-        text = "".join([idx_to_char.get(i, '') for i in best_seq])
-        return text
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
         await self.ensure_shard(shard)
         if self.tokenizer is None:
@@ -742,35 +635,21 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             device = self._device
             self._model.train()
 
-            is_vision = len(target.shape) > 0 and len(example.shape) == 4
-
-            if is_vision:
-                imgs = torch.from_numpy(example).to(device)
-                labels = torch.from_numpy(target).to(device)
-                label_lens = torch.from_numpy(length).to(device)
-                preds = self._model(imgs)
-                T = preds.size(0)
-                batch_size = imgs.size(0)
-                input_lens = torch.full(size=(batch_size,), fill_value=T, dtype=torch.int32).to(device)
-                preds = preds.log_softmax(2)
-                criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True).to(device)
-                loss_val = criterion(preds, labels, input_lens, label_lens)
-            else:
-                if example.dtype != np.int64:
-                    example = example.astype(np.int64)
-                if target.dtype != np.int64:
-                    target = target.astype(np.int64)
-                input_ids = torch.from_numpy(example).to(device)
-                labels = torch.from_numpy(target).to(device)
-                if input_ids.dim() == 1:
-                    input_ids = input_ids.unsqueeze(0)
-                if labels.dim() == 1:
-                    labels = labels.unsqueeze(0)
-                out = self._model(input_ids)
-                logits = out.logits if hasattr(out, "logits") else out[0]
-                shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
-                shift_labels = labels[..., 1:].contiguous().view(-1)
-                loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+            if example.dtype != np.int64:
+                example = example.astype(np.int64)
+            if target.dtype != np.int64:
+                target = target.astype(np.int64)
+            input_ids = torch.from_numpy(example).to(device)
+            labels = torch.from_numpy(target).to(device)
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            if labels.dim() == 1:
+                labels = labels.unsqueeze(0)
+            out = self._model(input_ids)
+            logits = out.logits if hasattr(out, "logits") else out[0]
+            shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+            shift_labels = labels[..., 1:].contiguous().view(-1)
+            loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
 
             opt = self._get_optimizer()
             if opt is not None:

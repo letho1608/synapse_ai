@@ -3,7 +3,7 @@ import traceback
 from os import PathLike
 import os
 from typing import Union
-from transformers import AutoTokenizer, AutoProcessor
+from transformers import AutoTokenizer
 import numpy as np
 from synapse.helpers import DEBUG
 from pathlib import Path

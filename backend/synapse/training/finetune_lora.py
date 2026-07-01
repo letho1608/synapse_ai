@@ -27,16 +27,8 @@ def resolve_hf_model_id(model_name: str, base_model_id: Optional[str] = None) ->
 
 def load_raw_data(path: Path) -> List[Dict[str, Any]]:
     path = Path(path).resolve()
-    if path.is_dir():
-        from synapse.data.simple_dataset import ImageDataset
-        try:
-            ds = ImageDataset(str(path))
-            if len(ds.data) > 0:
-                return ds.data
-        except Exception as e:
-            print(f"Loi nap ImageDataset tu {path}: {e}")
     if not path.is_file():
-        raise FileNotFoundError(f"Dataset khong ton tai hoac khong phai la file hop le: {path}")
+        raise FileNotFoundError(f"Dataset không tồn tại hoặc không phải là file hợp lệ: {path}")
     data = []
     if path.suffix == ".jsonl":
         with open(path, "r", encoding="utf-8", errors="ignore") as f:

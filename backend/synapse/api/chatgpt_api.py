@@ -21,15 +21,10 @@ from synapse.terminal_log import get_lines as get_terminal_log_lines
 from synapse.helpers import PrefixDict, shutdown, get_all_ip_addresses_and_interfaces
 from synapse.networking.tailscale.tailscale_helpers import get_synapse_api_urls_from_node_list, get_self_tailscale_info
 from synapse.orchestration import Node
-from synapse.model_list import HF_MODELS, HF_MODEL_PARAMS, resolve_hf_id, VISION_MODELS  # Danh sách + metadata cho web UI
+from synapse.model_list import HF_MODELS, HF_MODEL_PARAMS, resolve_hf_id  # Danh sách + metadata cho web UI
 from typing import Callable, Optional
-from PIL import Image
-import numpy as np
-import base64
-from io import BytesIO
 from synapse.loading import RepoProgressEvent
 import tempfile
-from synapse.apputil import create_animation_mp4
 from collections import defaultdict
 from synapse.training.finetune_lora import load_raw_data, load_raw_data_async, format_sample_to_text, _build_lora_config
 from synapse.training.preprocessing import preprocess, preprocess_async
@@ -137,43 +132,7 @@ def generate_completion(
   return completion
 
 
-def remap_messages(messages: List[Message]) -> List[Message]:
-  remapped_messages = []
-  last_image = None
-  for message in messages:
-    if not isinstance(message.content, list):
-      remapped_messages.append(message)
-      continue
-
-    remapped_content = []
-    for content in message.content:
-      if isinstance(content, dict):
-        if content.get("type") in ["image_url", "image"]:
-          image_url = content.get("image_url", {}).get("url") or content.get("image")
-          if image_url:
-            last_image = {"type": "image", "image": image_url}
-            remapped_content.append({"type": "text", "text": "[An image was uploaded but is not displayed here]"})
-        else:
-          remapped_content.append(content)
-      else:
-        remapped_content.append(content)
-    remapped_messages.append(Message(role=message.role, content=remapped_content))
-
-  if last_image:
-    # Replace the last image placeholder with the actual image content
-    for message in reversed(remapped_messages):
-      for i, content in enumerate(message.content):
-        if isinstance(content, dict):
-          if content.get("type") == "text" and content.get("text") == "[An image was uploaded but is not displayed here]":
-            message.content[i] = last_image
-            return remapped_messages
-
-  return remapped_messages
-
-
-def build_prompt(tokenizer, _messages: List[Message], tools: Optional[List[Dict]] = None):
-  messages = remap_messages(_messages)
-  
+def build_prompt(tokenizer, messages: List[Message], tools: Optional[List[Dict]] = None):
   # Check if tokenizer has chat template (GPT-2 doesn't have one)
   if not hasattr(tokenizer, 'chat_template') or tokenizer.chat_template is None:
     # For models without chat template (like GPT-2), concatenate messages
@@ -281,7 +240,7 @@ class ChatGPTAPI:
                 
         return await handler(request)
 
-    self.app = web.Application(client_max_size=100*1024*1024, middlewares=[auth_middleware])  # 100MB to support image upload
+    self.app = web.Application(client_max_size=10*1024*1024, middlewares=[auth_middleware])  # 10MB limit for text payloads
     self.prompts: PrefixDict[str, PromptSession] = PrefixDict()
     self.prev_token_lens: Dict[str, int] = {}
     self.stream_tasks: Dict[str, asyncio.Task] = {}
@@ -337,14 +296,10 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/chat/token/encode", self.handle_post_chat_token_encode), {"*": cors_options})
     cors.add(self.app.router.add_post("/chat/completions", self.handle_post_chat_completions), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/chat/completions", self.handle_post_chat_completions), {"*": cors_options})
-    cors.add(self.app.router.add_post("/v1/image/generations", self.handle_post_image_generations), {"*": cors_options})
-    cors.add(self.app.router.add_get("/v1/download/progress", self.handle_get_download_progress), {"*": cors_options})
-    cors.add(self.app.router.add_get("/modelpool", self.handle_model_support), {"*": cors_options})
     cors.add(self.app.router.add_get("/healthcheck", self.handle_healthcheck), {"*": cors_options})
     cors.add(self.app.router.add_post("/quit", self.handle_quit), {"*": cors_options})
     cors.add(self.app.router.add_delete("/models/{model_name}", self.handle_delete_model), {"*": cors_options})
     cors.add(self.app.router.add_get("/initial_models", self.handle_get_initial_models), {"*": cors_options})
-    cors.add(self.app.router.add_post("/create_animation", self.handle_create_animation), {"*": cors_options})
     cors.add(self.app.router.add_post("/download", self.handle_post_download), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/topology", self.handle_get_topology), {"*": cors_options})
     cors.add(self.app.router.add_get("/topology", self.handle_get_topology), {"*": cors_options})
@@ -355,7 +310,8 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_get("/v1/system/stats", self.handle_get_system_stats), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/ws/metrics", self.handle_ws_metrics), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/system/info", self.handle_get_system_info), {"*": cors_options})
-    cors.add(self.app.router.add_post("/v1/model/check", self.handle_check_model_fit), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/models/list", self.handle_get_models_list), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/models/search", self.handle_get_models_search), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/models/compatibility", self.handle_get_models_compatibility), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/network/nodes", self.handle_get_network_nodes), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/datasets", self.handle_get_datasets), {"*": cors_options})
@@ -367,6 +323,7 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/datasets/rename", self.handle_post_datasets_rename), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/datasets/validate", self.handle_get_datasets_validate), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/datasets/link", self.handle_post_datasets_link), {"*": cors_options})
+    cors.add(self.app.router.add_post("/v1/datasets/update", self.handle_post_datasets_update), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/activity", self.handle_get_activity_logs), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/logs/terminal", self.handle_get_terminal_logs), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/training/start", self.handle_post_training), {"*": cors_options})
@@ -375,6 +332,8 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_get("/v1/models/list", self.handle_get_models_list), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/models/pull", self.handle_post_models_pull), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/models/delete", self.handle_post_models_delete), {"*": cors_options})
+    cors.add(self.app.router.add_post("/v1/models/merge", self.handle_post_models_merge), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/models/checkpoints", self.handle_get_model_checkpoints), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/settings", self.handle_get_settings), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/settings", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/settings/save", self.handle_post_settings), {"*": cors_options})
@@ -829,6 +788,26 @@ class ChatGPTAPI:
       available = [{"name": n, "status": "available"} for n in sorted(HF_MODELS.keys())]
       return web.json_response({"downloaded": [], "available": available})
 
+  async def handle_get_models_search(self, request):
+    """Tìm kiếm models trên Hugging Face API."""
+    try:
+      query = request.query.get("q", "").strip()
+      if not query:
+        return web.json_response({"data": []})
+      
+      from synapse.model_discovery import search_hugging_face
+      results = await asyncio.get_event_loop().run_in_executor(None, lambda: search_hugging_face(query))
+      
+      # Mark models that are already downloaded
+      downloaded_names = self._get_hf_downloaded_names()
+      for r in results:
+        if r["name"] in downloaded_names:
+          r["isDownloaded"] = True
+          
+      return web.json_response({"data": results})
+    except Exception as e:
+      return web.json_response({"detail": str(e)}, status=500)
+
   async def handle_post_models_pull(self, request):
     """Tải model: Đầu tiên kiểm tra trong HF_MODELS, nếu không có thì scrape metadata và tiến hành HF snapshot_download."""
     try:
@@ -898,11 +877,85 @@ class ChatGPTAPI:
         strategy.execute()
       return web.json_response({
         "success": True,
-        "message": f"Đã xóa cache HF cho {model_name}" if rev_hashes else f"Không tìm thấy cache cho {model_name}",
+        "message": f"Đã xóa cache HF cho {model_name}" if rev_hashes else f"Không tìm thấy cache for {model_name}",
       })
     except Exception as e:
       if DEBUG >= 2:
         traceback.print_exc()
+      return web.json_response({"success": False, "message": str(e)}, status=500)
+
+  async def handle_get_model_checkpoints(self, request):
+    """Liệt kê các checkpoints đã lưu trong thư mục checkpoints/."""
+    try:
+      from synapse.loading import get_checkpoints_base_dir
+      cp_dir = get_checkpoints_base_dir()
+      if not cp_dir.exists():
+        return web.json_response({"data": []})
+      
+      checkpoints = []
+      for model_dir in cp_dir.iterdir():
+        if model_dir.is_dir():
+          # Kiểm tra xem có phải adapter (LoRA) hay full model
+          is_adapter = (model_dir / "adapter_config.json").exists()
+          is_full = (model_dir / "config.json").exists()
+          
+          if is_adapter or is_full:
+            checkpoints.append({
+              "name": model_dir.name,
+              "path": str(model_dir.absolute()),
+              "type": "adapter" if is_adapter else "full",
+              "created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(model_dir.stat().st_ctime))
+            })
+            
+      return web.json_response({"data": checkpoints})
+    except Exception as e:
+      return web.json_response({"detail": str(e)}, status=500)
+
+  async def handle_post_models_merge(self, request):
+    """Hợp nhất models/adapters. Body: base_model, adapters (list of paths), output_name, merge_type."""
+    try:
+      from synapse.training.merging import merge_lora_adapters, merge_models_checkpoints
+      body = await request.json()
+      base_model = body.get("base_model")
+      adapters = body.get("adapters", []) # List of paths or names in checkpoints/
+      output_name = body.get("output_name")
+      merge_type = body.get("merge_type", "linear")
+      
+      if not base_model or not adapters or not output_name:
+        return web.json_response({"success": False, "message": "Thiếu base_model, adapters hoặc output_name"}, status=400)
+      
+      from synapse.loading import get_checkpoints_base_dir
+      cp_dir = get_checkpoints_base_dir()
+      
+      # Resolve adapter paths
+      resolved_adapters = []
+      for a in adapters:
+        p = Path(a)
+        if not p.is_absolute():
+          p = cp_dir / a
+        if p.exists():
+          resolved_adapters.append(str(p.absolute()))
+        else:
+          return web.json_response({"success": False, "message": f"Adapter không tồn tại: {a}"}, status=400)
+          
+      output_path = str((cp_dir / output_name).absolute())
+      
+      # Run merging in a separate thread to not block the event loop
+      loop = asyncio.get_event_loop()
+      result = await loop.run_in_executor(
+        None, 
+        lambda: merge_lora_adapters(resolve_hf_id(base_model), resolved_adapters, output_path, merge_type=merge_type)
+      )
+      
+      if result.get("success"):
+        self.log_activity("Model Merged", output_name, "success")
+        return web.json_response(result)
+      else:
+        self.log_activity("Merge Failed", output_name, "failed")
+        return web.json_response(result, status=500)
+        
+    except Exception as e:
+      if DEBUG >= 2: traceback.print_exc()
       return web.json_response({"success": False, "message": str(e)}, status=500)
 
   async def handle_post_chat_token_encode(self, request):
@@ -950,45 +1003,6 @@ class ChatGPTAPI:
             {"error": {"message": f"Model '{model_id}' không có trong registry PyTorch/HF. Chọn model từ danh sách.", "code": "model_not_found"}},
             status=400,
           )
-        is_vision = model_id in VISION_MODELS
-        if is_vision:
-          base64_image = None
-          for msg in reversed(data.get("messages", [])):
-            if isinstance(msg.get("content"), list):
-              for content in msg["content"]:
-                if content.get("type") == "image_url":
-                  base64_image = content["image_url"].get("url", "")
-                  break
-                elif content.get("type") == "image":
-                  base64_image = content.get("image", "")
-                  break
-            if base64_image:
-              break
-          if not base64_image:
-            return web.json_response({"error": {"message": "Vision model yêu cầu hình ảnh.", "code": "missing_image"}}, status=400)
-          if "," in base64_image:
-            base64_image = base64_image.split(",", 1)[1]
-          try:
-            image_bytes = base64.b64decode(base64_image)
-          except Exception as e:
-            return web.json_response({"error": {"message": f"Base64 decode failed: {e}", "code": "invalid_image"}}, status=400)
-          
-          try:
-            request_id = str(uuid.uuid4())
-            text_result = await self.node.inference_engine.infer_vision(base_shard, image_bytes)
-          except Exception as e:
-            if DEBUG >= 1:
-              traceback.print_exc()
-            return web.json_response({"error": {"message": f"Lỗi Vision Inference: {e}", "code": "vision_error"}}, status=500)
-          
-          completion = {
-            "id": f"chatcmpl-{request_id}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": data.get("model"),
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text_result}, "finish_reason": "stop"}]
-          }
-          return web.json_response(completion)
 
         request_id = str(uuid.uuid4())
         self.token_queues[request_id] = asyncio.Queue()
@@ -1303,13 +1317,6 @@ class ChatGPTAPI:
           print(f"Cleaning up token queue: {request_id=}")
         del self.token_queues[request_id]
 
-  async def handle_post_image_generations(self, request):
-    """Image generation: endpoint tạm trả 501."""
-    return web.json_response(
-      {"error": {"message": "Image generation chưa hỗ trợ. Dùng model vision hoặc API khác."}},
-      status=501,
-    )
-
   async def handle_delete_model(self, request):
     """Xóa model: xóa khỏi HF cache (danh sách từ HF_MODELS)."""
     model_id = (request.match_info.get("model_name") or "").strip()
@@ -1340,47 +1347,7 @@ class ChatGPTAPI:
     """Danh sách model: từ HF_MODELS; downloaded = có trong HF cache."""
     downloaded_names = self._get_hf_downloaded_names()
     model_data = {}
-    for mid in sorted(HF_MODELS.keys()):
-      model_data[mid] = {
-        "name": mid,
-        "downloaded": mid in downloaded_names,
-        "download_percentage": 100 if mid in downloaded_names else 0,
-        "total_size": None,
-        "total_downloaded": None,
-        "loading": False,
-      }
     return web.json_response(model_data)
-
-  async def handle_create_animation(self, request):
-    try:
-      data = await request.json()
-      replacement_image_path = data.get("replacement_image_path")
-      device_name = data.get("device_name", "Local Device")
-      prompt_text = data.get("prompt", "")
-
-      if DEBUG >= 2: print(f"Creating animation with params: replacement_image={replacement_image_path}, device={device_name}, prompt={prompt_text}")
-
-      if not replacement_image_path:
-        return web.json_response({"error": "replacement_image_path is required"}, status=400)
-
-      # Create temp directory if it doesn't exist
-      tmp_dir = Path(tempfile.gettempdir())/"synapse_animations"
-      tmp_dir.mkdir(parents=True, exist_ok=True)
-
-      # Generate unique output filename in temp directory
-      output_filename = f"animation_{uuid.uuid4()}.mp4"
-      output_path = str(tmp_dir/output_filename)
-
-      if DEBUG >= 2: print(f"Animation temp directory: {tmp_dir}, output file: {output_path}, directory exists: {tmp_dir.exists()}, directory permissions: {oct(tmp_dir.stat().st_mode)[-3:]}")
-
-      # Create the animation
-      create_animation_mp4(replacement_image_path, output_path, device_name, prompt_text)
-
-      return web.json_response({"status": "success", "output_path": output_path})
-
-    except Exception as e:
-      if DEBUG >= 2: traceback.print_exc()
-      return web.json_response({"error": str(e)}, status=500)
 
   async def handle_post_download(self, request):
     """Download model: HF snapshot_download (danh sách từ HF_MODELS)."""
@@ -1867,14 +1834,19 @@ class ChatGPTAPI:
 
 
   async def handle_get_settings(self, request):
-    """Trả về cài đặt hiện tại (default model)."""
+    """Trả về cài đặt hiện tại."""
     return web.json_response({
       "default_model": getattr(self, "default_model", ""),
-      "discovery_module": getattr(self, "discovery_module", "tailscale")
+      "discovery_module": getattr(self, "discovery_module", "tailscale"),
+      "lacp_priority": getattr(self.node, "_lacp_priority", "latency"),
+      "lacp_max_ping": getattr(self.node, "_lacp_max_ping", 100),
+      "load_quantization": getattr(self, "load_quantization", "auto"),
+      "lookahead_window": getattr(self, "lookahead_window", 3),
+      "transport_quantization": getattr(self, "transport_quantization", "int8")
     })
 
   async def handle_post_settings(self, request):
-    """Lưu cài đặt (default_model) và ghi file."""
+    """Lưu cài đặt và áp dụng ngay lập tức."""
     try:
       body = await request.json()
       model = (body.get("default_model") or "").strip()
@@ -1888,6 +1860,17 @@ class ChatGPTAPI:
         self.discovery_module = discovery_module
         if old_module != discovery_module:
             requires_restart = True
+            
+      # Optimization settings
+      self.load_quantization = body.get("load_quantization", "auto")
+      self.lookahead_window = int(body.get("lookahead_window", 3))
+      self.transport_quantization = body.get("transport_quantization", "int8")
+      
+      # Apply to node
+      if hasattr(self.node, "_lacp_priority"):
+        self.node._lacp_priority = body.get("lacp_priority", "latency")
+      if hasattr(self.node, "_lacp_max_ping"):
+        self.node._lacp_max_ping = int(body.get("lacp_max_ping", 100))
         
       self._save_settings()
       self.log_activity("Cài đặt đã lưu", "-", "success")
@@ -2103,27 +2086,10 @@ class ChatGPTAPI:
           else:
             lines = [json.dumps(data, ensure_ascii=False)[:1000]]
       elif path.is_dir():
-          # Preview cho folder (quét file labels/pk)
-          pk_file = path / "transcription.pk"
-          if pk_file.exists():
-              import pickle
-              lines.append(f"--- Thư mục OCR: {path.name} ---")
-              lines.append(f"Tìm thấy: transcription.pk")
-              try:
-                  with open(pk_file, 'rb') as f:
-                      data = pickle.load(f)
-                  lines.append(f"Tổng số mẫu nhãn: {len(data)}")
-                  lines.append("Xem trước 10 nhãn đầu tiên:")
-                  # Dữ liệu pickle của bạn là list of dict [{'path': 'text'}]
-                  for entry in data[:10]:
-                      lines.append(json.dumps(entry, ensure_ascii=False))
-              except:
-                  lines.append("Lỗi đọc file .pk (Pickle format check failed)")
-          else:
-              lines.append(f"--- Thư mục: {path.name} ---")
-              lines.append("Không tìm thấy transcription.pk. Danh sách 10 file đầu tiên:")
-              for f in list(path.iterdir())[:10]:
-                  lines.append(f.name + (" (Folder)" if f.is_dir() else ""))
+          lines.append(f"--- Thư mục: {path.name} ---")
+          lines.append("Danh sách 10 file đầu tiên:")
+          for f in list(path.iterdir())[:10]:
+              lines.append(f.name + (" (Folder)" if f.is_dir() else ""))
 
       return web.json_response({"success": True, "preview": lines})
     except Exception as e:
@@ -2389,6 +2355,44 @@ class ChatGPTAPI:
         traceback.print_exc()
       return web.json_response({"success": False, "message": str(e)}, status=500)
 
+  async def handle_post_datasets_update(self, request):
+    """Cập nhật nội dung dataset. Body: path hoặc name, content."""
+    try:
+      body = await request.json()
+      name = (body.get("name") or body.get("path") or "").strip()
+      content = (body.get("content") or "").strip()
+      if not name or not content:
+        return web.json_response({"success": False, "message": "Thiếu name hoặc content"}, status=400)
+      
+      path = self._resolve_dataset_path(name, name_only_ok=False)
+      if path is None or not path.is_file():
+        return web.json_response({"success": False, "message": "File không tồn tại hoặc không được phép chỉnh sửa"}, status=404)
+        
+      # Validate content before saving
+      if path.suffix == ".jsonl":
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        for i, ln in enumerate(lines):
+          try:
+            json.loads(ln)
+          except json.JSONDecodeError as e:
+            return web.json_response({"success": False, "message": f"Dòng {i + 1} không phải JSON hợp lệ: {e}"}, status=400)
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+      else:
+        try:
+          data = json.loads(content)
+          if not isinstance(data, list):
+            return web.json_response({"success": False, "message": "Nội dung JSON phải là mảng (array)"}, status=400)
+          path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except json.JSONDecodeError as e:
+          return web.json_response({"success": False, "message": f"JSON không hợp lệ: {e}"}, status=400)
+          
+      self.log_activity("Dataset Updated", path.name, "success")
+      return web.json_response({"success": True, "message": "Đã cập nhật dataset thành công"})
+    except Exception as e:
+      if DEBUG >= 2:
+        traceback.print_exc()
+      return web.json_response({"success": False, "message": str(e)}, status=500)
+
   async def handle_get_activity_logs(self, request):
     # Return the last 50 activities, reversed (newest first)
     return web.json_response({"data": list(reversed(self.activity_logs[-50:]))})
@@ -2470,36 +2474,24 @@ class ChatGPTAPI:
         self.log_activity("Training Failed", model, "failed")
         return
 
-      is_ocr = False
-      if isinstance(raw_data, list) and len(raw_data) > 0:
-          if "image_path" in raw_data[0]:
-              is_ocr = True
+      pp = await preprocess_async(raw_data, format_type="auto", min_chars=min_chars, max_chars=max_chars, dedup=not skip_dedup,)
+      raw_data = pp["processed_samples"]
+      job["preprocess"] = {
+        "original_count": pp["original_count"],
+        "empty_removed": pp["empty_removed"],
+        "short_removed": pp["short_removed"],
+        "duplicate_removed": pp["duplicate_removed"],
+        "validation_errors": pp["validation_errors"],
+        "valid_count": pp["valid_count"],
+        "format_detected": pp["format_detected"],
+      }
+      if not raw_data:
+        job["status"] = "failed"
+        job["error"] = "Khong co mau hop le sau tien xu ly"
+        self.log_activity("Training Failed", model, "failed")
+        return
 
-      if not is_ocr:
-        pp = await preprocess_async(raw_data, format_type="auto", min_chars=min_chars, max_chars=max_chars, dedup=not skip_dedup,)
-        raw_data = pp["processed_samples"]
-        job["preprocess"] = {
-          "original_count": pp["original_count"],
-          "empty_removed": pp["empty_removed"],
-          "short_removed": pp["short_removed"],
-          "duplicate_removed": pp["duplicate_removed"],
-          "validation_errors": pp["validation_errors"],
-          "valid_count": pp["valid_count"],
-          "format_detected": pp["format_detected"],
-        }
-        if not raw_data:
-          job["status"] = "failed"
-          job["error"] = "Khong co mau hop le sau tien xu ly"
-          self.log_activity("Training Failed", model, "failed")
-          return
-
-      if is_ocr:
-          print(f"[Training] Bat dau huan luyen OCR (CRNN) phan tan cho model: {model}")
-          from synapse.training.ocr_trainer import train_crnn_ocr
-          await train_crnn_ocr(job, raw_data, self.node)
-          return
-
-      # Logic Training LLM cũ (Causal LM)
+      # Logic Training LLM (Causal LM)
       base_shard = build_base_shard(model, self.inference_engine_classname)
       if base_shard is None:
         job["status"] = "failed"
@@ -2946,6 +2938,11 @@ class ChatGPTAPI:
         except Exception:
           pass
 
+      # Lấy latency matrix
+      latency_matrix = {}
+      if hasattr(self.node, "_latency_cache"):
+        latency_matrix = self.node._latency_cache
+
       return web.json_response({
         "nodes": result,
         "total_nodes": len(result),
@@ -2953,6 +2950,7 @@ class ChatGPTAPI:
         "total_layers": total_layers,
         "strategy_name": strategy_name,
         "peer_graph": peer_graph,
+        "latency_matrix": latency_matrix,
         "training_job": self._training_job,
       })
     except Exception as e:
@@ -3031,18 +3029,3 @@ class ChatGPTAPI:
           print(f"[INFO] API server cleanup completed")
         except Exception as e:
           print(f"[WARNING] Error during runner cleanup: {e}")
-
-  def base64_decode(self, base64_string):
-    #decode and reshape image
-    if base64_string.startswith('data:image'):
-      base64_string = base64_string.split(',')[1]
-    image_data = base64.b64decode(base64_string)
-    img = Image.open(BytesIO(image_data))
-    W, H = (dim - dim%64 for dim in (img.width, img.height))
-    if W != img.width or H != img.height:
-      if DEBUG >= 2: print(f"Warning: image shape is not divisible by 64, downsampling to {W}x{H}")
-      img = img.resize((W, H), Image.NEAREST)  # use desired downsampling filter
-    img = np.array(img)
-    img = (img[:, :, :3].astype(np.float32)/255)*2 - 1
-    img = img[None]
-    return img

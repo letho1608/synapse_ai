@@ -87,10 +87,10 @@
                 <div class="chat-msg" :class="msg.role === 'user' ? 'chat-msg-user' : 'chat-msg-assistant'">
                     <div class="chat-msg-avatar" x-show="msg.role === 'assistant'"><i class="fas fa-robot"></i></div>
                     <div class="chat-msg-bubble">
-                        <div class="chat-msg-content" x-text="msg.content" style="white-space: pre-wrap;"></div>
+                        <div class="chat-msg-content markdown" x-html="renderMarkdown(msg.content)" style="white-space: normal;"></div>
                         <div class="chat-msg-usage text-muted" x-show="msg.usage" x-text="msg.usage"></div>
                     </div>
-                    <div class="chat-msg-avatar chat-msg-avatar-user" x-show="msg.role === 'user'"><i class="fas fa-user"></i></div>
+                    <div class="chat-msg-avatar chat-msg-avatar-user" x-show="msg.role === 'user'"><i class="fas fa-user"></i></div>    
                 </div>
             </template>
             <div class="chat-msg chat-msg-assistant" x-show="isTesting">

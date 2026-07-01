@@ -3195,29 +3195,6 @@
     "_discovered": true
   },
   {
-    "name": "Qwen/Qwen2.5-VL-3B-Instruct",
-    "provider": "Alibaba",
-    "parameter_count": "3.8B",
-    "parameters_raw": 3754622976,
-    "min_ram_gb": 2.1,
-    "recommended_ram_gb": 3.5,
-    "min_vram_gb": 1.9,
-    "quantization": "Q4_K_M",
-    "context_length": 128000,
-    "use_case": "Instruction following, chat",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "qwen2_5_vl",
-    "hf_downloads": 2442718,
-    "hf_likes": 620,
-    "release_date": "2025-01-26",
-    "gguf_sources": [
-      {
-        "repo": "unsloth/Qwen2.5-VL-3B-Instruct-GGUF",
-        "provider": "unsloth"
-      }
-    ]
-  },
-  {
     "name": "microsoft/Phi-tiny-MoE-instruct",
     "provider": "Microsoft",
     "parameter_count": "3.8B",
@@ -5226,24 +5203,6 @@
     "_discovered": true
   },
   {
-    "name": "lmms-lab/llava-onevision-qwen2-7b-ov",
-    "provider": "lmms-lab",
-    "parameter_count": "8.0B",
-    "parameters_raw": 8030348832,
-    "min_ram_gb": 4.5,
-    "recommended_ram_gb": 7.5,
-    "min_vram_gb": 4.1,
-    "quantization": "Q4_K_M",
-    "context_length": 32768,
-    "use_case": "General purpose text generation",
-    "pipeline_tag": "text-generation",
-    "architecture": "llava",
-    "hf_downloads": 138891,
-    "hf_likes": 62,
-    "release_date": "2024-06-29",
-    "_discovered": true
-  },
-  {
     "name": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
     "provider": "hugging-quants",
     "parameter_count": "8.0B",
@@ -5416,29 +5375,6 @@
     "hf_likes": 1,
     "release_date": "2025-04-29",
     "_discovered": true
-  },
-  {
-    "name": "Qwen/Qwen2.5-VL-7B-Instruct",
-    "provider": "Alibaba",
-    "parameter_count": "8.3B",
-    "parameters_raw": 8290000000,
-    "min_ram_gb": 4.6,
-    "recommended_ram_gb": 7.7,
-    "min_vram_gb": 4.2,
-    "quantization": "Q4_K_M",
-    "context_length": 32768,
-    "use_case": "Multimodal, vision and text",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "qwen2_vl",
-    "hf_downloads": 0,
-    "hf_likes": 0,
-    "release_date": null,
-    "gguf_sources": [
-      {
-        "repo": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
-        "provider": "unsloth"
-      }
-    ]
   },
   {
     "name": "LiquidAI/LFM2-8B-A1B",
@@ -5704,23 +5640,6 @@
     "_discovered": true
   },
   {
-    "name": "meta-llama/Llama-3.2-11B-Vision-Instruct",
-    "provider": "Meta",
-    "parameter_count": "11.0B",
-    "parameters_raw": 10665463808,
-    "min_ram_gb": 6.0,
-    "recommended_ram_gb": 9.9,
-    "min_vram_gb": 5.5,
-    "quantization": "Q4_K_M",
-    "context_length": 131072,
-    "use_case": "Multimodal, vision and text",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "llama",
-    "hf_downloads": 0,
-    "hf_likes": 0,
-    "release_date": null
-  },
-  {
     "name": "upstage/SOLAR-10.7B-Instruct-v1.0",
     "provider": "Upstage",
     "parameter_count": "10.7B",
@@ -5791,29 +5710,6 @@
     "hf_likes": 1,
     "release_date": "2025-12-04",
     "_discovered": true
-  },
-  {
-    "name": "google/gemma-3-12b-it",
-    "provider": "Google",
-    "parameter_count": "12B",
-    "parameters_raw": 12000000000,
-    "min_ram_gb": 6.7,
-    "recommended_ram_gb": 11.2,
-    "min_vram_gb": 6.1,
-    "quantization": "Q4_K_M",
-    "context_length": 131072,
-    "use_case": "Multimodal, vision and text",
-    "pipeline_tag": "text-generation",
-    "architecture": "gemma3",
-    "hf_downloads": 0,
-    "hf_likes": 0,
-    "release_date": null,
-    "gguf_sources": [
-      {
-        "repo": "unsloth/gemma-3-12b-it-GGUF",
-        "provider": "unsloth"
-      }
-    ]
   },
   {
     "name": "mistralai/Mistral-Nemo-Instruct-2407",
@@ -7140,52 +7036,6 @@
     ]
   },
   {
-    "name": "google/gemma-3-27b-it",
-    "provider": "Google",
-    "parameter_count": "27.4B",
-    "parameters_raw": 27432406640,
-    "min_ram_gb": 15.3,
-    "recommended_ram_gb": 25.5,
-    "min_vram_gb": 14.1,
-    "quantization": "Q4_K_M",
-    "context_length": 4096,
-    "use_case": "General purpose",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "gemma3",
-    "hf_downloads": 1651465,
-    "hf_likes": 1902,
-    "release_date": "2025-03-01",
-    "gguf_sources": [
-      {
-        "repo": "unsloth/gemma-3-27b-it-GGUF",
-        "provider": "unsloth"
-      }
-    ]
-  },
-  {
-    "name": "Qwen/Qwen3.5-27B",
-    "provider": "Alibaba",
-    "parameter_count": "27.8B",
-    "parameters_raw": 27781427952,
-    "min_ram_gb": 15.5,
-    "recommended_ram_gb": 25.9,
-    "min_vram_gb": 14.2,
-    "quantization": "Q4_K_M",
-    "context_length": 262144,
-    "use_case": "General purpose",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "qwen3_5",
-    "hf_downloads": 217725,
-    "hf_likes": 468,
-    "release_date": "2026-02-24",
-    "gguf_sources": [
-      {
-        "repo": "unsloth/Qwen3.5-27B-GGUF",
-        "provider": "unsloth"
-      }
-    ]
-  },
-  {
     "name": "lmstudio-community/GLM-4.7-Flash-MLX-8bit",
     "provider": "lmstudio-community",
     "parameter_count": "29.9B",
@@ -8119,29 +7969,6 @@
     ]
   },
   {
-    "name": "Qwen/Qwen3.5-35B-A3B",
-    "provider": "Alibaba",
-    "parameter_count": "36.0B",
-    "parameters_raw": 35951822704,
-    "min_ram_gb": 20.1,
-    "recommended_ram_gb": 33.5,
-    "min_vram_gb": 18.4,
-    "quantization": "Q4_K_M",
-    "context_length": 262144,
-    "use_case": "General purpose",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "qwen3_5_moe",
-    "hf_downloads": 481446,
-    "hf_likes": 734,
-    "release_date": "2026-02-24",
-    "gguf_sources": [
-      {
-        "repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
-        "provider": "unsloth"
-      }
-    ]
-  },
-  {
     "name": "lmstudio-community/Seed-OSS-36B-Instruct-MLX-8bit",
     "provider": "lmstudio-community",
     "parameter_count": "36.2B",
@@ -9040,29 +8867,6 @@
     ]
   },
   {
-    "name": "Qwen/Qwen3.5-122B-A10B",
-    "provider": "Alibaba",
-    "parameter_count": "125.1B",
-    "parameters_raw": 125086497008,
-    "min_ram_gb": 69.9,
-    "recommended_ram_gb": 116.5,
-    "min_vram_gb": 64.1,
-    "quantization": "Q4_K_M",
-    "context_length": 262144,
-    "use_case": "General purpose",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "qwen3_5_moe",
-    "hf_downloads": 127141,
-    "hf_likes": 358,
-    "release_date": "2026-02-24",
-    "gguf_sources": [
-      {
-        "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
-        "provider": "unsloth"
-      }
-    ]
-  },
-  {
     "name": "mistralai/Mixtral-8x22B-Instruct-v0.1",
     "provider": "Mistral AI",
     "parameter_count": "140.6B",
@@ -9797,44 +9601,6 @@
     "_discovered": true
   },
   {
-    "name": "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
-    "provider": "Meta",
-    "parameter_count": "401.6B",
-    "parameters_raw": 401583781376,
-    "min_ram_gb": 224.4,
-    "recommended_ram_gb": 374.0,
-    "min_vram_gb": 205.7,
-    "quantization": "Q4_K_M",
-    "context_length": 4096,
-    "use_case": "Instruction following, chat",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "llama4",
-    "hf_downloads": 6546,
-    "hf_likes": 466,
-    "release_date": "2025-04-01",
-    "is_moe": true,
-    "num_experts": 16,
-    "active_experts": 1,
-    "active_parameters": 17000000000
-  },
-  {
-    "name": "Qwen/Qwen3.5-397B-A17B",
-    "provider": "Alibaba",
-    "parameter_count": "403.4B",
-    "parameters_raw": 403397928944,
-    "min_ram_gb": 225.4,
-    "recommended_ram_gb": 375.7,
-    "min_vram_gb": 206.6,
-    "quantization": "Q4_K_M",
-    "context_length": 262144,
-    "use_case": "General purpose",
-    "pipeline_tag": "image-text-to-text",
-    "architecture": "qwen3_5_moe",
-    "hf_downloads": 1030009,
-    "hf_likes": 1144,
-    "release_date": "2026-02-16"
-  },
-  {
     "name": "meta-llama/Llama-3.1-405B-Instruct",
     "provider": "Meta",
     "parameter_count": "405.9B",
@@ -10197,22 +9963,5 @@
     "hf_downloads": 3353,
     "hf_likes": 500,
     "num_hidden_layers": 32
-  },
-  {
-    "name": "dcaybe/dcaybe-1.0-8.7m",
-    "provider": "Dcaybe",
-    "parameter_count": "8.7M",
-    "parameters_raw": 8700000,
-    "min_ram_gb": 15.6,
-    "recommended_ram_gb": 26.1,
-    "min_vram_gb": 15.6,
-    "quantization": "F16",
-    "context_length": 4096,
-    "use_case": "Nhận diện chữ viết tay (OCR)",
-    "pipeline_tag": "image-to-text",
-    "architecture": "unknown",
-    "hf_downloads": 0,
-    "hf_likes": 0,
-    "num_hidden_layers": 10
   }
 ]

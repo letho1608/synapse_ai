@@ -70,6 +70,16 @@ def get_models_dir():
         return Path(os.environ["SYNAPSE_MODELS_DIR"])
     return Path.home() / ".cache" / "huggingface" / "hub"
 
+def get_checkpoints_base_dir():
+    """Lấy thư mục gốc chứa các checkpoints (models/adapters)."""
+    if os.environ.get("SYNAPSE_CHECKPOINTS_DIR"):
+        return Path(os.environ["SYNAPSE_CHECKPOINTS_DIR"])
+    p = Path("backend") / "checkpoints"
+    if not p.exists():
+        p = Path("checkpoints")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
 def get_checkpoints_dir(model_id: str = ""):
     base = Path.home() / ".cache" / "huggingface" / "hub"
     if model_id:

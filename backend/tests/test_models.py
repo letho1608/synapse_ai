@@ -70,7 +70,7 @@ def test_build_base_and_full_shard():
     assert full is not None
     assert full.end_layer == full.n_layers - 1
     assert get_repo("qwen2.5:1.5b", "PyTorchHFInferenceEngine") == "Qwen/Qwen2.5-1.5B-Instruct"
-    assert "qwen2.5:1.5b" in list_models()
+    assert "qwen2.5-1.5b" in list_models()
     assert build_base_shard("__none__", "PyTorchHFInferenceEngine") is None
     assert build_full_shard("__none__", "PyTorchHFInferenceEngine") is None
     print("  [OK] test_build_base_and_full_shard")

@@ -70,6 +70,10 @@ function appState() {
                 datasetPreviewName: '',
                 datasetPreviewLines: 50,
                 datasetPreviewTarget: null,
+                datasetEditOpen: false,
+                datasetEditName: '',
+                datasetEditContent: '',
+                datasetEditLoading: false,
                 datasetCreateOpen: false,
                 datasetCreateName: '',
                 datasetCreateFormat: 'jsonl',
@@ -81,7 +85,16 @@ function appState() {
                 datasetRenameNewName: '',
                 datasetRenameLoading: false,
                 validateDatasetLoading: '',
-                settingsForm: { default_model: '', theme: 'light', discovery_module: 'tailscale' },
+                settingsForm: { 
+                    default_model: '', 
+                    theme: 'light', 
+                    discovery_module: 'tailscale',
+                    lacp_priority: 'latency',
+                    lacp_max_ping: 100,
+                    load_quantization: 'auto',
+                    lookahead_window: 3,
+                    transport_quantization: 'int8'
+                },
                 settingsLoading: false,
                 pageLoading: false,
                 datasetValidateResult: null,
@@ -92,12 +105,25 @@ function appState() {
                 clusterStrategyName: '',
                 clusterTotalLayers: 32,
                 clusterPeerGraph: {},
+                clusterLatencyMatrix: {},
                 // Removed chart refs to avoid Alpine Proxy issues
                 _lossHistory: [],
                 _monitoringHistory: { labels: [], cpu: [], ram: [], vram: [] },
                 // === Model filter ===
                 modelSearch: '',
                 modelStatusFilter: 'all',  // 'all', 'downloaded', 'available'
+                hfSearchQuery: '',
+                hfSearchResults: [],
+                hfSearchLoading: false,
+                // === Merging ===
+                mergeLoading: false,
+                mergeForm: {
+                    baseModel: '',
+                    selectedAdapters: [],
+                    type: 'linear',
+                    outputName: ''
+                },
+                checkpointList: [],
                 
                 async loadPage(page) {
                     this.pageLoading = true;
@@ -170,8 +196,7 @@ function appState() {
                     this.fetchDatasets();
                     this.fetchModels();
 
-                    this.settingsForm.theme = 'light';
-                    localStorage.setItem('synapse_theme', 'light');
+                    this.settingsForm.theme = localStorage.getItem('synapse_theme') || 'light';
                     this.applyTheme(this.settingsForm.theme);
                     
                     // Khởi tạo WebSocket thay vì dùng Polling
@@ -326,6 +351,11 @@ function appState() {
                         const data = await res.json();
                         this.settingsForm.default_model = data.default_model || '';
                         this.settingsForm.discovery_module = data.discovery_module || 'tailscale';
+                        this.settingsForm.lacp_priority = data.lacp_priority || 'latency';
+                        this.settingsForm.lacp_max_ping = data.lacp_max_ping || 100;
+                        this.settingsForm.load_quantization = data.load_quantization || 'auto';
+                        this.settingsForm.lookahead_window = data.lookahead_window || 3;
+                        this.settingsForm.transport_quantization = data.transport_quantization || 'int8';
                     } catch (e) {
                         console.error('fetchSettings:', e);
                     }
@@ -350,7 +380,12 @@ function appState() {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 default_model: this.settingsForm.default_model || undefined,
-                                discovery_module: this.settingsForm.discovery_module || 'tailscale'
+                                discovery_module: this.settingsForm.discovery_module || 'tailscale',
+                                lacp_priority: this.settingsForm.lacp_priority,
+                                lacp_max_ping: this.settingsForm.lacp_max_ping,
+                                load_quantization: this.settingsForm.load_quantization,
+                                lookahead_window: this.settingsForm.lookahead_window,
+                                transport_quantization: this.settingsForm.transport_quantization
                             })
                         });
                         const data = await res.json();
@@ -359,7 +394,7 @@ function appState() {
                             await this.fetchModelList();
                             await this.fetchActivity();
                             if (data.restarted) {
-                                alert("Cài đặt đã được lưu. Hệ thống đang tự động khởi động lại mạng dưới nền để áp dụng phương thức kết nối mới. Vui lòng đợi trong giây lát...");
+                                alert("Cài đặt đã được lưu. Hệ thống đang tự động khởi động lại mạng dưới nền để áp dụng các thay đổi mới. Vui lòng đợi trong giây lát...");
                                 this.isOffline = true;
                                 setTimeout(() => { this.fetchSystemInfo(); }, 3000);
                             } else {
@@ -482,6 +517,54 @@ function appState() {
                         }
                     } catch (e) {
                         alert('Lỗi: ' + (e.message || e));
+                    }
+                },
+
+                async editDataset(dataset) {
+                    this.datasetEditName = dataset.name;
+                    this.datasetEditOpen = true;
+                    this.datasetEditContent = 'Đang tải nội dung...';
+                    this.datasetEditLoading = false;
+                    try {
+                        // Tải toàn bộ nội dung (lines=100000)
+                        const res = await fetch('/v1/datasets/preview?path=' + encodeURIComponent(dataset.path) + '&lines=100000');
+                        const data = await res.json();
+                        if (data.success) {
+                            this.datasetEditContent = (data.preview || []).join('\n');
+                        } else {
+                            alert(data.message || 'Không tải được nội dung');
+                            this.datasetEditOpen = false;
+                        }
+                    } catch (e) {
+                        alert('Lỗi: ' + (e.message || e));
+                        this.datasetEditOpen = false;
+                    }
+                },
+
+                async saveDatasetEdit() {
+                    if (this.datasetEditLoading) return;
+                    this.datasetEditLoading = true;
+                    try {
+                        const res = await fetch('/v1/datasets/update', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                name: this.datasetEditName,
+                                content: this.datasetEditContent
+                            })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.showToast('Đã lưu thay đổi dataset', 'success');
+                            this.datasetEditOpen = false;
+                            await this.fetchDatasets();
+                        } else {
+                            alert(data.message || 'Lưu thất bại');
+                        }
+                    } catch (e) {
+                        alert('Lỗi: ' + (e.message || e));
+                    } finally {
+                        this.datasetEditLoading = false;
                     }
                 },
 
@@ -660,6 +743,23 @@ function appState() {
                         alert('Lỗi: ' + (e.message || e));
                     } finally {
                         this.pullLoading = '';
+                    }
+                },
+
+                async searchHuggingFace() {
+                    if (!this.hfSearchQuery.trim() || this.hfSearchLoading) return;
+                    this.hfSearchLoading = true;
+                    try {
+                        const res = await fetch('/v1/models/search?q=' + encodeURIComponent(this.hfSearchQuery.trim()));
+                        const data = await res.json();
+                        this.hfSearchResults = data.data || [];
+                        if (this.hfSearchResults.length === 0) {
+                            this.showToast('Không tìm thấy model nào trên Hugging Face', 'warning');
+                        }
+                    } catch (e) {
+                        alert('Lỗi tìm kiếm: ' + (e.message || e));
+                    } finally {
+                        this.hfSearchLoading = false;
                     }
                 },
 
@@ -972,6 +1072,10 @@ function appState() {
                         const res = await fetch('/v1/activity');
                         const data = await res.json();
                         this.activities = data.data || [];
+                        
+                        // Calculate metrics from activities for dashboard
+                        this.stats.training_count = this.activities.filter(a => a.action && a.action.toLowerCase().includes('training')).length;
+                        this.stats.tests_count = this.activities.filter(a => a.action && a.action.toLowerCase().includes('inference')).length;
                     } catch (e) {
                         console.error('Error fetching activity:', e);
                     }
@@ -1100,12 +1204,52 @@ function appState() {
                     if (el) el.scrollTop = el.scrollHeight;
                 },
 
+                async fetchCheckpoints() {
+                    try {
+                        const res = await fetch('/v1/models/checkpoints');
+                        const data = await res.json();
+                        this.checkpointList = data.data || [];
+                    } catch (e) {
+                        console.error('fetchCheckpoints:', e);
+                    }
+                },
+
+                async runMerge() {
+                    if (this.mergeLoading) return;
+                    this.mergeLoading = true;
+                    try {
+                        const res = await fetch('/v1/models/merge', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                base_model: this.mergeForm.baseModel,
+                                adapters: this.mergeForm.selectedAdapters,
+                                output_name: this.mergeForm.outputName,
+                                merge_type: this.mergeForm.type
+                            })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.showToast('Hợp nhất mô hình thành công!', 'success');
+                            await this.fetchCheckpoints();
+                            await this.fetchModels();
+                        } else {
+                            alert(data.message || data.error || 'Hợp nhất thất bại');
+                        }
+                    } catch (e) {
+                        alert('Lỗi: ' + (e.message || e));
+                    } finally {
+                        this.mergeLoading = false;
+                    }
+                },
+
                 getPageTitle() {
                     const titles = {
                         'dashboard': 'Dashboard',
                         'models': 'Quản Lý Mô Hình',
                         'test': 'Kiểm thử',
                         'training': 'Training',
+                        'merging': 'Model Merging',
                         'datasets': 'Quản Lý Dataset',
                         'monitoring': 'Giám Sát Hệ Thống',
                         'settings': 'Cài Đặt',
@@ -1123,7 +1267,6 @@ function appState() {
                         });
                     }
                 },
-                },
 
                 // ===== CLUSTER RESOURCES =====
                 async fetchClusterResources() {
@@ -1136,6 +1279,7 @@ function appState() {
                         this.clusterTotalLayers = data.total_layers || 32;
                         this.clusterTrainingJob = data.training_job || null;
                         this.clusterPeerGraph = data.peer_graph || {};
+                        this.clusterLatencyMatrix = data.latency_matrix || {};
                         this.$nextTick(() => this.renderClusterCharts());
                     } catch (e) {
                         console.error('fetchClusterResources:', e);
@@ -1253,6 +1397,32 @@ function appState() {
                             || (status === 'available' && !m.isDownloaded);
                         return matchSearch && matchStatus;
                     });
+                },
+                renderMarkdown(text) {
+                    if (!text) return '';
+                    try {
+                        if (typeof marked === 'undefined') return text;
+                        // Configure marked for code highlighting
+                        marked.setOptions({
+                            highlight: function(code, lang) {
+                                if (typeof hljs !== 'undefined') {
+                                    const language = hljs.getLanguage(lang) ? lang : 'plaintext';
+                                    return hljs.highlight(code, { language }).value;
+                                }
+                                return code;
+                            },
+                            breaks: true,
+                            gfm: true
+                        });
+                        const rawHtml = marked.parse(text);
+                        if (typeof DOMPurify !== 'undefined') {
+                            return DOMPurify.sanitize(rawHtml);
+                        }
+                        return rawHtml;
+                    } catch (e) {
+                        console.error('Markdown error:', e);
+                        return text;
+                    }
                 },
                 parseAnsi(text) {
                     if (!text) return '';

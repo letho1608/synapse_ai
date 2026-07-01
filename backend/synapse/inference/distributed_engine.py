@@ -202,18 +202,32 @@ class DistributedPipelineController:
                 if result is not None and result.tokens:
                     all_generated_tokens.extend(result.tokens)
 
-            # Decode phase: sequential (each token depends on previous)
-            for token_idx in range(1, max_generate_tokens):
-                if session.is_finished:
-                    break
-
-                if len(all_generated_tokens) >= max_generate_tokens:
-                    break
-
-                last_token = np.array([[all_generated_tokens[-1]]])
+            # Decode phase: sequential with N-gram Lookahead optimization
+            lookahead_window = getattr(self, "lookahead_window", 3)
+            ngram_size = 3
+            
+            while not session.is_finished and len(all_generated_tokens) < max_generate_tokens:
+                # Guess next tokens using simple N-gram matching on current history
+                guesses = []
+                if lookahead_window > 0 and len(all_generated_tokens) >= ngram_size + 1:
+                    history = all_generated_tokens
+                    suffix = history[-ngram_size:]
+                    # Search for previous occurrences of this suffix
+                    for i in range(len(history) - ngram_size - 1, 0, -1):
+                        if history[i:i+ngram_size] == suffix:
+                            # Potential match! Use following tokens as guesses
+                            guesses = history[i+ngram_size : i+ngram_size+lookahead_window]
+                            if guesses:
+                                if DEBUG >= 2: print(f"[Lookahead] Guessed: {guesses} (based on history index {i})")
+                                break
+                
+                # Combine last token with guesses for parallel verification
+                candidate_tokens = [all_generated_tokens[-1]] + guesses
+                input_tensor = np.array([candidate_tokens], dtype=np.int64)
+                
                 await self._send_input_to_stage(
                     first_stage_node_id, first_stage_shard,
-                    last_token, request_id, is_prompt=False,
+                    input_tensor, request_id, is_prompt=False,
                     microbatch_id=0,
                 )
 
@@ -221,10 +235,36 @@ class DistributedPipelineController:
                     request_id, last_stage_node_id, last_stage_shard, timeout=30.0,
                 )
 
-                if next_result is None:
+                if next_result is None or not next_result.tokens:
                     break
-                if next_result.tokens:
-                    all_generated_tokens.extend(next_result.tokens)
+                
+                # Verify guesses: check which tokens matched the model's actual predictions
+                # Since candidate_tokens has N tokens, next_result.tokens should also have N tokens
+                # where result[i] is the model's prediction AFTER candidate[i].
+                accepted_count = 1 # Always accept the first actual prediction
+                
+                # For candidate[0], prediction is next_result[0]
+                # For candidate[1] (guess1), prediction is next_result[1]
+                # If next_result[0] == candidate[1], then guess1 was correct!
+                for g_idx in range(len(guesses)):
+                    if next_result.tokens[g_idx] == guesses[g_idx]:
+                        accepted_count += 1
+                        if DEBUG >= 2: print(f"[Lookahead] Correct guess: {guesses[g_idx]}!")
+                    else:
+                        break # Stop at first wrong guess
+                
+                # Add all accepted tokens to our history
+                verified_tokens = next_result.tokens[:accepted_count]
+                all_generated_tokens.extend(verified_tokens)
+                
+                if on_token_callback:
+                    try:
+                        if asyncio.iscoroutinefunction(on_token_callback):
+                            await on_token_callback(request_id, verified_tokens, False)
+                        else:
+                            on_token_callback(request_id, verified_tokens, False)
+                    except Exception: pass
+
                 if next_result.is_finished:
                     break
 
@@ -264,17 +304,24 @@ class DistributedPipelineController:
         microbatch_id: int = 0,
     ) -> None:
         topic = f"synapse/inference/tensor/{target_node_id}"
-        payload = {
-            "request_id": request_id,
-            "shard": target_shard.to_dict(),
-            "tensor_data": input_data.tobytes(),
-            "shape": list(input_data.shape),
-            "dtype": str(input_data.dtype),
-            "inference_state": {"is_prompt": is_prompt},
-            "_orchestrator_id": self.node_id,
-            "microbatch_id": microbatch_id,
-        }
-        await self.event_router.publish(topic, payload)
+        
+        # Use INT8 quantization for hidden states to slash bandwidth on slow links
+        is_hidden_states = np.issubdtype(input_data.dtype, np.floating)
+        quantize = is_hidden_states 
+        
+        encoded_payload = encode_tensor(
+            input_data,
+            metadata={
+                "request_id": request_id,
+                "shard": target_shard.to_dict(),
+                "inference_state": {"is_prompt": is_prompt},
+                "_orchestrator_id": self.node_id,
+                "microbatch_id": microbatch_id,
+                "_sent_at": time.time(),
+            },
+            quantize_int8=quantize
+        )
+        await self.event_router.publish(topic, {"bin": encoded_payload})
 
     async def _collect_result(
         self,
@@ -381,16 +428,23 @@ class DistributedPipelineController:
                     if next_stage_idx < len(partition_assignments):
                         next_node_id, next_shard = partition_assignments[next_stage_idx]
                         topic = f"synapse/inference/tensor/{next_node_id}"
-                        payload = {
-                            "request_id": request_id,
-                            "shard": next_shard.to_dict(),
-                            "tensor_data": result.data.tobytes(),
-                            "shape": list(result.data.shape),
-                            "dtype": str(result.data.dtype),
-                            "inference_state": {"is_prompt": True},
-                            "_orchestrator_id": self.node_id,
-                        }
-                        await self.event_router.publish(topic, payload)
+                        
+                        # Use INT8 for hidden states
+                        is_hidden_states = np.issubdtype(result.data.dtype, np.floating)
+                        quantize = is_hidden_states
+                        
+                        encoded_payload = encode_tensor(
+                            result.data,
+                            metadata={
+                                "request_id": request_id,
+                                "shard": next_shard.to_dict(),
+                                "inference_state": {"is_prompt": True},
+                                "_orchestrator_id": self.node_id,
+                                "_sent_at": time.time(),
+                            },
+                            quantize_int8=quantize
+                        )
+                        await self.event_router.publish(topic, {"bin": encoded_payload})
                 send_fn = relay_send
 
             stage = PipelineStage(

@@ -81,24 +81,27 @@
 
         <!-- Cluster Status -->
         <div class="stat-card">
-            <div class="stat-label">CLUSTER STATUS</div>
-            <div style="font-size: 24px; font-weight: bold; color:#10B981; margin-top: 8px;" x-text="networkNodes.length || 0"></div>
-            <div class="text-muted" style="font-size: 10px; margin-bottom: 8px;">Active Nodes</div>
-            <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
-                <span class="text-muted">Network Health</span>
-                <span x-text="(systemInfo.network_discovery || 'Unknown').toUpperCase()"></span>
+            <div class="stat-label">CLUSTER HEALTH</div>
+            <div style="font-size: 24px; font-weight: bold; color:#10B981; margin-top: 8px;" x-text="clusterResources.length || 0"></div>
+            <div class="text-muted" style="font-size: 10px; margin-bottom: 12px;">Active Nodes</div>
+            
+            <div style="height:4px; background:var(--border); border-radius:2px; margin-bottom:12px; display:flex; gap:2px">
+                <template x-for="node in clusterResources">
+                    <div style="flex:1; height:100%; background:#10B981; border-radius:1px"></div>
+                </template>
             </div>
+
             <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
-                <span class="text-muted">Partitions</span>
-                <span x-text="distributedStatus.partitions_count || 0"></span>
+                <span class="text-muted">Total Shards</span>
+                <span x-text="clusterResources.reduce((acc, n) => acc + (n.layer_count || 0), 0) + ' Layers'"></span>
             </div>
             <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
                 <span class="text-muted">Dist. Inference</span>
-                <span :style="distributedStatus.multi_node_inference ? 'color:var(--success)' : 'color:var(--text-muted)'" x-text="distributedStatus.multi_node_inference ? 'Ready' : 'Disabled'"></span>
+                <span :style="distributedStatus.multi_node_inference ? 'color:var(--success)' : 'color:var(--text-muted)'" x-text="distributedStatus.multi_node_inference ? 'Ready' : 'OFF'"></span>
             </div>
             <div style="display:flex; justify-content:space-between; font-size:11px; margin-top:4px;">
-                <span class="text-muted">Dist. Training</span>
-                <span :style="distributedStatus.multi_node_training ? 'color:var(--success)' : 'color:var(--text-muted)'" x-text="distributedStatus.multi_node_training ? 'Ready' : 'Disabled'"></span>
+                <span class="text-muted">Total VRAM</span>
+                <span x-text="clusterResources.reduce((acc, n) => acc + (n.vram_gb || 0), 0).toFixed(1) + ' GB'"></span>
             </div>
             
             <template x-if="networkNodes.length === 0">
@@ -129,15 +132,6 @@
                 <div style="font-size: 24px; font-weight: bold; color:#8B5CF6;" x-text="stats.tests_count || 0"></div>
                 <div class="text-muted" style="font-size: 10px;">Tests</div>
             </div>
-            
-            <template x-if="(stats.datasets_count || 0) === 0">
-                <div style="margin-top: 12px; text-align:center;">
-                    <div style="font-size: 11px; color:var(--text-muted); margin-bottom: 8px;">No datasets available</div>
-                    <button class="btn btn-outline" style="width:100%; font-size:10px; padding:4px 8px; color:var(--text-primary); border-color:var(--border);" @click="currentPage = 'datasets'">
-                        <i class="fas fa-database" style="margin-right:4px;"></i> Add Dataset
-                    </button>
-                </div>
-            </template>
         </div>
     </div>
 

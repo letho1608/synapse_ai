@@ -14,9 +14,6 @@ import json
 class ModelType(Enum):
     """Loại mô hình AI"""
     NLP = "nlp"
-    VISION = "vision"
-    MULTIMODAL = "multimodal"
-    AUDIO = "audio"
     TIMESERIES = "timeseries"
     GRAPH = "graph"
     CUSTOM = "custom"
@@ -32,23 +29,6 @@ class TaskType(Enum):
     SUMMARIZATION = "summarization"
     TRANSLATION = "translation"
     
-    # Vision Tasks
-    IMAGE_GENERATION = "image_generation"
-    IMAGE_CLASSIFICATION = "image_classification"
-    OBJECT_DETECTION = "object_detection"
-    SEMANTIC_SEGMENTATION = "semantic_segmentation"
-    IMAGE_TO_IMAGE = "image_to_image"
-    
-    # Multimodal Tasks
-    IMAGE_TEXT_TO_TEXT = "image_text_to_text"
-    TEXT_TO_IMAGE = "text_to_image"
-    VISUAL_QUESTION_ANSWERING = "visual_question_answering"
-    
-    # Audio Tasks
-    SPEECH_RECOGNITION = "speech_recognition"
-    TEXT_TO_SPEECH = "text_to_speech"
-    AUDIO_CLASSIFICATION = "audio_classification"
-    
     # Other
     CUSTOM = "custom"
 
@@ -60,7 +40,7 @@ class ModelConfig:
     
     Attributes:
         model_name: Tên định danh của mô hình
-        model_type: Loại mô hình (NLP, Vision, etc.)
+        model_type: Loại mô hình (NLP, etc.)
         task_type: Task mà mô hình thực hiện
         hidden_size: Kích thước hidden dimension
         num_layers: Số lượng layers

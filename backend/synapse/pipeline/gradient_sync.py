@@ -77,14 +77,20 @@ class DistributedTrainer:
         ring_order: Optional[List[str]] = None,
         learning_rate: float = 1e-5,
         max_grad_norm: float = 1.0,
+        quantize_grads: bool = True,
     ):
         self.node_id = node_id
         self.world_size = world_size
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+        self.quantize_grads = quantize_grads
         self.reducer = RingAllReducer(world_size, ring_order=ring_order)
         self._train_step: int = 0
         self._loss_history: List[float] = []
+
+    def _quantize_gradients(self, gradients: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """Quantize gradients to FP16 to save 50% bandwidth."""
+        return {k: v.astype(np.float16) for k, v in gradients.items()}
 
     async def step(
         self,
@@ -96,14 +102,20 @@ class DistributedTrainer:
         self._train_step += 1
 
         self.reducer.reset(self.node_id)
-        self.reducer.accumulate(self.node_id, local_gradients)
-
+        
+        # Prepare gradients for ring transfer
         current_gradients = local_gradients
+        if self.quantize_grads:
+            current_gradients = self._quantize_gradients(current_gradients)
+            
+        self.reducer.accumulate(self.node_id, current_gradients)
+
         predecessor = self.reducer.get_predecessor(self.node_id)
         successor = self.reducer.get_successor(self.node_id)
 
         for _ in range(max(1, self.world_size) - 1):
             if send_fn and successor:
+                # Fire and forget or await? Usually await to ensure sequential ring flow
                 await send_fn(successor, current_gradients)
             if recv_fn and predecessor:
                 received = await recv_fn(predecessor)
@@ -112,14 +124,17 @@ class DistributedTrainer:
 
         reduced = self.reducer.get_accumulated(self.node_id)
 
+        # Gradient clipping
         total_norm = 0.0
         for grad in reduced.values():
-            total_norm += np.sum(grad ** 2)
+            total_norm += np.sum(grad.astype(np.float32) ** 2)
         total_norm = np.sqrt(total_norm)
 
         scale = self.max_grad_norm / max(total_norm, self.max_grad_norm)
         if scale < 1.0:
-            reduced = {k: v * scale for k, v in reduced.items()}
+            reduced = {k: (v.astype(np.float32) * scale) for k, v in reduced.items()}
+        else:
+            reduced = {k: v.astype(np.float32) for k, v in reduced.items()}
 
         updates = {}
         for param, grad in reduced.items():

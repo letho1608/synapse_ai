@@ -1,0 +1,114 @@
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <div>
+        <h2 style="margin:0;font-size:18px;color:var(--text-primary)"><i class="fas fa-object-group" style="color:var(--primary);margin-right:8px"></i>Model Merging & Quantization</h2>
+        <p class="text-muted" style="margin:4px 0 0 0;font-size:13px">Hợp nhất các LoRA adapters hoặc Checkpoints để tạo mô hình mới.</p>
+    </div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+    <!-- Cột 1: Form Hợp nhất -->
+    <div class="card">
+        <div class="card-header" style="margin-bottom:16px">
+            <h2 class="card-title" style="font-size:14px; text-transform:uppercase"><i class="fas fa-plus-circle"></i> Create New Merge</h2>
+        </div>
+        
+        <div class="form-group" style="margin-bottom:12px">
+            <label class="form-label">Base Model</label>
+            <select class="form-input" x-model="mergeForm.baseModel">
+                <option value="">-- Chọn Base Model --</option>
+                <template x-for="m in modelList.downloaded" :key="m.name">
+                    <option :value="m.name" x-text="m.name"></option>
+                </template>
+            </select>
+        </div>
+
+        <div class="form-group" style="margin-bottom:12px">
+            <label class="form-label">Adapters / Checkpoints to Merge</label>
+            <div style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border); border-radius: 4px; padding: 8px;">
+                <template x-for="cp in checkpointList" :key="cp.path">
+                    <div style="display:flex; align-items:center; margin-bottom:4px; font-size:12px">
+                        <input type="checkbox" :value="cp.name" x-model="mergeForm.selectedAdapters" style="margin-right:8px">
+                        <span x-text="cp.name"></span>
+                        <span class="badge badge-muted" style="font-size:9px; margin-left:auto" x-text="cp.type"></span>
+                    </div>
+                </template>
+                <div x-show="checkpointList.length === 0" class="text-muted" style="font-size:11px; text-align:center; padding:10px">
+                    No checkpoints found in checkpoints/ folder.
+                </div>
+            </div>
+            <p class="text-muted" style="font-size:10px; margin-top:4px">Chọn ít nhất 1 adapter để hợp nhất vào base model.</p>
+        </div>
+
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px">
+            <div class="form-group" style="margin-bottom:12px">
+                <label class="form-label">Merge Type</label>
+                <select class="form-input" x-model="mergeForm.type">
+                    <option value="linear">Linear (Weighted Sum)</option>
+                    <option value="slerp">SLERP (Spherical Linear)</option>
+                    <option value="ties">Ties Merging</option>
+                </select>
+            </div>
+            <div class="form-group" style="margin-bottom:12px">
+                <label class="form-label">Output Name</label>
+                <input type="text" class="form-input" x-model="mergeForm.outputName" placeholder="vd: qwen2.5-merged-v1">
+            </div>
+        </div>
+
+        <div style="margin-top:16px">
+            <button class="btn btn-primary" style="width:100%" 
+                    :disabled="mergeLoading || !mergeForm.baseModel || mergeForm.selectedAdapters.length === 0 || !mergeForm.outputName"
+                    @click="runMerge()">
+                <i class="fas fa-spinner fa-spin" x-show="mergeLoading"></i>
+                <span x-text="mergeLoading ? 'MERGING...' : 'START MERGE PROCESS'"></span>
+            </button>
+        </div>
+    </div>
+
+    <!-- Cột 2: Danh sách Checkpoints & History -->
+    <div style="display:flex; flex-direction:column; gap:20px">
+        <div class="card">
+            <div class="card-header" style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center">
+                <h2 class="card-title" style="font-size:14px; text-transform:uppercase"><i class="fas fa-archive"></i> Saved Checkpoints</h2>
+                <button class="btn btn-outline btn-sm" @click="fetchCheckpoints()" style="padding:2px 6px"><i class="fas fa-sync-alt"></i></button>
+            </div>
+            <div class="table-container" style="max-height: 400px; overflow-y: auto;">
+                <table class="data-table" style="font-size:11px">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Type</th>
+                            <th>Created</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="cp in checkpointList" :key="cp.path">
+                            <tr>
+                                <td style="font-weight:600" x-text="cp.name"></td>
+                                <td><span class="badge" :class="cp.type === 'adapter' ? 'badge-primary' : 'badge-warning'" x-text="cp.type.toUpperCase()"></span></td>
+                                <td class="text-muted" x-text="cp.created"></td>
+                                <td>
+                                    <button class="btn btn-outline btn-sm" style="padding:2px 4px" title="Use as base" @click="mergeForm.baseModel = cp.name"><i class="fas fa-level-up-alt"></i></button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="background: var(--primary-bg); border-color: var(--primary-light)">
+    <div style="display:flex; gap:16px; align-items:flex-start">
+        <i class="fas fa-info-circle" style="color:var(--primary); font-size:20px; margin-top:4px"></i>
+        <div>
+            <h3 style="margin:0 0 4px 0; font-size:14px; color:var(--primary)">Hợp nhất (Merging) hoạt động như thế nào?</h3>
+            <p style="margin:0; font-size:12px; line-height:1.5; color:var(--text-secondary)">
+                Quá trình này sẽ tải mô hình cơ sở (Base Model) vào RAM, sau đó áp dụng các trọng số từ LoRA adapters đã chọn. 
+                Kết quả cuối cùng sẽ được lưu lại dưới dạng một mô hình đầy đủ (Full Model) trong thư mục <code>checkpoints/</code>. 
+                Bạn có thể sử dụng mô hình mới này cho Inference ngay lập tức.
+            </p>
+        </div>
+    </div>
+</div>
