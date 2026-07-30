@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Latency Matrix & Hierarchical Clustering
+LACP — Latency Matrix & Hierarchical Clustering
 
 Builds an N×N latency matrix between all nodes in the cluster,
 then performs agglomerative hierarchical clustering to group

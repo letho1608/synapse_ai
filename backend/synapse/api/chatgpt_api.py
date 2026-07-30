@@ -2802,7 +2802,7 @@ class ChatGPTAPI:
       except Exception:
         pass
 
-      strategy_name = "LACP 3.0 (Multi-Resource + Latency Clustering)"
+      strategy_name = "LACP (Multi-Resource + Latency Clustering)"
       if topology and self.node.topology.nodes:
         try:
           partitions = self.node._compute_lacp_partition()

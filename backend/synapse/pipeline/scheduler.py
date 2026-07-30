@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Pipeline Parallelism Scheduler (1F1B / GPipe)
+LACP — Pipeline Parallelism Scheduler (1F1B / GPipe)
 
 Implements the One-Forward-One-Backward (1F1B) schedule for pipeline
 parallelism across multiple nodes. This eliminates pipeline bubbles

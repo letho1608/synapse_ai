@@ -16,7 +16,7 @@ sys.path.insert(0, ROOT)
 # --- Test 1: Import LACP modules ---
 
 def test_import_lacp_modules():
-    """Import tất cả LACP 3.0 modules."""
+    """Import tất cả LACP modules."""
     from synapse.topology.resource_weight import NodeResources, ResourceWeights, ResourceScorer, NormalizedScores
     from synapse.topology.latency_matrix import LatencyMatrix, LatencyProber, HierarchicalClusterer, Cluster
     from synapse.topology.partitioner import compute_partition, LACPPartition, ShardAssignment
@@ -30,7 +30,7 @@ def test_import_lacp_modules():
 # --- Test 2: NodeResources ---
 
 def test_node_resources():
-    """Test NodeResources dataclass (LACP 3.0)."""
+    """Test NodeResources dataclass (LACP)."""
     from synapse.topology.resource_weight import NodeResources
     
     r = NodeResources(
@@ -47,7 +47,7 @@ def test_node_resources():
 # --- Test 3: Cluster ---
 
 def test_lacp3_cluster():
-    """Test Cluster dataclass (LACP 3.0)."""
+    """Test Cluster dataclass (LACP)."""
     from synapse.topology.latency_matrix import Cluster
     
     cluster = Cluster(cluster_id=1, nodes=["A", "B", "C"], centroid_latency_ms=15.0, intra_latency_ms=5.0)
@@ -58,10 +58,10 @@ def test_lacp3_cluster():
     print(" [OK] test_lacp3_cluster")
 
 
-# --- Test 4: LACP 3.0 HierarchicalClusterer ---
+# --- Test 4: LACP HierarchicalClusterer ---
 
 def test_hierarchical_clusterer():
-    """Test LACP 3.0 HierarchicalClusterer clustering."""
+    """Test LACP HierarchicalClusterer clustering."""
     from synapse.topology.latency_matrix import HierarchicalClusterer, LatencyMatrix, LatencyEntry
     
     matrix = LatencyMatrix(
@@ -119,7 +119,7 @@ def test_hierarchical_clusterer_fallback():
 # --- Test 5: ResourceScorer ---
 
 def test_resource_scorer():
-    """Test LACP 3.0 ResourceScorer."""
+    """Test LACP ResourceScorer."""
     from synapse.topology.resource_weight import ResourceScorer, NodeResources, ResourceWeights
     
     nodes = {
@@ -141,10 +141,10 @@ def test_resource_scorer():
     print(" [OK] test_resource_scorer")
 
 
-# --- Test 6: compute_partition (LACP 3.0 entry point) ---
+# --- Test 6: compute_partition (LACP entry point) ---
 
 def test_compute_partition():
-    """Test LACP 3.0 compute_partition with 2 nodes."""
+    """Test LACP compute_partition with 2 nodes."""
     from synapse.topology.partitioner import compute_partition
     from synapse.topology.resource_weight import NodeResources
     
@@ -345,10 +345,10 @@ def test_async_forwarder_create():
     print(" [OK] test_async_forwarder_create")
 
 
-# --- Test 12: Integration - Full LACP 3.0 flow ---
+# --- Test 12: Integration - Full LACP flow ---
 
 def test_lacp3_full_integration():
-    """Test full LACP 3.0 flow: resource scoring → cluster → partition → pipeline."""
+    """Test full LACP flow: resource scoring → cluster → partition → pipeline."""
     from synapse.topology.partitioner import compute_partition
     from synapse.topology.resource_weight import NodeResources
     from synapse.topology.latency_matrix import LatencyMatrix, LatencyEntry
@@ -407,14 +407,14 @@ def test_lacp3_full_integration():
 # --- Test 13: Verify LargestRemainder removed ---
 
 def test_largest_remainder_removed():
-    """Verify LargestRemainderPartitioningStrategy is removed (LACP 3.0 replaces LACP 2.0)."""
+    """Verify LargestRemainderPartitioningStrategy is removed (LACP replaces LACP 2.0)."""
     import os
     assert not os.path.exists(
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "synapse", "topology", "largest_remainder.py")
     ), "LargestRemainderPartitioningStrategy should be deleted"
     
-    # Verify LACP 3.0 is available
+    # Verify LACP is available
     from synapse.topology.partitioner import compute_partition
     assert compute_partition is not None
     

@@ -1,5 +1,5 @@
 """
-Test LACP 3.0 — Pipeline Parallelism 1F1B Scheduler
+Test LACP — Pipeline Parallelism 1F1B Scheduler
 
 Validates:
 1. 1F1B schedule generation is correct (warmup, steady, cooldown)

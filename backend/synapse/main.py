@@ -118,8 +118,8 @@ event_router = EventRouter()
 libp2p_node = Libp2pNode(args.node_id, args.node_port or 5678, event_router)
 
 topology_viz = TopologyViz(chatgpt_api_endpoints=chatgpt_api_endpoints, web_chat_urls=web_chat_urls) if not args.disable_tui else None
-# LACP 3.0 multi-resource partitioning is built into Node via compute_partition()
-if DEBUG >= 1: print("Using LACP 3.0 (Multi-Resource + Latency Clustering) partitioning strategy")
+# LACP multi-resource partitioning is built into Node via compute_partition()
+if DEBUG >= 1: print("Using LACP (Multi-Resource + Latency Clustering) partitioning strategy")
 
 def create_peer_handle(node_id: str, address: str, desc: str, dev_caps: DeviceCapabilities):
     return P2PPeerHandle(node_id, address, desc, dev_caps, event_router, libp2p_node)

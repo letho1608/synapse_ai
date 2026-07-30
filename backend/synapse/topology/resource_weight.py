@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Latency-Aware Compute Pooling Resource Weight Engine
+LACP — Latency-Aware Compute Pooling Resource Weight Engine
 
 Computes a unified resource score for each node based on:
 - GPU VRAM (primary for layer capacity)
@@ -108,7 +108,7 @@ def normalize(value: float, min_val: float, max_val: float) -> float:
 @dataclass
 class ResourceWeights:
     """
-    Configurable weights for the LACP 3.0 composite score.
+    Configurable weights for the LACP composite score.
     Sums to 1.0. Adjust per deployment scenario.
     """
     vram: float = 0.25

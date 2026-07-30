@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Result Router
+LACP — Result Router
 
 Handles in-order reassembly of results from distributed pipeline nodes.
 Every tensor carries a (request_id, orchestrator_id, micro_batch_id,

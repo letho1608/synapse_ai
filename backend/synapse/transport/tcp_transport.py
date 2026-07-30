@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Direct TCP Transport for Binary Tensor Forwarding
+LACP — Direct TCP Transport for Binary Tensor Forwarding
 
 Provides a direct TCP socket transport alongside EventRouter for
 high-throughput tensor data. Uses the binary codec from codec.py.

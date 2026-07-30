@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Binary Tensor Codec & Async Forwarding Engine
+LACP — Binary Tensor Codec & Async Forwarding Engine
 
 High-performance tensor transport for distributed pipeline parallelism.
 

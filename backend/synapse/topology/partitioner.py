@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Optimal Shard-to-Node Partitioning Engine
+LACP — Optimal Shard-to-Node Partitioning Engine
 
 Combines resource weighting, latency clustering, and ILP/Greedy
 optimization to produce the optimal assignment of model layers to nodes.
@@ -35,7 +35,7 @@ from .latency_matrix import (
 
 @dataclass
 class ShardAssignment:
-    """Result of LACP 3.0 partitioning for a single node."""
+    """Result of LACP partitioning for a single node."""
     node_id: str
     start_layer: int
     end_layer: int
@@ -53,7 +53,7 @@ class ShardAssignment:
 
 @dataclass
 class LACPPartition:
-    """Complete LACP 3.0 partitioning result for a model."""
+    """Complete LACP partitioning result for a model."""
     model_id: str = ""
     total_layers: int = 0
     num_micro_batches: int = 1
@@ -76,7 +76,7 @@ class LACPPartition:
         """
         Return pipeline stages ordered by cluster. Each stage is a list
         of ShardAssignments that run in parallel within the same pipeline slot.
-        For LACP 3.0, clusters represent pipeline stages.
+        For LACP, clusters represent pipeline stages.
         """
         stages: Dict[int, List[ShardAssignment]] = {}
         for a in self.assignments:
@@ -99,7 +99,7 @@ def compute_partition(
     num_micro_batches: int = 1,
 ) -> LACPPartition:
     """
-    Main entry point for LACP 3.0 partitioning.
+    Main entry point for LACP partitioning.
 
     Algorithm:
     1. Compute composite resource scores for all nodes

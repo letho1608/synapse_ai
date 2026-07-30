@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Pipeline Stage Executor
+LACP — Pipeline Stage Executor
 
 Executes forward passes on a node's assigned layer range with:
 - Micro-batch processing from 1F1B schedule

@@ -1,5 +1,5 @@
 """
-Test LACP 3.0 — Multi-Resource Weighting Engine
+Test LACP — Multi-Resource Weighting Engine
 
 Validates:
 1. Resource normalization produces correct 0.0-1.0 ranges

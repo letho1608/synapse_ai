@@ -1,6 +1,6 @@
 # Synapse AI: True Distributed Supercomputing Platform
 
-**LACP 3.0 — Latency-Aware Compute Pooling** — Run LLMs across hundreds of nodes with genuine parallel acceleration. Every added node increases token generation speed and reduces training time.
+**LACP — Latency-Aware Compute Pooling** — Run LLMs across hundreds of nodes with genuine parallel acceleration. Every added node increases token generation speed and reduces training time.
 
 [![Repo](https://img.shields.io/badge/repo-github.com%2Fletho1608%2Fsynapse__ai-blue)](https://github.com/letho1608/synapse_ai)
 
@@ -14,7 +14,7 @@ Synapse AI is a **true distributed supercomputing system** that pools ALL hardwa
 
 ### How It's Different
 
-| What most "distributed" projects do | What Synapse AI LACP 3.0 does |
+| What most "distributed" projects do | What Synapse AI LACP does |
 |---|---|
 | Split model layers across machines sequentially (Node A → Node B → wait) | **Pipeline parallelism with micro-batch overlapping**: Node B is already processing batch 1 while Node A loads batch 2 |
 | Only use VRAM as partition criteria | **Multi-resource LACP**: weighs VRAM + TFLOPS + CPU + RAM + disk I/O + bandwidth for every node |
@@ -26,7 +26,7 @@ Synapse AI is a **true distributed supercomputing system** that pools ALL hardwa
 
 ---
 
-## Architecture: LACP 3.0 Pipeline
+## Architecture: LACP Pipeline
 
 ```
                    ┌─────────────────────────────────────────┐
@@ -64,7 +64,7 @@ For training, Synapse uses the **1F1B schedule** from GPipe:
 
 ## Key Components
 
-### LACP 3.0 Partitioning Engine
+### LACP Partitioning Engine
 
 | Resource | How It's Weighted |
 |----------|-------------------|
@@ -179,7 +179,7 @@ python main.py --discovery-module manual --node-id node-gpu-01 --node-port 5678
 The cluster self-organizes:
 1. **Discovery** → nodes find each other
 2. **Probing** → latency + bandwidth matrix built (N×N)
-3. **LACP 3.0** → master computes optimal shard assignment
+3. **LACP** → master computes optimal shard assignment
 4. **Pipeline** → 1F1B micro-batching begins
 5. **API** → `/v1/chat/completions` serves requests with distributed acceleration
 
@@ -220,7 +220,7 @@ synapse_ai/
 ├── main.py                          # Entry point
 ├── synapse/
 │   ├── main.py                      # CLI, wiring
-│   ├── lacp/                        # LACP 3.0 partitioning engine
+│   ├── lacp/                        # LACP partitioning engine
 │   │   ├── resource_weight.py       # Multi-resource weighting
 │   │   ├── latency_matrix.py        # N×N probing + clustering
 │   │   └── partitioner.py           # ILP optimal assignment
@@ -240,7 +240,7 @@ synapse_ai/
 │   ├── api/                         # REST API
 │   └── ui/                          # Web dashboard
 └── tests/
-    ├── test_lacp_multiresource.py   # LACP 3.0 partitioning tests
+    ├── test_lacp_multiresource.py   # LACP partitioning tests
     ├── test_pipeline_1f1b.py        # 1F1B schedule + micro-batch tests
     ├── test_async_forwarding.py     # Async tensor transport tests
     ├── test_cluster_scale.py        # N-node cluster scale tests

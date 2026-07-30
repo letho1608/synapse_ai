@@ -1,5 +1,5 @@
 """
-Test LACP 3.0 — Gradient Sync & Fault Tolerance
+Test LACP — Gradient Sync & Fault Tolerance
 
 Validates:
 1. Ring all-reduce: N nodes reduce gradients correctly

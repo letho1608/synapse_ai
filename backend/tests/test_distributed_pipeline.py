@@ -1,5 +1,5 @@
 """
-Test LACP 3.0 — Distributed Pipeline Integration
+Test LACP — Distributed Pipeline Integration
 
 Validates:
 1. PipelineStage executes forward passes correctly

@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Distributed Inference Engine
+LACP — Distributed Inference Engine
 
 Extends PyTorchHFEngine with distributed multi-node pipeline execution.
 Coordinates inference across nodes assigned to contiguous layer ranges.

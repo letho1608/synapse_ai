@@ -1,5 +1,5 @@
 """
-LACP 3.0 - Distributed Gradient Aggregation (All-Reduce) & DDP
+LACP - Distributed Gradient Aggregation (All-Reduce) & DDP
 
 Ring all-reduce for synchronizing gradients across N nodes.
 Each node has a full model copy (DDP style).

@@ -63,13 +63,13 @@ class Node:
     # Initialize Election Manager
     self.election_manager = ElectionManager(self.id, self.event_router)
 
-    # LACP 3.0 Distributed Pipeline Extension
+    # LACP Distributed Pipeline Extension
     self._distributed_pipeline = None
 
-    # LACP 3.0 TCP Transport for binary tensor forwarding
+    # LACP TCP Transport for binary tensor forwarding
     self.tcp_transport: Optional[Any] = None
 
-    # LACP 3.0 Fault Tolerance Manager
+    # LACP Fault Tolerance Manager
     self.fault_tolerance = None
 
     # Tracks whether distributed inference is currently active across multiple nodes.
@@ -139,14 +139,14 @@ class Node:
 
   @property
   def distributed_pipeline(self):
-    """LACP 3.0 Distributed Pipeline Extension — lazy-initialized."""
+    """LACP Distributed Pipeline Extension — lazy-initialized."""
     if self._distributed_pipeline is None:
       from synapse.pipeline.node_extension import DistributedPipelineExtension
       self._distributed_pipeline = DistributedPipelineExtension(self)
     return self._distributed_pipeline
 
   def _lazy_init_fault_tolerance(self):
-    """LACP 3.0 Fault Tolerance Manager — lazy-initialized."""
+    """LACP Fault Tolerance Manager — lazy-initialized."""
     if self.fault_tolerance is None:
       from synapse.pipeline.fault_tolerance import FaultToleranceManager
       self.fault_tolerance = FaultToleranceManager(self.id)
@@ -361,7 +361,7 @@ class Node:
       if DEBUG >= 2: traceback.print_exc()
 
   async def check_fault_tolerance(self) -> None:
-    """LACP 3.0: Dynamic Fault Tolerance with rebalancing on node failure."""
+    """LACP: Dynamic Fault Tolerance with rebalancing on node failure."""
     current_time = time.time()
 
     # Phase 1: Check stuck requests (original watchdog)
@@ -378,7 +378,7 @@ class Node:
       if DEBUG >= 1: print(f"!!! [FAULT_TOLERANCE] Found {len(stuck_requests)} stuck requests. Triggering topology refresh.")
       await self.collect_topology(set())
 
-    # Phase 2: LACP 3.0 node failure detection + rebalancing
+    # Phase 2: LACP node failure detection + rebalancing
     if self.fault_tolerance and self._distributed_pipeline:
       dead_nodes = self.fault_tolerance.get_dead_nodes()
       for dead_id in dead_nodes:
@@ -419,7 +419,7 @@ class Node:
     """Handle incoming tensor for inference via P2P."""
     data = event.data
     
-    # Check for new binary format (LACP 3.0 High-Perf)
+    # Check for new binary format (LACP High-Perf)
     if isinstance(data, dict) and "bin" in data:
         tensor_data, metadata = decode_tensor(data["bin"])
         request_id = metadata.get("request_id")
@@ -767,10 +767,10 @@ class Node:
     shard = self.get_current_shard(base_shard)
     if DEBUG >= 2: print(f"[{request_id}] process prompt: {base_shard=} {shard=} {prompt=}")
 
-    # LACP 3.0: Use distributed pipeline when multiple nodes are available
+    # LACP: Use distributed pipeline when multiple nodes are available
     node_count = len(self.topology.nodes) if self.topology.nodes else 0
     if node_count > 1 and self.is_orchestrator_for_request(request_id):
-      if DEBUG >= 1: print(f"[{request_id}] LACP 3.0: Using distributed pipeline across {node_count} nodes")
+      if DEBUG >= 1: print(f"[{request_id}] LACP: Using distributed pipeline across {node_count} nodes")
       self.distributed_active = True
       self.distributed_node_count = node_count
       self.distributed_status = "distributed"
@@ -1276,7 +1276,7 @@ class Node:
         did_peers_change = await self.update_peers()
         if DEBUG >= 3: print(f"{did_peers_change=}")
         
-        # LACP 3.0: Record heartbeat for all connected peers
+        # LACP: Record heartbeat for all connected peers
         self._lazy_init_fault_tolerance()
         if self.fault_tolerance:
           for peer_id in [p.id() for p in self.peers]:

@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Fault Tolerance & Dynamic Rebalancing Engine
+LACP — Fault Tolerance & Dynamic Rebalancing Engine
 
 Handles node failures in the distributed pipeline with zero-downtime recovery.
 
@@ -10,7 +10,7 @@ Strategy:
   4. Pipeline resume — continue inference/training from last checkpoint
   5. Graceful degradation — if N nodes drop to N-1, rebalance then continue
 
-The rebalancing uses the LACP 3.0 partitioner to recompute optimal shard
+The rebalancing uses the LACP partitioner to recompute optimal shard
 assignments excluding the failed node, then redistributes layers.
 """
 
@@ -219,7 +219,7 @@ class FaultToleranceManager:
                 result.success = False
                 return result
 
-            # Compute new assignments via LACP 3.0
+            # Compute new assignments via LACP
             new_assignments = await lacp_partition_fn(alive, total_layers)
             result.new_assignments = new_assignments
 

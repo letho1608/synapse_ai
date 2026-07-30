@@ -1,5 +1,5 @@
 """
-Test LACP 3.0 partitioning with 3 nodes for real model sizes.
+Test LACP partitioning with 3 nodes for real model sizes.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

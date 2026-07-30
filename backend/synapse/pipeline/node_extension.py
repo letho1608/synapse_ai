@@ -1,5 +1,5 @@
 """
-LACP 3.0 — Distributed Pipeline Node Extension
+LACP — Distributed Pipeline Node Extension
 
 Extends the Node class with:
 1. Distributed inference pipeline (multi-node)

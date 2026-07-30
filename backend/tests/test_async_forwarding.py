@@ -1,5 +1,5 @@
 """
-Test LACP 3.0 — Async Tensor Binary Codec & Forwarding
+Test LACP — Async Tensor Binary Codec & Forwarding
 
 Validates:
 1. Binary codec: encode → decode roundtrip for various dtypes/shapes
