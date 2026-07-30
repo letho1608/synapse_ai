@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-import pickle
+import json
 import os
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Set, Tuple, Any
 import numpy as np
 
@@ -83,7 +83,7 @@ class FaultToleranceManager:
     """
 
     HEARTBEAT_INTERVAL = 2.0   # seconds between heartbeats
-    HEARTBEAT_TIMEOUT = 10.0   # seconds before considering node dead
+    HEARTBEAT_TIMEOUT = 5.0    # seconds before considering node dead (matches README claim)
     CHECKPOINT_INTERVAL = 30.0  # seconds between state snapshots
     MAX_MISSES = 3             # consecutive missed heartbeats before blacklisting
 
@@ -143,7 +143,7 @@ class FaultToleranceManager:
         kv_cache: Optional[Dict] = None,
         optimizer_state: Optional[Dict] = None,
     ) -> str:
-        """Save a shard state checkpoint. Returns checkpoint path."""
+        """Save a shard state checkpoint to JSON. Returns checkpoint path."""
         ckpt = ShardCheckpoint(
             node_id=self.node_id,
             model_id=model_id,
@@ -157,11 +157,40 @@ class FaultToleranceManager:
         filename = f"{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
         filepath = os.path.join(self.checkpoint_dir, filename)
 
-        with open(filepath, "wb") as f:
-            pickle.dump(ckpt, f)
+        # Use JSON-safe serialization (convert numpy arrays if present)
+        data = asdict(ckpt)
+        self._json_serialize(data, filepath)
 
         self._checkpoints[self.node_id].append(ckpt)
         return filepath
+
+    @staticmethod
+    def _json_serialize(data: dict, filepath: str) -> None:
+        """Serialize dict to JSON, converting numpy types safely."""
+        def convert(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.floating):
+                return float(obj)
+            if isinstance(obj, dict):
+                return {k: convert(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [convert(v) for v in obj]
+            return obj
+        sanitized = convert(data)
+        with open(filepath, "w") as f:
+            json.dump(sanitized, f, default=str, indent=2)
+
+    @staticmethod
+    def _json_deserialize(filepath: str) -> Optional[dict]:
+        """Deserialize JSON file safely."""
+        try:
+            with open(filepath, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError, IOError):
+            return None
 
     def load_latest_checkpoint(self, node_id: str) -> Optional[ShardCheckpoint]:
         """Load the most recent checkpoint for a node (used during recovery)."""
@@ -173,15 +202,14 @@ class FaultToleranceManager:
     def load_checkpoint(
         self, model_id: str, start_layer: int, end_layer: int, step: int
     ) -> Optional[ShardCheckpoint]:
-        """Load a specific checkpoint from disk."""
+        """Load a specific checkpoint from disk (JSON format)."""
         filename = f"{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
         filepath = os.path.join(self.checkpoint_dir, filename)
 
-        if not os.path.exists(filepath):
+        data = self._json_deserialize(filepath)
+        if data is None:
             return None
-
-        with open(filepath, "rb") as f:
-            return pickle.load(f)
+        return ShardCheckpoint(**{k: v for k, v in data.items() if k in ShardCheckpoint.__dataclass_fields__})
 
     # ── Dynamic Rebalancing ────────────────────────────────
 
@@ -247,8 +275,14 @@ class FaultToleranceManager:
         while self._running:
             await asyncio.sleep(self.HEARTBEAT_INTERVAL)
 
+            # Check every registered node for timeout
+            for nid in list(self._health.keys()):
+                h = self._health[nid]
+                h.check_timeout(self.HEARTBEAT_TIMEOUT)
+
             dead = self.get_dead_nodes()
             for node_id in dead:
                 if not self._health[node_id].is_blacklisted:
-                    # Node just died — trigger rebalance
+                    # Node just died — this would trigger rebalance
+                    # Rebalance is invoked externally via check_fault_tolerance() in node.py
                     self._pending_rebalance = node_id

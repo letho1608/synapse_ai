@@ -65,6 +65,7 @@ class PipelineStage:
         forward_fn: Callable,
         send_tensor_fn: Callable,
         recv_tensor_fn: Optional[Callable] = None,
+        backward_fn: Optional[Callable] = None,
     ):
         self.stage_id = stage_id
         self.node_id = node_id
@@ -72,6 +73,7 @@ class PipelineStage:
         self._forward_fn = forward_fn
         self._send_tensor_fn = send_tensor_fn
         self._recv_tensor_fn = recv_tensor_fn
+        self._backward_fn = backward_fn
 
         self.is_first_stage = stage_id == 0
         self.is_last_stage = stage_id == num_stages - 1
@@ -109,6 +111,7 @@ class PipelineStage:
         return result
 
     async def process_loop(self, stop_event: asyncio.Event) -> None:
+        """Process both forward and backward passes as scheduled."""
         while not stop_event.is_set():
             try:
                 mb = await asyncio.wait_for(self._input_queue.get(), timeout=0.5)
@@ -116,7 +119,11 @@ class PipelineStage:
                 continue
 
             try:
-                result = await self.run_forward(mb)
+                op = mb.metadata.get("op", "forward") if mb.metadata else "forward"
+                if op == "backward" and self._backward_fn is not None:
+                    result = await self.run_backward(mb)
+                else:
+                    result = await self.run_forward(mb)
 
                 if not self.is_last_stage:
                     await self._send_tensor_fn(result)
@@ -129,6 +136,29 @@ class PipelineStage:
         mb = MicroBatch(batch_id=micro_batch_id, data=input_data, metadata=metadata or {})
         result = await self.run_forward(mb)
         return result.data
+
+    async def run_backward(self, micro_batch: MicroBatch) -> StageResult:
+        """Execute a backward pass on this stage's layer range."""
+        if self._backward_fn is None:
+            raise RuntimeError("No backward function configured for this stage")
+        start = time.perf_counter()
+        try:
+            result_data = await self._backward_fn(micro_batch)
+        except Exception:
+            self.stats.failures += 1
+            raise
+
+        elapsed = (time.perf_counter() - start) * 1000
+        self.stats.total_backwards += 1
+        self.stats.total_latency_ms += elapsed
+
+        result = StageResult(
+            micro_batch_id=micro_batch.batch_id,
+            data=result_data,
+            step=micro_batch.step if hasattr(micro_batch, "step") else 0,
+            elapsed_ms=elapsed,
+        )
+        return result
 
 
 class PipelineExecutor:

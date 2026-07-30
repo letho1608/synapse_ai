@@ -202,70 +202,90 @@ class DistributedPipelineController:
                 if result is not None and result.tokens:
                     all_generated_tokens.extend(result.tokens)
 
-            # Decode phase: sequential with N-gram Lookahead optimization
+            # Decode phase: true pipeline-parallel micro-batch overlapping
+            # Instead of sending one batch and waiting, fire multiple micro-batches
+            # into the pipeline before collecting results. Each stage processes
+            # concurrently: Stage 1 works on batch N while Stage 0 loads batch N+1.
             lookahead_window = getattr(self, "lookahead_window", 3)
             ngram_size = 3
             
             while not session.is_finished and len(all_generated_tokens) < max_generate_tokens:
-                # Guess next tokens using simple N-gram matching on current history
+                # Build N-gram lookahead guesses
                 guesses = []
                 if lookahead_window > 0 and len(all_generated_tokens) >= ngram_size + 1:
                     history = all_generated_tokens
                     suffix = history[-ngram_size:]
-                    # Search for previous occurrences of this suffix
                     for i in range(len(history) - ngram_size - 1, 0, -1):
                         if history[i:i+ngram_size] == suffix:
-                            # Potential match! Use following tokens as guesses
                             guesses = history[i+ngram_size : i+ngram_size+lookahead_window]
                             if guesses:
-                                if DEBUG >= 2: print(f"[Lookahead] Guessed: {guesses} (based on history index {i})")
                                 break
                 
-                # Combine last token with guesses for parallel verification
-                candidate_tokens = [all_generated_tokens[-1]] + guesses
-                input_tensor = np.array([candidate_tokens], dtype=np.int64)
+                # Pipeline-parallel decode: fire multiple micro-batches concurrently
+                # so stages overlap (Stage 1 processes batch N while Stage 0 processes batch N+1)
+                num_decode_batches = max(2, lookahead_window)  # At least 2 for overlap
+                decode_batches = []
                 
-                await self._send_input_to_stage(
-                    first_stage_node_id, first_stage_shard,
-                    input_tensor, request_id, is_prompt=False,
-                    microbatch_id=0,
-                )
-
-                next_result = await self._collect_result(
-                    request_id, last_stage_node_id, last_stage_shard, timeout=30.0,
-                )
-
-                if next_result is None or not next_result.tokens:
+                for db_idx in range(num_decode_batches):
+                    # Each micro-batch gets its own candidate tokens
+                    batch_guesses = guesses[db_idx:] if db_idx < len(guesses) else []
+                    candidate_tokens = [all_generated_tokens[-1]] + batch_guesses
+                    input_tensor = np.array([candidate_tokens], dtype=np.int64)
+                    decode_batches.append((db_idx, input_tensor))
+                
+                # Fire ALL micro-batches into the pipeline immediately (no waiting)
+                # Stage 0 sends batch 0, then immediately sends batch 1, etc.
+                # While Stage 0 loads batch 1, Stage 1 is already processing batch 0.
+                for db_idx, input_tensor in decode_batches:
+                    await self._send_input_to_stage(
+                        first_stage_node_id, first_stage_shard,
+                        input_tensor, request_id, is_prompt=False,
+                        microbatch_id=db_idx,
+                    )
+                
+                # Collect results from the last stage as they complete
+                decode_results = []
+                for _ in decode_batches:
+                    next_result = await self._collect_result(
+                        request_id, last_stage_node_id, last_stage_shard, timeout=30.0,
+                    )
+                    if next_result is not None:
+                        decode_results.append(next_result)
+                
+                if not decode_results:
                     break
                 
-                # Verify guesses: check which tokens matched the model's actual predictions
-                # Since candidate_tokens has N tokens, next_result.tokens should also have N tokens
-                # where result[i] is the model's prediction AFTER candidate[i].
-                accepted_count = 1 # Always accept the first actual prediction
+                # Verify guesses across all micro-batch results
+                all_accepted = []
+                for db_idx, result in enumerate(decode_results):
+                    if result.tokens:
+                        batch_guesses = guesses[db_idx:] if db_idx < len(guesses) else []
+                        accepted_count = 1  # Always accept the first actual prediction
+                        for g_idx in range(len(batch_guesses)):
+                            if g_idx < len(result.tokens) and result.tokens[g_idx] == batch_guesses[g_idx]:
+                                accepted_count += 1
+                            else:
+                                break
+                        verified_tokens = result.tokens[:accepted_count]
+                        all_accepted.extend(verified_tokens)
+                        if result.is_finished:
+                            break
                 
-                # For candidate[0], prediction is next_result[0]
-                # For candidate[1] (guess1), prediction is next_result[1]
-                # If next_result[0] == candidate[1], then guess1 was correct!
-                for g_idx in range(len(guesses)):
-                    if next_result.tokens[g_idx] == guesses[g_idx]:
-                        accepted_count += 1
-                        if DEBUG >= 2: print(f"[Lookahead] Correct guess: {guesses[g_idx]}!")
-                    else:
-                        break # Stop at first wrong guess
+                if not all_accepted:
+                    break
                 
-                # Add all accepted tokens to our history
-                verified_tokens = next_result.tokens[:accepted_count]
-                all_generated_tokens.extend(verified_tokens)
+                all_generated_tokens.extend(all_accepted)
                 
                 if on_token_callback:
                     try:
                         if asyncio.iscoroutinefunction(on_token_callback):
-                            await on_token_callback(request_id, verified_tokens, False)
+                            await on_token_callback(request_id, all_accepted, False)
                         else:
-                            on_token_callback(request_id, verified_tokens, False)
-                    except Exception: pass
+                            on_token_callback(request_id, all_accepted, False)
+                    except Exception:
+                        pass
 
-                if next_result.is_finished:
+                if any(r.is_finished for r in decode_results):
                     break
 
             session.is_finished = True

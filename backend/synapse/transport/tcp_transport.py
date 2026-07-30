@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import struct
 import time
 from typing import Any, Callable, Dict, Optional, Set, Tuple
@@ -51,6 +52,10 @@ class TCPServer:
         )
         for sock in self._server.sockets:
             self.port = sock.getsockname()[1]
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
             break
         if DEBUG >= 1:
             print(f"[TCP] Server listening on {self.host}:{self.port}")
@@ -66,6 +71,12 @@ class TCPServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
         peer = writer.get_extra_info("peername")
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         try:
             while True:
                 header = await reader.readexactly(FRAME_HEADER.size)
@@ -129,6 +140,12 @@ class TCPClientPool:
                     timeout=self._connect_timeout,
                 )
                 writer = writer[1]
+                try:
+                    sock = writer.get_extra_info("socket")
+                    if sock is not None:
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
                 self._conns[key] = (writer, time.time())
                 return writer
             except (asyncio.TimeoutError, ConnectionRefusedError, OSError):

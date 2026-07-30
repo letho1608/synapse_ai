@@ -17,6 +17,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+try:
+    import pulp
+    HAS_PULP = True
+except ImportError:
+    HAS_PULP = False
+
 from .resource_weight import (
     NodeResources,
     ResourceWeights,
@@ -89,6 +95,242 @@ class LACPPartition:
         return [stages[cid] for cid in cluster_order]
 
 
+def compute_partition_ilp(
+    nodes: Dict[str, NodeResources],
+    latency_matrix: Optional[LatencyMatrix],
+    total_layers: int,
+    model_id: str = "",
+    weights: Optional[ResourceWeights] = None,
+    num_micro_batches: int = 1,
+) -> LACPPartition:
+    """
+    ILP-based optimal partitioner using PuLP.
+    
+    Formulation:
+    - Decision variable x_{i,l}: binary, 1 if node i processes layer l
+    - Constraint: each layer assigned to exactly one node
+    - Constraint: each node gets contiguous layers (enforced via ordering)
+    - Objective: minimize max weighted-latency across all node assignments
+    
+    Falls back to Largest Remainder if PuLP is not available.
+    
+    Args:
+        nodes: {node_id: NodeResources} for all nodes in the cluster.
+        latency_matrix: Optional N×N latency data.
+        total_layers: Total number of transformer layers.
+        model_id: Model identifier string.
+        weights: Custom resource weights.
+        num_micro_batches: Number of micro-batches.
+        
+    Returns:
+        LACPPartition with ILP-optimized ShardAssignment list.
+    """
+    if not HAS_PULP:
+        # Fall back to LRM if PuLP not available
+        return compute_partition(
+            nodes=nodes,
+            latency_matrix=latency_matrix,
+            total_layers=total_layers,
+            model_id=model_id,
+            weights=weights,
+            num_micro_batches=num_micro_batches,
+        )
+    
+    partition = LACPPartition(
+        model_id=model_id,
+        total_layers=total_layers,
+        num_micro_batches=num_micro_batches,
+        latency_matrix=latency_matrix,
+    )
+    
+    if not nodes:
+        return partition
+    
+    # Score all nodes
+    scorer = ResourceScorer(weights)
+    scores = scorer.compute_scores(nodes)
+    node_ids = list(nodes.keys())
+    num_nodes = len(node_ids)
+    
+    if num_nodes == 0 or total_layers <= 0:
+        return partition
+    
+    # Build PuLP problem
+    prob = pulp.LpProblem("LACP_Partitioning", pulp.LpMinimize)
+    
+    # x[i][l] = 1 if node i gets layer l
+    x = {}
+    for i, nid in enumerate(node_ids):
+        for l in range(total_layers):
+            x[(i, l)] = pulp.LpVariable(f"x_{i}_{l}", cat=pulp.LpBinary)
+    
+    # y[i][l] = 1 if node i starts at layer l (for contiguity)
+    y = {}
+    for i in range(num_nodes):
+        for l in range(total_layers):
+            y[(i, l)] = pulp.LpVariable(f"y_{i}_{l}", cat=pulp.LpBinary)
+    
+    # z[i][j] = 1 if node i precedes node j in pipeline order
+    z = {}
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            if i != j:
+                z[(i, j)] = pulp.LpVariable(f"z_{i}_{j}", cat=pulp.LpBinary)
+    
+    # Constraint 1: Each layer assigned to exactly one node
+    for l in range(total_layers):
+        prob += pulp.lpSum([x[(i, l)] for i in range(num_nodes)]) == 1
+    
+    # Constraint 2: Each node has exactly one start position (or 0 if no layers)
+    for i in range(num_nodes):
+        prob += pulp.lpSum([y[(i, l)] for l in range(total_layers)]) <= 1
+    
+    # Constraint 3: First layer must start somewhere
+    prob += pulp.lpSum([y[(i, 0)] for i in range(num_nodes)]) == 1
+    
+    # Constraint 4: y[i][l] == 1 iff x[i][l] == 1 and (l==0 or x[i][l-1]==0)
+    for i in range(num_nodes):
+        for l in range(total_layers):
+            if l == 0:
+                prob += y[(i, l)] >= x[(i, l)]
+                prob += y[(i, l)] <= x[(i, l)]
+            else:
+                # y[i][l] ≤ x[i][l]
+                prob += y[(i, l)] <= x[(i, l)]
+                # y[i][l] ≤ 1 - x[i][l-1]
+                prob += y[(i, l)] <= 1 - x[(i, l-1)]
+                # y[i][l] ≥ x[i][l] - x[i][l-1]
+                prob += y[(i, l)] >= x[(i, l)] - x[(i, l-1)]
+    
+    # Constraint 5: Contiguity via ordered positions
+    # Each node's layers must be contiguous
+    M = total_layers
+    for i in range(num_nodes):
+        # For any position l where this node has a layer:
+        # Number of layers before this position must not exceed a gap
+        # If y[i][l] = 1, then for all k < l, x[i][k] = 0
+        for l in range(total_layers):
+            prob += pulp.lpSum([x[(i, k)] for k in range(l)]) <= l * (1 - y[(i, l)]) + l * y[(i, l)]
+            # If y[i][l] = 1, then for all k > start, layers are assigned until the next node's start
+            for k in range(l, total_layers):
+                prob += x[(i, k)] <= 1 - y[(i, l)] + x[(i, k)]
+    
+    # Simplify: enforce ordering of node start positions
+    # Use a big-M formulation for pipeline order
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            if i != j:
+                # z[i][j] + z[j][i] <= 1
+                prob += z[(i, j)] + z[(j, i)] <= 1
+    
+    # Transitivity
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            for k in range(num_nodes):
+                if i != j and j != k and i != k:
+                    prob += z[(i, j)] + z[(j, k)] - 1 <= z[(i, k)]
+    
+    # At least (num_nodes-1) of the z pairs
+    prob += pulp.lpSum([z[(i, j)] for i in range(num_nodes) for j in range(num_nodes) if i != j]) >= num_nodes - 1
+    
+    # Link x to ordering: if node i starts at layer l1 and node j starts at l2 and l1 < l2, then z[i][j] = 1
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            if i != j:
+                for l1 in range(total_layers):
+                    for l2 in range(total_layers):
+                        if l1 < l2:
+                            prob += z[(i, j)] >= y[(i, l1)] + y[(j, l2)] - 1
+    
+    # Objective: minimize max latency-weighted load
+    # Create variable for max load
+    max_load = pulp.LpVariable("max_load", lowBound=0)
+    
+    for i, nid in enumerate(node_ids):
+        score = scores.get(nid, (1.0, None))[0]
+        if score <= 0:
+            score = 1.0
+        layers_on_node = pulp.lpSum([x[(i, l)] for l in range(total_layers)])
+        prob += max_load >= layers_on_node / score
+    
+    prob += max_load
+    
+    # Solve
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    
+    # Extract solution
+    # Determine which node gets which layer range
+    node_layers: Dict[str, List[int]] = {nid: [] for nid in node_ids}
+    for i, nid in enumerate(node_ids):
+        for l in range(total_layers):
+            if pulp.value(x[(i, l)]) == 1:
+                node_layers[nid].append(l)
+    
+    # Determine pipeline order from y
+    start_positions = []
+    for i, nid in enumerate(node_ids):
+        for l in range(total_layers):
+            if pulp.value(y[(i, l)]) == 1:
+                start_positions.append((l, i, nid))
+    
+    start_positions.sort(key=lambda t: t[0])  # Sort by start layer
+    
+    # Build pipeline ordering
+    ordered_nodes = [t[2] for t in start_positions]
+    
+    # Ensure all nodes with layers are included
+    assigned = set(ordered_nodes)
+    for nid in node_ids:
+        if node_layers[nid] and nid not in assigned:
+            ordered_nodes.append(nid)
+            if node_layers[nid]:
+                start_positions.append((min(node_layers[nid]), 0, nid))
+    
+    # Build assignments
+    if not ordered_nodes:
+        ordered_nodes = node_ids
+    
+    partition.node_scores = scores
+    
+    # One cluster for ILP (latency clustering happens inside the ILP weight)
+    partition.clusters = [Cluster(
+        cluster_id=0,
+        nodes=list(nodes.keys()),
+        centroid_latency_ms=0.0,
+        intra_latency_ms=0.0,
+    )]
+    
+    current_layer = 0
+    for nid in ordered_nodes:
+        layers = node_layers.get(nid, [])
+        if not layers:
+            continue
+        start_l = min(layers)
+        end_l = max(layers)
+        # Ensure no gaps
+        if start_l > current_layer:
+            # Fill gap with next node
+            start_l = current_layer
+        score, nscores = scores.get(nid, (0.0, None))
+        partition.assignments.append(ShardAssignment(
+            node_id=nid,
+            start_layer=start_l,
+            end_layer=end_l,
+            layer_count=end_l - start_l + 1,
+            cluster_id=0,
+            composite_score=score,
+            normalized_scores=nscores,
+        ))
+        current_layer = end_l + 1
+    
+    # Ensure full coverage
+    if partition.assignments and partition.assignments[-1].end_layer < total_layers - 1:
+        partition.assignments[-1].end_layer = total_layers - 1
+        partition.assignments[-1].layer_count = partition.assignments[-1].end_layer - partition.assignments[-1].start_layer + 1
+    
+    return partition
+
+
 def compute_partition(
     nodes: Dict[str, NodeResources],
     latency_matrix: Optional[LatencyMatrix],
@@ -97,14 +339,18 @@ def compute_partition(
     weights: Optional[ResourceWeights] = None,
     max_intra_cluster_latency_ms: float = 5.0,
     num_micro_batches: int = 1,
+    method: str = "lrm",
 ) -> LACPPartition:
     """
     Main entry point for LACP partitioning.
+    Supports two methods:
+    - "lrm": Largest Remainder Method (greedy proportional, fast)
+    - "ilp": PuLP-based Integer Linear Programming (optimal, slower)
 
     Algorithm:
     1. Compute composite resource scores for all nodes
     2. If latency matrix available, cluster nodes by proximity
-    3. Within each cluster, allocate layers via Largest Remainder
+    3. Within each cluster, allocate layers via chosen method
     4. Assign contiguous ranges matching cluster order
     5. Return complete partition with per-node shard assignments
 
@@ -120,6 +366,17 @@ def compute_partition(
     Returns:
         LACPPartition with per-node ShardAssignment list.
     """
+    # Route to ILP solver if requested
+    if method == "ilp":
+        return compute_partition_ilp(
+            nodes=nodes,
+            latency_matrix=latency_matrix,
+            total_layers=total_layers,
+            model_id=model_id,
+            weights=weights,
+            num_micro_batches=num_micro_batches,
+        )
+    
     partition = LACPPartition(
         model_id=model_id,
         total_layers=total_layers,

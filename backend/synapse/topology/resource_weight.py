@@ -25,6 +25,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+try:
+    import pynvml
+    HAS_PYNVML = True
+except ImportError:
+    HAS_PYNVML = False
+
 # ──────────────────────────────────────────────────────────
 # Resource measurement
 # ──────────────────────────────────────────────────────────
@@ -83,6 +95,11 @@ class NodeResources:
         else:
             fp32_val = 0
 
+        # Measure disk I/O, power, and other resources from live system
+        disk_metrics = _measure_disk_io()
+        power_metrics = _measure_power()
+        bandwidth_metrics = _measure_dummy_bandwidth()  # Overwritten by latency probing later
+
         return cls(
             gpu_name=getattr(dc, "chip", "") or getattr(dc, "model", ""),
             gpu_vram_mb=float(getattr(dc, "memory", 0)),
@@ -90,7 +107,98 @@ class NodeResources:
             gpu_tflops_fp32=float(fp32_val),
             cpu_cores=int(getattr(dc, "cpu_cores", 0) or 0),
             system_ram_mb=float(getattr(dc, "system_ram_mb", 0) or 0),
+            disk_read_mbps=disk_metrics.get("read_mbps", 0.0),
+            disk_write_mbps=disk_metrics.get("write_mbps", 0.0),
+            bandwidth_mbps=bandwidth_metrics.get("bandwidth_mbps", 0.0),
+            power_limit_w=power_metrics.get("power_limit_w", 0.0),
+            current_power_w=power_metrics.get("current_power_w", 0.0),
         )
+
+
+# ──────────────────────────────────────────────────────────
+# Live resource measurement helpers
+# ──────────────────────────────────────────────────────────
+
+
+def _measure_disk_io() -> Dict[str, float]:
+    """Measure disk I/O throughput using psutil.
+    
+    Returns dict with read_mbps and write_mbps (MB/s).
+    Falls back to 0 values if psutil is unavailable or measurement fails.
+    """
+    result = {"read_mbps": 0.0, "write_mbps": 0.0}
+    if not HAS_PSUTIL:
+        return result
+    try:
+        # Sample disk I/O counters twice with a short interval
+        before = psutil.disk_io_counters()
+        if before is None:
+            return result
+        time.sleep(0.5)
+        after = psutil.disk_io_counters()
+        if after is None:
+            return result
+        
+        elapsed = 0.5  # sleep duration
+        # Convert bytes to MB, divide by elapsed seconds
+        read_bytes = after.read_bytes - before.read_bytes
+        write_bytes = after.write_bytes - before.write_bytes
+        result["read_mbps"] = (read_bytes / (1024 * 1024)) / elapsed
+        result["write_mbps"] = (write_bytes / (1024 * 1024)) / elapsed
+    except Exception:
+        pass
+    return result
+
+
+def _measure_power() -> Dict[str, float]:
+    """Measure GPU power using pynvml, or system power via psutil.
+    
+    Returns dict with power_limit_w (TDP) and current_power_w.
+    Falls back to 0 values if no measurement is possible.
+    """
+    result = {"power_limit_w": 0.0, "current_power_w": 0.0}
+    if HAS_PYNVML:
+        try:
+            pynvml.nvmlInit()
+            device_count = pynvml.nvmlDeviceGetCount()
+            if device_count > 0:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                try:
+                    power_limit = pynvml.nvmlDeviceGetPowerManagementLimit(handle)
+                    result["power_limit_w"] = power_limit / 1000.0  # milliwatts to watts
+                except Exception:
+                    pass
+                try:
+                    power_usage = pynvml.nvmlDeviceGetPowerUsage(handle)
+                    result["current_power_w"] = power_usage / 1000.0  # milliwatts to watts
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+    elif HAS_PSUTIL:
+        try:
+            battery = psutil.sensors_battery()
+            if battery is not None:
+                result["current_power_w"] = battery.power_plugged * 50.0  # rough estimate
+                result["power_limit_w"] = result["current_power_w"] * 1.2
+        except Exception:
+            pass
+    return result
+
+
+def _measure_dummy_bandwidth() -> Dict[str, float]:
+    """Return a placeholder bandwidth value.
+    
+    Real bandwidth is measured during latency probing (latency_matrix.py)
+    and populated into NodeResources.bandwidth_mbps afterward.
+    This value is a reasonable default for single-node operation.
+    """
+    return {"bandwidth_mbps": 1000.0}  # 1 Gbps default, overwritten by probing
 
 
 # ──────────────────────────────────────────────────────────

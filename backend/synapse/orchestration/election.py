@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Callable
 from loguru import logger
 from synapse.routing import EventRouter, Event
 
@@ -10,8 +10,8 @@ class ElectionManager:
     ElectionManager handles leading node selection for the Synapse cluster.
     Inspired by Exo's Master Election but simplified for Synapse's P2P mesh.
 
-    Uses capacity-based (VRAM + FLOPs) weighting instead of load-based
-    weighting to prevent Master flapping during AI tasks.
+    Uses capacity-based (multi-resource LACP score) weighting instead of
+    simple VRAM+FLOPs to prevent Master flapping during AI tasks.
     Implements Master Stickiness: a Master only loses status when truly offline.
     """
     TICK_INTERVAL = 2.0
@@ -19,12 +19,13 @@ class ElectionManager:
     MASTER_STICKINESS_GRACE_PERIOD = 30.0
 
     def __init__(self, node_id: str, event_router: EventRouter, compute_weight: float = 1.0,
-                 dynamic_weight: bool = False):
+                 dynamic_weight: bool = False, resource_scorer: Optional[Callable] = None):
         self.node_id = node_id
         self.event_router = event_router
         self.base_compute_weight = compute_weight
         self.compute_weight = compute_weight
         self.dynamic_weight = dynamic_weight
+        self._resource_scorer = resource_scorer  # Callable: fn(node_id) -> composite_score
         self._monitor = None
 
         self.active_nodes: Dict[str, Dict] = {}
@@ -39,13 +40,21 @@ class ElectionManager:
 
     def set_base_compute_weight(self, vram_gb: float, fp32_flops: float) -> None:
         """
-        Set base compute weight from hardware capacity (VRAM + FLOPs).
-        This is the stable, capacity-based weight used for election.
+        Set base compute weight from hardware capacity.
+        Falls back to VRAM + FLOPs if no multi-resource scorer is available.
+        When a resource_scorer is available, it takes precedence.
         """
-        self.base_compute_weight = vram_gb + (fp32_flops / 100.0)
+        simple_weight = vram_gb + (fp32_flops / 100.0)
+        if self._resource_scorer is not None:
+            try:
+                multi_weight = self._resource_scorer(self.node_id)
+                self.base_compute_weight = max(simple_weight, multi_weight * 1000.0)
+                self.compute_weight = self.base_compute_weight
+                return
+            except Exception:
+                pass
+        self.base_compute_weight = simple_weight
         self.compute_weight = self.base_compute_weight
-        if self._monitor is None:
-            self.compute_weight = self.base_compute_weight
 
     async def start(self):
         """Start the election background task."""

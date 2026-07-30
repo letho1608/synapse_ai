@@ -9,8 +9,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Awaitable
+from typing import Dict, List, Optional, Callable, Awaitable, Any
 import numpy as np
+
+from synapse.pipeline.scheduler import (
+    MicroBatch,
+    MicroBatchOp,
+    PipelineSchedule,
+    PipelineScheduler,
+)
+from synapse.pipeline.stage import PipelineStage
 
 
 @dataclass
@@ -151,3 +159,73 @@ class DistributedTrainer:
         if not self._loss_history:
             return 0.0
         return sum(self._loss_history) / len(self._loss_history)
+
+    async def train_1f1b(
+        self,
+        stages: List[PipelineStage],
+        num_micro_batches: int,
+        input_data: np.ndarray,
+        labels: Optional[np.ndarray] = None,
+    ) -> List[float]:
+        """
+        Execute a training step using 1F1B pipeline schedule.
+        
+        Uses PipelineScheduler.generate_1f1b_schedule() to coordinate 
+        forward and backward passes across all pipeline stages.
+        
+        Args:
+            stages: List of PipelineStage objects, one per node.
+            num_micro_batches: Number of micro-batches for the pipeline.
+            input_data: Input tensor for training.
+            labels: Optional target labels for loss computation.
+            
+        Returns:
+            List of loss values per micro-batch.
+        """
+        scheduler = PipelineScheduler(num_micro_batches=num_micro_batches)
+        num_stages = len(stages)
+        node_ids = [s.node_id for s in stages]
+        
+        schedule = scheduler.generate_1f1b_schedule(num_stages, num_micro_batches, node_ids=node_ids)
+        
+        # Build per-stage slot map
+        stage_slots = scheduler.slots_for_stage(schedule, 0)
+        for s in stages:
+            if s.stage_id > 0:
+                stage_slots = scheduler.slots_for_stage(schedule, s.stage_id)
+        
+        # Execute pipeline
+        stop_events = {s.stage_id: asyncio.Event() for s in stages}
+        loop_tasks = [
+            asyncio.create_task(s.process_loop(stop_events[s.stage_id]))
+            for s in stages
+        ]
+        
+        losses = []
+        try:
+            for slot in sorted(schedule.slots, key=lambda s: s.step):
+                if slot.stage == 0:
+                    mb_data = input_data.copy() if slot.micro_batch_id > 0 else input_data
+                    op_name = "backward" if slot.op == MicroBatchOp.BACKWARD else "forward"
+                    mb = MicroBatch(
+                        batch_id=slot.micro_batch_id,
+                        data=mb_data,
+                        labels=labels,
+                        metadata={"op": op_name, "step": slot.step},
+                    )
+                    await stages[0].enqueue_input(mb)
+            
+            # Collect results from last stage
+            num_ops = len([s for s in schedule.slots if s.stage == num_stages - 1])
+            for _ in range(num_ops):
+                result = await stages[-1].dequeue_output(timeout=30.0)
+                if result is not None:
+                    losses.append(float(np.mean(result.data)) if hasattr(result.data, "__iter__") else 0.0)
+        finally:
+            for evt in stop_events.values():
+                evt.set()
+            for task in loop_tasks:
+                task.cancel()
+            await asyncio.gather(*loop_tasks, return_exceptions=True)
+        
+        return losses
