@@ -26,6 +26,40 @@ class TestResourceMeasurement:
         assert result["read_mbps"] >= 0
         assert result["write_mbps"] >= 0
 
+    def test_disk_io_measurement_is_cached_within_ttl(self):
+        """A6: a partition recompute must not re-incur the 0.5 s disk-I/O
+        sampling sleep on every call — consecutive _measure_disk_io() calls
+        within the TTL return the cached measurement without sleeping."""
+        import time
+        from synapse.topology import resource_weight as rw
+
+        first = rw._measure_disk_io()
+        t0 = time.monotonic()
+        second = rw._measure_disk_io()
+        elapsed = time.monotonic() - t0
+
+        assert second == first, "cached copy must match the measured values"
+        assert elapsed < 0.4, (
+            f"second call took {elapsed:.3f}s — the 0.5 s sampling sleep ran "
+            f"again; cache not hit"
+        )
+
+    def test_disk_io_cache_refreshes_after_ttl(self):
+        """A6: after the TTL expires a fresh measurement (with its sampling
+        sleep) is taken, so the cache never serves stale values forever."""
+        import time
+        from synapse.topology import resource_weight as rw
+
+        rw._disk_io_cache_ts = 0.0  # force expiry
+        t0 = time.monotonic()
+        rw._measure_disk_io()
+        elapsed = time.monotonic() - t0
+
+        assert elapsed >= 0.4, (
+            f"refresh call took {elapsed:.3f}s — expected the 0.5 s sampling "
+            f"sleep to re-run; cache did not refresh"
+        )
+
     def test_power_measurement_function_exists(self):
         """Verify _measure_power() is defined and returns dict."""
         from synapse.topology.resource_weight import _measure_power

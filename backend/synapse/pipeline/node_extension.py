@@ -96,8 +96,19 @@ class DistributedPipelineExtension:
 
     async def start(self) -> None:
         if not self._started:
+            self.sync_inference_engine()
             await self._controller.start()
             self._started = True
+
+    def sync_inference_engine(self) -> None:
+        """Refresh the controller's engine reference from the node.
+
+        The extension may be constructed at node.start() (A7: initialized
+        unconditionally so rebalancing works before any distributed request),
+        while node.select_best_inference_engine() can swap the node's engine
+        later; the controller must always forward with the current engine.
+        """
+        self._controller.inference_engine = self._node.inference_engine
 
     async def stop(self) -> None:
         if self._started:

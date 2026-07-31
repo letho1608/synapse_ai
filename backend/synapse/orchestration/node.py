@@ -260,9 +260,15 @@ class Node:
             print(f"[SHM] Failed to start shared-memory transport: {e}")
         self.shm_transport = None
 
-    # Start distributed pipeline extension
-    if self._distributed_pipeline:
-        await self._distributed_pipeline.start()
+    # Start distributed pipeline extension unconditionally: rebalancing and
+    # partition checks in check_fault_tolerance() gate on
+    # self._distributed_pipeline, so a node that dies before the first
+    # distributed request must still have the pipeline initialized (and its
+    # ResultRouter started) to be rebalanced.
+    if self._distributed_pipeline is None:
+        from synapse.pipeline.node_extension import DistributedPipelineExtension
+        self._distributed_pipeline = DistributedPipelineExtension(self)
+    await self._distributed_pipeline.start()
 
     # Start fault tolerance manager
     self._lazy_init_fault_tolerance()
@@ -1404,6 +1410,10 @@ class Node:
     await self.broadcast_supported_engines(supported_engines)
     if len(self.get_topology_inference_engines()):
       self.inference_engine = get_inference_engine(supported_engines[0], self.shard_downloader)
+      # The distributed pipeline extension is initialized unconditionally at
+      # start(); keep its controller forwarding with the current engine.
+      if self._distributed_pipeline is not None:
+        self._distributed_pipeline.sync_inference_engine()
 
   async def periodic_topology_collection(self, interval: int):
     while True:

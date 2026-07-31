@@ -37,6 +37,14 @@ try:
 except ImportError:
     HAS_PYNVML = False
 
+# Disk I/O measurement cache. Measuring requires a 0.5 s sampling sleep, and
+# the LACP path calls from_device_capabilities() once per node on every
+# partition recompute (~0.5 s × node count per pass). Cache the measurement
+# for a few seconds so recomputes reuse it instead of re-incurring the sleep.
+_DISK_IO_CACHE_TTL = 5.0
+_disk_io_cache: Dict[str, float] = {}
+_disk_io_cache_ts: float = 0.0
+
 # ──────────────────────────────────────────────────────────
 # Resource measurement
 # ──────────────────────────────────────────────────────────
@@ -122,23 +130,35 @@ class NodeResources:
 
 def _measure_disk_io() -> Dict[str, float]:
     """Measure disk I/O throughput using psutil.
-    
+
     Returns dict with read_mbps and write_mbps (MB/s).
     Falls back to 0 values if psutil is unavailable or measurement fails.
+
+    Measurements are cached for _DISK_IO_CACHE_TTL seconds: the LACP path
+    rebuilds NodeResources per node on every partition recompute, and a
+    0.5 s sampling sleep per call would otherwise block each recompute.
     """
+    global _disk_io_cache, _disk_io_cache_ts
+    now = time.monotonic()
+    if _disk_io_cache and (now - _disk_io_cache_ts) < _DISK_IO_CACHE_TTL:
+        return dict(_disk_io_cache)
+
     result = {"read_mbps": 0.0, "write_mbps": 0.0}
     if not HAS_PSUTIL:
+        _disk_io_cache, _disk_io_cache_ts = result, now
         return result
     try:
         # Sample disk I/O counters twice with a short interval
         before = psutil.disk_io_counters()
         if before is None:
+            _disk_io_cache, _disk_io_cache_ts = result, now
             return result
         time.sleep(0.5)
         after = psutil.disk_io_counters()
         if after is None:
+            _disk_io_cache, _disk_io_cache_ts = result, now
             return result
-        
+
         elapsed = 0.5  # sleep duration
         # Convert bytes to MB, divide by elapsed seconds
         read_bytes = after.read_bytes - before.read_bytes
@@ -147,6 +167,7 @@ def _measure_disk_io() -> Dict[str, float]:
         result["write_mbps"] = (write_bytes / (1024 * 1024)) / elapsed
     except Exception:
         pass
+    _disk_io_cache, _disk_io_cache_ts = dict(result), now
     return result
 
 

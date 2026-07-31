@@ -24,7 +24,7 @@ Synapse AI is a **true distributed supercomputing system** that pools ALL hardwa
 | Node failure kills the request | **Dynamic rebalancing**: failed node's shard reassigned live; dead node's JSON checkpoint (no pickle) is written and staged for the survivor — resume-from-checkpoint is pending (see Known Limitations) |
 | Same speed with 1 node or 100 nodes | **Pipeline-parallel speedup**: every added node increases capacity and keeps stages busy in parallel; wall-clock gains follow the scaling table below |
 
-**Verification:** All claims backed by real tests — 233 tests across 29 test modules covering fault tolerance, TCP_NODELAY, resource measurement, ILP partitioning, multi-resource election, decode token verification, prompt-conditioned pipeline overlap, streaming fidelity, 1F1B training with real backward gradients and inter-stage handoff, binary tensor transport, large-frame bridge handling (256 MiB cap + explicit error on oversize), cross-node checkpoint recovery, zero-copy shared memory, and the web UI root route. Coverage is behavioral: tests drive the shipped production code paths (hardware-dependent backends are stubbed where required) — no source-string assertion tests.
+**Verification:** All claims backed by real tests — 236 tests across 30 test modules covering fault tolerance, TCP_NODELAY, resource measurement (with disk-I/O metric caching), ILP partitioning, multi-resource election, decode token verification, prompt-conditioned pipeline overlap, streaming fidelity, 1F1B training with real backward gradients and inter-stage handoff, binary tensor transport, large-frame bridge handling (256 MiB cap + explicit error on oversize), cross-node checkpoint recovery, pre-request rebalancing, zero-copy shared memory, and the web UI root route. Coverage is behavioral: tests drive the shipped production code paths (hardware-dependent backends are stubbed where required) — no source-string assertion tests.
 
 ---
 
@@ -162,7 +162,7 @@ Speedup is measured against the same workload on 1 node (pipeline-parallel infer
 - **Checkpoint recovery is wired into distributed training and rebalancing.** Every distributed training step persists a JSON metadata checkpoint (model id, shard layer range, step) to the shared checkpoint directory, and `check_fault_tolerance()` stages the dead node's recovered state for the surviving node, which then reloads the on-disk checkpoint via the engine's `load_checkpoint` path before resuming (verified by `test_cross_node_recovery.py` / `test_fault_tolerance_live.py`). Checkpoint recovery depends on a **shared filesystem**: the file written by one node must be readable by the orchestrator on another (`load_latest_checkpoint()` scans the shared directory).
 - **Distributed decode re-feeds the full context rather than reusing a KV cache.** Each decode micro-batch is conditioned on the entire prompt plus verified history (prompt-conditioned end to end, verified by `test_decode_pipeline_overlap.py`), but every step re-runs the full context through the pipeline — incremental KV-cache reuse across decode steps is not yet implemented, so decode is correct at the cost of re-computation.
 - **The P2P event bridge no longer silently drops legitimate large frames.** The per-frame cap is raised from a hardcoded 10 MiB to a configurable 256 MiB default (`max_frame_size`, settable on `P2PSocketBridge`/`Libp2pNode`); a frame that still exceeds the configured cap gets an explicit `error`/`frame_too_large` packet back to the sender (recorded in `bridge._last_errors[peer_id]`) instead of a silent disconnect — verified by `test_p2p_bridge_binary.py` (a 12 MB tensor ≈ 24 MB framed is delivered intact end to end).
-- **With the multi-resource LACP path enabled (`--no-tflops-proportional`), partitioning re-runs resource measurement and bandwidth probing on a cadence**: probing is gated to once per 10 s, but each partition recompute still costs ~0.5 s per node in disk-I/O measurement, and the bandwidth estimate is a single-1024-byte-message round-trip proxy (a lower bound, not link capacity).
+- **With the multi-resource LACP path enabled (`--no-tflops-proportional`), partitioning re-runs resource measurement and bandwidth probing on a cadence**: disk-I/O measurements are cached for 5 s (`_DISK_IO_CACHE_TTL`), so partition recomputes within that window reuse the last measurement instead of re-incurring the 0.5 s sampling sleep per node (verified by `test_resource_measurement.py`), and the bandwidth estimate is a single-1024-byte-message round-trip proxy (a lower bound, not link capacity).
 - **Multi-node behavior is verified with in-process simulated nodes** driving the real transport/partition/training code; a hardware multi-machine E2E benchmark run is deferred to future work.
 - **The web UI is a backend-served static dashboard** (no npm dependency) — `GET /` always returns a real page, served by the API process itself.
 
@@ -221,7 +221,7 @@ The cluster self-organizes:
 2. **Probing** → latency + bandwidth matrix built (N×N)
 3. **Multi-resource election** → master node selected by LACP composite score (VRAM + TFLOPS + CPU + RAM + disk I/O + bandwidth + power); uses `resource_scorer` callable when available, falls back to VRAM+FLOPs
 4. **LACP** → master computes optimal shard assignment via Largest Remainder Method (`method="lrm"`, fast) or ILP (`method="ilp"`, optimal via PuLP binary variables `x_{i,l}`)
-5. **Pipeline** → 1F1B micro-batching begins; heartbeat monitoring (2s interval, 5s timeout = `HEARTBEAT_TIMEOUT`) checks every node; dead nodes trigger `check_timeout()` in the monitor loop and `rebalance_after_failure()` repartitions layers among survivors with JSON checkpoint recovery (rebalancing triggers only after the distributed pipeline has been initialized and after discovery has dropped the dead peer from the topology)
+5. **Pipeline** → 1F1B micro-batching begins; heartbeat monitoring (2s interval, 5s timeout = `HEARTBEAT_TIMEOUT`) checks every node; dead nodes trigger `check_timeout()` in the monitor loop and `rebalance_after_failure()` repartitions layers among survivors with JSON checkpoint recovery (the distributed pipeline is initialized unconditionally at `node.start()`, so rebalancing works before any distributed request, and discovery drops the dead peer from the topology)
 6. **API** → `/v1/chat/completions` serves requests with distributed acceleration
 
 ---
@@ -305,7 +305,8 @@ synapse_ai/
 │       ├── test_cross_node_recovery.py     # 6 tests: on-disk checkpoint recovery across nodes
 │       ├── test_tcp_nodelay.py             # 3 tests: server, accepted, client TCP_NODELAY
 │       ├── test_shm_transport.py           # 6 tests: zero-copy shared-memory transport
-│       ├── test_resource_measurement.py    # 6 tests: disk I/O, power, bandwidth
+│       ├── test_resource_measurement.py    # 8 tests: disk I/O (cached), power, bandwidth
+│       ├── test_a7_rebalance_before_request.py # 1 test: rebalance before first distributed request
 │       ├── test_partitioner_ilp.py         # 7 tests: ILP binary vars, coverage, contiguity
 │       ├── test_ilp_production_flow.py     # 5 tests: ILP selectable from production path
 │       ├── test_election_multiresource.py  # 6 tests: multi-resource scoring, fallback, stickiness
