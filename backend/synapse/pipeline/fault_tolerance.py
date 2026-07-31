@@ -38,6 +38,11 @@ class ShardCheckpoint:
     kv_cache: Optional[Dict[str, Any]] = None
     optimizer_state: Optional[Dict[str, Any]] = None
     timestamp: float = field(default_factory=time.time)
+    # Absolute path of the on-disk JSON file this checkpoint was saved to /
+    # loaded from. Filled by save_checkpoint() and by the disk-scan loaders;
+    # None for in-memory-only checkpoints. Lets the recovery path hand the
+    # exact file to the engine's checkpoint-load path.
+    checkpoint_path: Optional[str] = None
 
 
 @dataclass
@@ -170,6 +175,7 @@ class FaultToleranceManager:
         # this node's state) can find the file on the shared checkpoint dir.
         filename = f"{self.node_id}_{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
         filepath = os.path.join(self.checkpoint_dir, filename)
+        ckpt.checkpoint_path = filepath
 
         # Use JSON-safe serialization (convert numpy arrays if present)
         data = asdict(ckpt)
@@ -233,6 +239,7 @@ class FaultToleranceManager:
             if data is None:
                 continue
             ckpt = ShardCheckpoint(**{k: v for k, v in data.items() if k in ShardCheckpoint.__dataclass_fields__})
+            ckpt.checkpoint_path = os.path.join(self.checkpoint_dir, fname)
             if newest is None or ckpt.timestamp > newest.timestamp:
                 newest = ckpt
         return newest
@@ -262,7 +269,9 @@ class FaultToleranceManager:
         data = self._json_deserialize(filepath)
         if data is None:
             return None
-        return ShardCheckpoint(**{k: v for k, v in data.items() if k in ShardCheckpoint.__dataclass_fields__})
+        ckpt = ShardCheckpoint(**{k: v for k, v in data.items() if k in ShardCheckpoint.__dataclass_fields__})
+        ckpt.checkpoint_path = filepath
+        return ckpt
 
     # ── Dynamic Rebalancing ────────────────────────────────
 

@@ -493,6 +493,19 @@ class Node:
                 f"(step {ckpt.step}, layers {ckpt.start_layer}-{ckpt.end_layer}) "
                 f"staged for node {target}"
               )
+            # Hand the recovered on-disk checkpoint to the engine that takes
+            # over the dead node's shard range, so training/inference resumes
+            # from the last saved state instead of cold-starting.
+            if ckpt.checkpoint_path and target:
+              engine = getattr(self, "inference_engine", None)
+              if engine is not None:
+                shard = Shard(
+                  model_id=ckpt.model_id,
+                  start_layer=ckpt.start_layer,
+                  end_layer=ckpt.end_layer,
+                  n_layers=32,
+                )
+                await engine.load_checkpoint(shard, ckpt.checkpoint_path)
 
   async def on_p2p_tensor(self, event: Event):
     """Handle incoming tensor for inference via P2P."""
