@@ -7,7 +7,7 @@ Verifies the fix for the decode-blocking bug: forward_tensor() publishes
 receiver got a hex STRING, decode_tensor() raised, and the exception was
 swallowed by the event router — every inter-node tensor was silently dropped.
 
-Also verifies the latency-probe echo: LatencyProber sends a raw 1KB blob that
+Also verifies the latency-probe echo: LatencyProber sends a raw probe blob that
 does not speak the framed handshake protocol; the bridge must echo it back so
 bandwidth measurement works against the production listener.
 
@@ -127,13 +127,16 @@ async def test_binary_tensor_survives_bridge_roundtrip():
 
 @pytest.mark.asyncio
 async def test_bridge_echoes_raw_latency_probe():
-    """LatencyProber's raw 1KB probe (no framed handshake) is echoed by the
+    """LatencyProber's raw probe (no framed handshake) is echoed by the
     production listener so RTT/bandwidth can be measured."""
+    from synapse.topology.latency_matrix import LatencyProber
+
     a = _MeshNode("br-probe-a", 59121)
     await a.start()
 
     reader, writer = await asyncio.open_connection("127.0.0.1", a.port)
-    probe = struct.pack("!dQ", time.time(), random.getrandbits(64)) + b"\x00" * (1024 - 16)
+    probe_size = LatencyProber.PROBE_SIZE
+    probe = struct.pack("!dQ", time.time(), random.getrandbits(64)) + b"\x00" * (probe_size - 16)
     writer.write(probe)
     await writer.drain()
     echo = await asyncio.wait_for(reader.readexactly(len(probe)), timeout=5.0)

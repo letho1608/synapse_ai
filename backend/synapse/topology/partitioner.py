@@ -14,8 +14,11 @@ The partitioner:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     import pulp
@@ -67,6 +70,12 @@ class LACPPartition:
     clusters: List[Cluster] = field(default_factory=list)
     latency_matrix: Optional[LatencyMatrix] = None
     node_scores: Dict[str, Tuple[float, NormalizedScores]] = field(default_factory=dict)
+    # Which solver produced this partition ("ilp" or "lrm") and the PuLP
+    # LpStatus string at solve time ("Optimal", "Not Solved", "Undefined",
+    # "pulp_unavailable", or "n/a" for the fast LRM path). Lets callers
+    # observe ILP→LRM degradation instead of guessing from timings.
+    method_used: str = ""
+    solver_status: str = ""
 
     @property
     def total_nodes(self) -> int:
@@ -102,6 +111,7 @@ def compute_partition_ilp(
     model_id: str = "",
     weights: Optional[ResourceWeights] = None,
     num_micro_batches: int = 1,
+    time_limit_seconds: Optional[float] = None,
 ) -> LACPPartition:
     """
     ILP-based optimal partitioner using PuLP.
@@ -121,13 +131,20 @@ def compute_partition_ilp(
         model_id: Model identifier string.
         weights: Custom resource weights.
         num_micro_batches: Number of micro-batches.
+        time_limit_seconds: Optional wall-clock budget for the CBC solve.
+            The ILP grows as O(n^3 + n^2*L^2) constraints, so without a cap
+            large clusters can stall the partition path indefinitely. When
+            the budget is exceeded the solve returns without an optimal
+            proof and this function degrades to the fast Largest Remainder
+            method, stamped on the returned partition via method_used/
+            solver_status (and logged) so the degradation is observable.
         
     Returns:
         LACPPartition with ILP-optimized ShardAssignment list.
     """
     if not HAS_PULP:
         # Fall back to LRM if PuLP not available
-        return compute_partition(
+        fallback = compute_partition(
             nodes=nodes,
             latency_matrix=latency_matrix,
             total_layers=total_layers,
@@ -135,6 +152,9 @@ def compute_partition_ilp(
             weights=weights,
             num_micro_batches=num_micro_batches,
         )
+        fallback.method_used = "lrm"
+        fallback.solver_status = "pulp_unavailable"
+        return fallback
     
     partition = LACPPartition(
         model_id=model_id,
@@ -250,13 +270,28 @@ def compute_partition_ilp(
     
     prob += max_load
     
-    # Solve
-    status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
-    if pulp.LpStatus[status] != "Optimal":
-        # Solver failed or the problem was infeasible: fall back to the
-        # Largest Remainder method so the cluster still gets a valid
-        # contiguous partition instead of a garbage/incomplete one.
-        return compute_partition(
+    # Solve under an optional wall-clock budget: the ILP is O(n^3 + n^2*L^2)
+    # constraints, so a timeLimit keeps the shipped path responsive on large
+    # clusters. When CBC hits the limit it returns without an optimal proof
+    # (LpStatus "Not Solved"/"Undefined") and we degrade to LRM below.
+    solver_kwargs = {"msg": False}
+    if time_limit_seconds is not None and time_limit_seconds > 0:
+        solver_kwargs["timeLimit"] = time_limit_seconds
+    status = prob.solve(pulp.PULP_CBC_CMD(**solver_kwargs))
+    status_str = pulp.LpStatus[status]
+    if status_str != "Optimal":
+        # Solver failed, timed out, or the problem was infeasible: fall back
+        # to the Largest Remainder method so the cluster still gets a valid
+        # contiguous partition instead of a garbage/incomplete one. The
+        # degradation is observable via the stamped method_used/solver_status
+        # fields and this log line.
+        logger.warning(
+            "ILP partition solve did not reach Optimal (status=%s, "
+            "time_limit_seconds=%s); falling back to Largest Remainder method",
+            status_str,
+            time_limit_seconds,
+        )
+        fallback = compute_partition(
             nodes=nodes,
             latency_matrix=latency_matrix,
             total_layers=total_layers,
@@ -264,6 +299,9 @@ def compute_partition_ilp(
             weights=weights,
             num_micro_batches=num_micro_batches,
         )
+        fallback.method_used = "lrm"
+        fallback.solver_status = status_str
+        return fallback
     
     # Extract solution
     # Determine which node gets which layer range
@@ -334,7 +372,9 @@ def compute_partition_ilp(
     if partition.assignments and partition.assignments[-1].end_layer < total_layers - 1:
         partition.assignments[-1].end_layer = total_layers - 1
         partition.assignments[-1].layer_count = partition.assignments[-1].end_layer - partition.assignments[-1].start_layer + 1
-    
+
+    partition.method_used = "ilp"
+    partition.solver_status = status_str
     return partition
 
 
@@ -346,6 +386,7 @@ def compute_partition(
     weights: Optional[ResourceWeights] = None,
     max_intra_cluster_latency_ms: float = 5.0,
     num_micro_batches: int = 1,
+    time_limit_seconds: Optional[float] = None,
     method: str = "lrm",
 ) -> LACPPartition:
     """
@@ -369,6 +410,8 @@ def compute_partition(
         weights: Custom resource weights (default: balanced).
         max_intra_cluster_latency_ms: Max latency within a cluster before splitting.
         num_micro_batches: Number of micro-batches for pipeline schedule.
+        time_limit_seconds: Wall-clock budget for the ILP solve (ignored for
+            method="lrm"); see compute_partition_ilp.
 
     Returns:
         LACPPartition with per-node ShardAssignment list.
@@ -382,6 +425,7 @@ def compute_partition(
             model_id=model_id,
             weights=weights,
             num_micro_batches=num_micro_batches,
+            time_limit_seconds=time_limit_seconds,
         )
     
     partition = LACPPartition(
@@ -390,6 +434,9 @@ def compute_partition(
         num_micro_batches=num_micro_batches,
         latency_matrix=latency_matrix,
     )
+    # The fast path: always stamps that it ran (and did not degrade).
+    partition.method_used = "lrm"
+    partition.solver_status = "n/a"
 
     if not nodes:
         return partition

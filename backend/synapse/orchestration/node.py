@@ -45,6 +45,7 @@ class Node:
     topology_viz: Optional[Any] = None,
     partition_method: str = "lrm",
     tflops_proportional: bool = True,
+    ilp_time_limit_seconds: Optional[float] = None,
   ):
     self.id = _id
     self.inference_engine = inference_engine
@@ -129,6 +130,10 @@ class Node:
     # CLI flag or the Node constructor (the production partitioner can use
     # the PuLP ILP solver through configuration).
     self.partition_method: str = partition_method
+    # Wall-clock budget (seconds) for the ILP partition solve; None = no cap.
+    # When the budget is exceeded the shipped path degrades to the fast LRM
+    # method, observable via LACPPartition.method_used/solver_status.
+    self.ilp_time_limit_seconds: Optional[float] = ilp_time_limit_seconds
     
     self.peers = []
     
@@ -526,6 +531,7 @@ class Node:
               total_layers=total_layers,
               model_id="",
               method=self.partition_method,
+              time_limit_seconds=self.ilp_time_limit_seconds,
             )
             new_assignments = {}
             for a in result.assignments:
@@ -1687,6 +1693,7 @@ class Node:
         total_layers=num_layers,
         model_id=model_id,
         method=self.partition_method,
+        time_limit_seconds=self.ilp_time_limit_seconds,
     )
 
     partitions = []

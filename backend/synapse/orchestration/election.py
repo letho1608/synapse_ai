@@ -15,8 +15,15 @@ class ElectionManager:
     Implements Master Stickiness: a Master only loses status when truly offline.
     """
     TICK_INTERVAL = 2.0
-    TIMEOUT = 6.0
-    MASTER_STICKINESS_GRACE_PERIOD = 30.0
+    # A peer is pruned when its heartbeat is older than TIMEOUT (~1.5 election
+    # ticks). Shorter than the old 6 s so a dead master is noticed quickly;
+    # still comfortably above the 2 s heartbeat cadence so live nodes are
+    # never pruned by scheduling jitter.
+    TIMEOUT = 3.0
+    # After the master is pruned, wait this long before accepting a new
+    # master. 4 s keeps the failover window responsive (~7-8 s total offline
+    # instead of ~36 s) while avoiding flapping on transient hiccups.
+    MASTER_STICKINESS_GRACE_PERIOD = 4.0
 
     def __init__(self, node_id: str, event_router: EventRouter, compute_weight: float = 1.0,
                  dynamic_weight: bool = False, resource_scorer: Optional[Callable] = None):

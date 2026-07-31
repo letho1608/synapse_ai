@@ -130,7 +130,12 @@ class LatencyProber:
     TCP ping-pong probes. Does NOT require root or special privileges.
     """
 
-    PROBE_SIZE = 1024  # 1KB probe packets
+    # 64 KiB probe payload: large enough that the round-trip is dominated by
+    # transfer time (serialization + echo) instead of the latency floor, so
+    # the bandwidth estimate reflects real link throughput rather than a
+    # single-1KB-RTT proxy. The P2P bridge reads this constant dynamically
+    # and echoes whatever size the prober sends.
+    PROBE_SIZE = 65536  # 64 KiB probe packets
     PROBE_COUNT = 5     # number of probes per measurement
 
     async def probe(self, node_id: str, address: str, timeout: float = 2.0) -> Optional[LatencyEntry]:
@@ -166,10 +171,12 @@ class LatencyProber:
 
                 latencies.append(rtt)
 
-                # Bandwidth estimate: data_size / transfer_time
+                # Bandwidth estimate: payload bytes moved in both directions
+                # (request + echo) over the measured round-trip window —
+                # a transfer-time-based figure, not a latency-only proxy.
                 transfer_time_s = rtt / 1000.0
                 if transfer_time_s > 0:
-                    bw = (self.PROBE_SIZE * 8) / (transfer_time_s * 1_000_000)
+                    bw = (self.PROBE_SIZE * 8 * 2) / (transfer_time_s * 1_000_000)
                     bandwidths.append(bw)
 
             except (asyncio.TimeoutError, ConnectionRefusedError, OSError):

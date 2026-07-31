@@ -77,6 +77,7 @@ parser.add_argument("--run-model", type=str, help="Specify a model to run direct
 parser.add_argument("--prompt", type=str, help="Prompt for the model when using --run-model", default="")
 parser.add_argument("--default-temp", type=float, help="Default token sampling temperature", default=0.7)
 parser.add_argument("--partition-method", type=str, choices=["lrm", "ilp"], default="lrm", help="LACP partition method: lrm (Largest Remainder, fast) or ilp (PuLP integer programming, optimal)")
+parser.add_argument("--ilp-time-limit-seconds", type=float, default=None, help="Wall-clock budget (seconds) for the ILP partition solve; when exceeded the shipped path falls back to the fast LRM method (degradation is logged and visible in LACPPartition.method_used/solver_status)")
 parser.add_argument("--no-tflops-proportional", action="store_true", help="Disable TFLOPS-proportional sharding and enable the multi-resource LACP scoring path (VRAM+TFLOPS+CPU+RAM+disk+bandwidth+power)")
 try:
     from dotenv import load_dotenv
@@ -176,6 +177,7 @@ node = Node(
     default_sample_temperature=args.default_temp,
     partition_method=args.partition_method,
     tflops_proportional=not args.no_tflops_proportional,
+    ilp_time_limit_seconds=args.ilp_time_limit_seconds,
 )
 node.discovery = discovery
 # No redundant GRPCServer anymore
