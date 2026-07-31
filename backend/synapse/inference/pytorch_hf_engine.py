@@ -607,6 +607,103 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                     print(f"[PyTorchHF] _get_optimizer: {e}")
         return getattr(self, "_optimizer", None)
 
+    async def _back_gradient(
+        self,
+        request_id: str,
+        shard: Shard,
+        example: np.ndarray,
+        target: np.ndarray,
+        length: np.ndarray,
+        backgrad: Optional[np.ndarray] = None,
+    ) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
+        """Backward phase: real gradients via torch autograd.
+
+        Re-runs the stage's forward on its micro-batch, computes the loss,
+        and backprops through the real model. Returns ``(None, grads)`` where
+        ``grads["__input_grad__"]`` is the gradient of the loss w.r.t. the
+        stage's input (the embedding output — the tensor the upstream stage's
+        backward consumes) and the remaining entries are per-parameter
+        gradients. When ``backgrad`` (the gradient handed back from the
+        downstream stage through the pipeline send path) is shape-compatible
+        with the model logits, it is used as the backward seed instead of the
+        local loss.
+
+        Returns ``(None, None)`` when no model/torch is available — the
+        caller treats that as "no backward gradients for this micro-batch".
+        """
+        try:
+            import torch
+            import torch.nn.functional as F
+
+            if self._model is None:
+                return None, None
+
+            device = self._device
+            self._model.train()
+
+            if example.dtype != np.int64:
+                example = example.astype(np.int64)
+            if target.dtype != np.int64:
+                target = target.astype(np.int64)
+            input_ids = torch.from_numpy(example).to(device)
+            labels = torch.from_numpy(target).to(device)
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            if labels.dim() == 1:
+                labels = labels.unsqueeze(0)
+
+            input_grad: Optional[np.ndarray] = None
+            capture_handle = None
+            get_embeddings = getattr(self._model, "get_input_embeddings", None)
+            if callable(get_embeddings):
+                emb_module = get_embeddings()
+                if emb_module is not None:
+                    def capture(module, grad_input, grad_output):
+                        nonlocal input_grad
+                        g = grad_output[0] if grad_output else None
+                        if g is not None:
+                            input_grad = g.detach().float().cpu().numpy()
+                    capture_handle = emb_module.register_full_backward_hook(capture)
+
+            try:
+                out = self._model(input_ids)
+                if hasattr(out, "logits"):
+                    logits = out.logits
+                elif isinstance(out, torch.Tensor):
+                    # Plain nn.Module: the forward output IS the logits tensor.
+                    # (out[0] would silently drop the batch dim.)
+                    logits = out
+                else:
+                    logits = out[0]
+                if backgrad is not None and tuple(np.asarray(backgrad).shape) == tuple(logits.shape):
+                    # Downstream gradient is shape-compatible with our output:
+                    # seed the backward with it (real external-gradient
+                    # backprop) instead of the local loss.
+                    seed = torch.from_numpy(
+                        np.asarray(backgrad, dtype=np.float32)
+                    ).to(device)
+                    torch.autograd.backward(logits, grad_tensors=seed)
+                else:
+                    shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+                    shift_labels = labels[..., 1:].contiguous().view(-1)
+                    loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+                    loss_val.backward()
+            finally:
+                if capture_handle is not None:
+                    capture_handle.remove()
+
+            grads: Dict[str, Any] = {}
+            if input_grad is not None:
+                grads["__input_grad__"] = input_grad
+            for name, p in self._model.named_parameters():
+                if p.grad is not None:
+                    grads[name] = p.grad.detach().float().cpu().numpy()
+            return None, (grads if grads else None)
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"[PyTorchHF] back_gradient: {e}")
+            return None, None
+
     async def train(
         self,
         request_id: str,
@@ -620,9 +717,9 @@ class PyTorchHFInferenceEngine(InferenceEngine):
     ) -> Tuple[Optional[float], Optional[np.ndarray]]:
         await self.ensure_shard(shard)
         if loss == "back_gradient":
-            if DEBUG >= 1:
-                print("[PyTorchHF] train(back_gradient) chua implement cho nhieu node; bo qua.")
-            return None, None
+            return await self._back_gradient(
+                request_id, shard, example, target, length, backgrad
+            )
 
         try:
             import torch

@@ -39,6 +39,41 @@ def _maybe_span(tracer, name: str, ctx, attrs: dict):
     return tracer.start_span(name, ctx, attrs)
 
 
+class _GradientHandoff:
+    """In-process pipeline backward channel for the 1F1B schedule.
+
+    The backward phase runs in reverse stage order: stage k's backward
+    consumes the input-gradient computed by stage k+1 (the downstream stage)
+    as its ``backgrad``. Keys are ``(stage_id, micro_batch_id)``; the value
+    is the real gradient tensor handed back through the stage's send path.
+    """
+
+    def __init__(self) -> None:
+        self._queues: Dict[Tuple[int, int], asyncio.Queue] = {}
+
+    def ensure(self, key: Tuple[int, int]) -> None:
+        """Pre-create the queue for a key so a get() before any put() waits
+        instead of returning immediately (the schedule runs the upstream
+        backward before the downstream one delivers)."""
+        self._queues.setdefault(key, asyncio.Queue(maxsize=1))
+
+    def put(self, key: Tuple[int, int], value: np.ndarray) -> None:
+        q = self._queues.setdefault(key, asyncio.Queue(maxsize=1))
+        if q.empty():
+            q.put_nowait(value)
+
+    async def get(
+        self, key: Tuple[int, int], timeout: float = 30.0
+    ) -> Optional[np.ndarray]:
+        q = self._queues.get(key)
+        if q is None:
+            return None
+        try:
+            return await asyncio.wait_for(q.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+
 class DistributedPipelineExtension:
     def __init__(self, node: Any):
         # Lazy import: synapse.inference.distributed_engine imports back into
@@ -524,6 +559,18 @@ class DistributedPipelineExtension:
         node.outstanding_requests[request_id] = "training"
         losses_by_mb: Dict[int, float] = {}
         grads_by_mb: Dict[int, Dict[str, np.ndarray]] = {}
+        # Real 1F1B backward handoff: each stage's backward computes the
+        # gradient of the loss w.r.t. its input and delivers it upstream via
+        # the pipeline send path; the upstream stage consumes it as backgrad
+        # (reverse-order gradient flow across stage boundaries).
+        handoff = _GradientHandoff()
+        self._last_handoff_sends: List[Tuple[int, int]] = []
+        # Pre-create every (stage, micro-batch) queue: the upstream stage's
+        # backward runs before the downstream stage's delivers, so gets must
+        # block until the value arrives rather than miss it.
+        for s in range(num_stages):
+            for m in range(num_micro_batches):
+                handoff.ensure((s, m))
 
         try:
             stages: List[PipelineStage] = []
@@ -546,33 +593,55 @@ class DistributedPipelineExtension:
                         return np.array([val], dtype=np.float32)
                     return np.zeros((1,), dtype=np.float32)
 
-                async def backward(mb: MicroBatch, _shard=shard, _last=is_last):
-                    # Engines do not yet implement cross-node back_gradient;
-                    # the schedule still drives the backward phase so the 1F1B
-                    # flow executes end to end.
+                async def backward(mb: MicroBatch, _shard=shard, _last=is_last, _idx=stage_idx):
+                    # Receive the downstream stage's input-gradient: gradient
+                    # of the loss w.r.t. the next stage's input, which is the
+                    # gradient of the loss w.r.t. this stage's output. The
+                    # last stage owns the loss, so it has no downstream grad.
+                    backgrad = None
                     if not _last:
-                        try:
-                            await node.inference_engine.train(
-                                request_id, _shard, mb.data,
-                                mb.labels if mb.labels is not None else labels,
-                                np.ones(max(1, mb.data.shape[0])),
-                                backgrad=mb.data, loss="back_gradient",
-                                sync_gradients=False,
-                            )
-                        except Exception:
-                            pass
-                    # Gradient feedback, not a loss: excluded from the results.
-                    return np.array([np.nan], dtype=np.float32)
+                        backgrad = await handoff.get((_idx + 1, mb.batch_id))
+                    grads = None
+                    try:
+                        _, grads = await node.inference_engine.train(
+                            request_id, _shard, mb.data,
+                            mb.labels if mb.labels is not None else labels,
+                            np.ones(max(1, mb.data.shape[0])),
+                            backgrad=backgrad, loss="back_gradient",
+                            sync_gradients=False,
+                        )
+                    except Exception:
+                        grads = None
+                    if grads and "__input_grad__" in grads:
+                        input_grad = np.asarray(grads["__input_grad__"], dtype=np.float32)
+                    elif backgrad is not None:
+                        input_grad = backgrad
+                    else:
+                        input_grad = np.zeros_like(mb.data, dtype=np.float32)
+                    # The last stage has no downstream send path, so it
+                    # delivers its input-gradient straight to the channel.
+                    if _last:
+                        handoff.put((_idx, mb.batch_id), input_grad)
+                    # Gradient feedback, not a loss: excluded from results.
+                    return input_grad
 
-                async def noop_send(result: StageResult) -> None:
-                    pass
+                async def handoff_send(result: StageResult, _idx=stage_idx) -> None:
+                    # Real inter-stage handoff: the backward phase's
+                    # input-gradient flows to the upstream stage via the
+                    # pipeline send path (previously a noop_send).
+                    if result.op == "backward":
+                        handoff.put(
+                            (_idx, result.micro_batch_id),
+                            np.asarray(result.data, dtype=np.float32),
+                        )
+                        self._last_handoff_sends.append((_idx, result.micro_batch_id))
 
                 stages.append(PipelineStage(
                     stage_id=stage_idx,
                     node_id=nid,
                     num_stages=num_stages,
                     forward_fn=forward,
-                    send_tensor_fn=noop_send,
+                    send_tensor_fn=handoff_send,
                     backward_fn=backward,
                 ))
 

@@ -222,15 +222,20 @@ class DistributedTrainer:
                     )
                     await stages[slot.stage].enqueue_input(mb)
 
-            # Collect forward losses from the last stage. The last stage also
-            # emits backward results (gradient feedback, not losses) — those
-            # are excluded here.
+            # Collect results from the last stage: drain ALL its slots so the
+            # pipeline fully executes (forward + backward phases) before the
+            # stage tasks are cancelled. Forward results are the losses;
+            # backward results are gradient feedback (StageResult.op) and are
+            # discarded, so real gradient values never leak into the loss
+            # list (previously they were filtered as non-finite NaN).
             num_ops = len([s for s in schedule.slots if s.stage == num_stages - 1])
             losses = []
             for _ in range(num_ops):
                 result = await stages[-1].dequeue_output(timeout=30.0)
                 if result is None:
                     continue
+                if getattr(result, "op", "forward") != "forward":
+                    continue  # backward gradient feedback, not a loss
                 try:
                     val = float(np.mean(result.data))
                 except Exception:
@@ -240,8 +245,18 @@ class DistributedTrainer:
         finally:
             for evt in stop_events.values():
                 evt.set()
-            for task in loop_tasks:
-                task.cancel()
-            await asyncio.gather(*loop_tasks, return_exceptions=True)
+            # Grace period: each stage finishes its in-flight op before
+            # exiting (the collector sees the last stage's final backward
+            # result, which is what unblocks the upstream link of the handoff
+            # chain — that last engine call completes just after collection).
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*loop_tasks, return_exceptions=True),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                for task in loop_tasks:
+                    task.cancel()
+                await asyncio.gather(*loop_tasks, return_exceptions=True)
 
         return losses

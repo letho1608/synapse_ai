@@ -31,6 +31,9 @@ class StageResult:
     data: np.ndarray
     step: int
     elapsed_ms: float
+    # "forward" or "backward" — lets the pipeline send path distinguish the
+    # backward phase's gradient feedback from forward activations/losses.
+    op: str = "forward"
 
 
 @dataclass
@@ -111,8 +114,15 @@ class PipelineStage:
         return result
 
     async def process_loop(self, stop_event: asyncio.Event) -> None:
-        """Process both forward and backward passes as scheduled."""
-        while not stop_event.is_set():
+        """Process both forward and backward passes as scheduled.
+
+        Graceful drain: once stop is requested the stage still consumes every
+        slot still queued before exiting — the 1F1B backward chain unwinds
+        upstream AFTER the last stage produces its final result, so a
+        hard loop-top exit would drop the last backward slots."""
+        while True:
+            if stop_event.is_set() and self._input_queue.empty():
+                break
             try:
                 mb = await asyncio.wait_for(self._input_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -157,6 +167,7 @@ class PipelineStage:
             data=result_data,
             step=micro_batch.step if hasattr(micro_batch, "step") else 0,
             elapsed_ms=elapsed,
+            op="backward",
         )
         return result
 
