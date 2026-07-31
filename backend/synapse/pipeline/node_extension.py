@@ -118,7 +118,11 @@ class DistributedPipelineExtension:
     def _get_partition_assignments(self, base_shard: Shard) -> List[Tuple[str, Shard]]:
         num_layers = base_shard.n_layers if base_shard.n_layers > 0 else 32
 
-        partitions = self._node._compute_lacp_partition(base_shard)
+        # B4: prefer the master's broadcast partition (already computed and
+        # consistent cluster-wide) over recomputing LACP locally per forward.
+        partitions = self._node._get_authoritative_partitions(base_shard)
+        if partitions is None:
+            partitions = self._node._compute_lacp_partition(base_shard)
         shards = map_partitions_to_shards(partitions, num_layers, base_shard.model_id)
 
         result: List[Tuple[str, Shard]] = []

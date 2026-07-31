@@ -24,7 +24,7 @@ Synapse AI is a **true distributed supercomputing system** that pools ALL hardwa
 | Node failure kills the request | **Dynamic rebalancing**: failed node's shard reassigned live; dead node's JSON checkpoint (no pickle) is written and staged for the survivor — resume-from-checkpoint is pending (see Known Limitations) |
 | Same speed with 1 node or 100 nodes | **Pipeline-parallel speedup**: every added node increases capacity and keeps stages busy in parallel; wall-clock gains follow the scaling table below |
 
-**Verification:** All claims backed by real tests — 236 tests across 30 test modules covering fault tolerance, TCP_NODELAY, resource measurement (with disk-I/O metric caching), ILP partitioning, multi-resource election, decode token verification, prompt-conditioned pipeline overlap, streaming fidelity, 1F1B training with real backward gradients and inter-stage handoff, binary tensor transport, large-frame bridge handling (256 MiB cap + explicit error on oversize), cross-node checkpoint recovery, pre-request rebalancing, zero-copy shared memory, and the web UI root route. Coverage is behavioral: tests drive the shipped production code paths (hardware-dependent backends are stubbed where required) — no source-string assertion tests.
+**Verification:** All claims backed by real tests — 242 tests across 31 test modules covering fault tolerance, TCP_NODELAY, resource measurement (with disk-I/O metric caching), ILP partitioning, multi-resource election, decode token verification, prompt-conditioned pipeline overlap, streaming fidelity, 1F1B training with real backward gradients and inter-stage handoff, binary tensor transport, large-frame bridge handling (256 MiB cap + explicit error on oversize), cross-node checkpoint recovery, pre-request rebalancing, latency-matrix refresh on topology change, authoritative-partition broadcast wiring, mesh heartbeats, zero-copy shared memory, and the web UI root route. Coverage is behavioral: tests drive the shipped production code paths (hardware-dependent backends are stubbed where required) — no source-string assertion tests.
 
 ---
 
@@ -221,7 +221,7 @@ The cluster self-organizes:
 2. **Probing** → latency + bandwidth matrix built (N×N)
 3. **Multi-resource election** → master node selected by LACP composite score (VRAM + TFLOPS + CPU + RAM + disk I/O + bandwidth + power); uses `resource_scorer` callable when available, falls back to VRAM+FLOPs
 4. **LACP** → master computes optimal shard assignment via Largest Remainder Method (`method="lrm"`, fast) or ILP (`method="ilp"`, optimal via PuLP binary variables `x_{i,l}`)
-5. **Pipeline** → 1F1B micro-batching begins; heartbeat monitoring (2s interval, 5s timeout = `HEARTBEAT_TIMEOUT`) checks every node; dead nodes trigger `check_timeout()` in the monitor loop and `rebalance_after_failure()` repartitions layers among survivors with JSON checkpoint recovery (the distributed pipeline is initialized unconditionally at `node.start()`, so rebalancing works before any distributed request, and discovery drops the dead peer from the topology)
+5. **Pipeline** → 1F1B micro-batching begins; heartbeat monitoring (2s interval, 5s timeout = `HEARTBEAT_TIMEOUT`) checks every node; each node also publishes its fault-tolerance heartbeat over the event mesh independently of discovery/membership, and a node flagged by the monitor loop (`_pending_rebalance`, first missed heartbeat) is rebalanced by `check_fault_tolerance()` immediately instead of waiting for the 3-miss blacklist threshold; the master broadcasts the authoritative partition before serving distributed requests so every node agrees on shard assignment, and dead nodes trigger `rebalance_after_failure()` repartitioning layers among survivors with JSON checkpoint recovery (the distributed pipeline is initialized unconditionally at `node.start()`, so rebalancing works before any distributed request)
 6. **API** → `/v1/chat/completions` serves requests with distributed acceleration
 
 ---
@@ -318,6 +318,7 @@ synapse_ai/
 │       ├── test_benchmark_exists.py        # 5 tests: benchmark speedup projections
 │       ├── test_api_endpoints.py           # 4 tests: API + web UI root route
 │       ├── test_p2p_bridge_binary.py       # 6 tests: binary tensor roundtrip + latency probe echo + large-frame handling (256 MiB cap, explicit error on oversize)
+│       ├── test_b3b4b5_wiring.py           # 6 tests: latency-cache refresh, authoritative-partition broadcast, mesh heartbeats, pending-rebalance consumption
 │       ├── test_lacp_multiresource.py      # LACP partitioning tests
 │       ├── test_pipeline_1f1b.py           # 1F1B schedule + micro-batch tests
 │       └── benchmark_cluster_speedup.py    # Speedup projection calculator (authoritative table)

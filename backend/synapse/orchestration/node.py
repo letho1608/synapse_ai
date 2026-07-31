@@ -274,6 +274,12 @@ class Node:
     self._lazy_init_fault_tolerance()
     if self.fault_tolerance:
         await self.fault_tolerance.start()
+        # B5: exchange fault-tolerance heartbeats over the event mesh,
+        # independently of discovery/membership, so liveness is tracked even
+        # before peers join the topology (and a dead peer keeps being
+        # rebalanced even if discovery never drops it).
+        self.event_router.subscribe("synapse/cluster/heartbeat", self._on_ft_heartbeat)
+        self._schedule_task(self._ft_heartbeat_loop(), "ft_heartbeat")
 
     self.cluster_state.update_node(self.id, {
         "device": str(self.device_capabilities),
@@ -430,6 +436,39 @@ class Node:
       if DEBUG >= 1: print(f"Error in on_node_status: {e}")
       if DEBUG >= 2: traceback.print_exc()
 
+  async def _ft_heartbeat_loop(self):
+    """Periodically publish this node's fault-tolerance heartbeat over the
+    event mesh (B5): peers record it regardless of topology membership."""
+    while True:
+      try:
+        interval = 2.0
+        if self.fault_tolerance is not None:
+          interval = self.fault_tolerance.HEARTBEAT_INTERVAL
+        await asyncio.sleep(interval)
+        if self.fault_tolerance is not None:
+          await self.event_router.publish(
+            "synapse/cluster/heartbeat",
+            {"type": "heartbeat", "node_id": self.id},
+            origin="local",
+          )
+      except asyncio.CancelledError:
+        break
+      except Exception as e:
+        if DEBUG >= 1:
+          print(f"[FT_HEARTBEAT] publish failed: {e}")
+
+  async def _on_ft_heartbeat(self, event: Event):
+    """Record a peer's fault-tolerance heartbeat (B5)."""
+    try:
+      data = event.data
+      if isinstance(data, dict):
+        nid = data.get("node_id")
+        if nid and nid != self.id and self.fault_tolerance is not None:
+          self.fault_tolerance.record_heartbeat(nid)
+    except Exception as e:
+      if DEBUG >= 1:
+        print(f"[FT_HEARTBEAT] record failed: {e}")
+
   async def check_fault_tolerance(self) -> None:
     """LACP: Dynamic Fault Tolerance with rebalancing on node failure."""
     current_time = time.time()
@@ -450,9 +489,20 @@ class Node:
 
     # Phase 2: LACP node failure detection + rebalancing
     if self.fault_tolerance and self._distributed_pipeline:
-      dead_nodes = self.fault_tolerance.get_dead_nodes()
+      ft = self.fault_tolerance
+      dead_nodes = ft.get_dead_nodes()
+      # The monitor loop flags a node at its FIRST missed heartbeat
+      # (_pending_rebalance) while blacklisting waits for 3 consecutive
+      # misses; rebalance it now instead of waiting for the threshold (B5).
+      if ft._pending_rebalance and ft._pending_rebalance not in dead_nodes:
+        dead_nodes.append(ft._pending_rebalance)
+
       for dead_id in dead_nodes:
-        if self.fault_tolerance._health.get(dead_id, None) and self.fault_tolerance._health[dead_id].is_blacklisted:
+        is_pending = (dead_id == ft._pending_rebalance)
+        if is_pending:
+          ft._pending_rebalance = None  # consumed by this rebalance
+        health = ft._health.get(dead_id)
+        if health and (health.is_blacklisted or is_pending):
           if DEBUG >= 1: print(f"!!! [LACP_FAULT] Node {dead_id} is dead, triggering rebalance")
 
           current_assignments = {}
@@ -886,6 +936,11 @@ class Node:
       self.distributed_node_count = node_count
       self.distributed_status = "distributed"
       try:
+        # B4: the master computes and broadcasts the authoritative partition
+        # before serving, so every node agrees on shard assignment instead of
+        # each recomputing the LACP partition locally on every forward.
+        if self.election_manager.is_master():
+          await self.broadcast_authoritative_partition(base_shard)
         tokens = await self.distributed_pipeline.process_prompt_distributed(
           base_shard=base_shard,
           prompt=prompt,
@@ -1643,6 +1698,22 @@ class Node:
         ))
     return partitions
 
+  def _get_authoritative_partitions(self, base_shard: Optional[Shard] = None) -> Optional[List[Partition]]:
+    """Return the master's broadcast partition when it still matches the
+    requested base shard, else None (caller recomputes locally)."""
+    parts = self._authoritative_partitions
+    if parts is None:
+      return None
+    cached = self._authoritative_base_shard
+    if base_shard is None or cached is None:
+      return parts
+    if (cached.model_id == base_shard.model_id
+        and cached.n_layers == base_shard.n_layers
+        and cached.start_layer == base_shard.start_layer
+        and cached.end_layer == base_shard.end_layer):
+      return parts
+    return None
+
   def _build_latency_matrix(self) -> Optional[LatencyMatrix]:
     """
     Build latency matrix for LACP partitioning.
@@ -1654,7 +1725,11 @@ class Node:
     if len(node_ids) < 2:
       return None
 
-    if not hasattr(self, '_latency_cache'):
+    # Rebuild the cache when the node set changes: a cache initialized once
+    # (hasattr guard) goes stale as nodes join/leave, distorting the matrix
+    # with missing nodes or ghosts (B3).
+    if (not hasattr(self, '_latency_cache')
+        or set(self._latency_cache.keys()) != set(node_ids)):
       self._latency_cache: Dict[str, Dict[str, float]] = {}
       for nid in node_ids:
         self._latency_cache[nid] = {other: 0.0 if other == nid else 50.0 for other in node_ids}
