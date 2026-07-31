@@ -3,7 +3,7 @@ from typing import List, Callable, Optional, Any
 from loguru import logger
 import json
 
-from synapse.routing.p2p_socket_bridge import P2PSocketBridge
+from synapse.routing.p2p_socket_bridge import P2PSocketBridge, DEFAULT_MAX_FRAME_SIZE
 
 class Libp2pNode:
     """
@@ -11,11 +11,14 @@ class Libp2pNode:
     It integrates with Tailscale for peer discovery and uses P2PSocketBridge
     for cross-process event relay.
     """
-    def __init__(self, node_id: str, port: int, event_router: Any):
+    def __init__(self, node_id: str, port: int, event_router: Any,
+                 max_frame_size: int = None):
         self.node_id = node_id
         self.port = port
         self.event_router = event_router
-        self._bridge = P2PSocketBridge(node_id, port, event_router)
+        if max_frame_size is None:
+            max_frame_size = DEFAULT_MAX_FRAME_SIZE
+        self._bridge = P2PSocketBridge(node_id, port, event_router, max_frame_size=max_frame_size)
         self._running = False
 
     async def start(self, bootstrap_peers: List[str] = None):

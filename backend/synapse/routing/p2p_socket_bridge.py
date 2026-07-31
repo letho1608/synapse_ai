@@ -12,6 +12,14 @@ PACKET_TYPE_EVENT = 0x01
 PACKET_TYPE_HANDSHAKE = 0x02
 PACKET_TYPE_PING = 0x03
 PACKET_TYPE_PONG = 0x04
+PACKET_TYPE_ERROR = 0x05
+
+# Default ceiling for a single framed JSON packet on the event bridge.
+# Raised from 10 MiB (which silently dropped frames for ~5 MB tensors after
+# JSON+hex expansion) to a configurable 256 MiB so legitimate large frames
+# are delivered; a frame that still exceeds the cap gets an explicit
+# error packet back to the sender instead of a silent disconnect.
+DEFAULT_MAX_FRAME_SIZE = 256 * 1024 * 1024
 
 
 def _get_all_local_ips() -> Set[str]:
@@ -41,10 +49,15 @@ class P2PSocketBridge:
     P2PSocketBridge provides a real TCP transport for the EventRouter.
     It allows multiple processes to share a common event-driven mesh.
     """
-    def __init__(self, node_id: str, port: int, event_router: EventRouter):
+    def __init__(
+        self, node_id: str, port: int, event_router: EventRouter,
+        max_frame_size: int = DEFAULT_MAX_FRAME_SIZE,
+    ):
         self.node_id = node_id
         self.port = port
         self.event_router = event_router
+        self.max_frame_size = max_frame_size
+        self._last_errors: Dict[str, Dict] = {}  # peer_id -> last error packet received
         self._running = False
         self._server: Optional[asyncio.AbstractServer] = None
         self._connections: Dict[str, Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
@@ -292,11 +305,11 @@ class P2PSocketBridge:
             # LatencyProber compatibility: a probe is a bare PROBE_SIZE-byte
             # blob whose leading 4 bytes are the top of a packed "!dQ"
             # timestamp — always a huge number, never a valid frame length
-            # (10MB cap). Echo the whole blob back so the prober's RTT and
-            # bandwidth measurement succeed against the production listener
-            # (previously the probe was dropped as "Packet too large" and
-            # bandwidth stayed at its hardcoded default).
-            if length <= 0 or length > 10 * 1024 * 1024:
+            # (way past the configured cap). Echo the whole blob back so the
+            # prober's RTT and bandwidth measurement succeed against the
+            # production listener (previously the probe was dropped as
+            # "Packet too large" and bandwidth stayed at its hardcoded default).
+            if length <= 0 or length > self.max_frame_size:
                 try:
                     from synapse.topology.latency_matrix import LatencyProber
                     probe_size = LatencyProber.PROBE_SIZE
@@ -418,11 +431,19 @@ class P2PSocketBridge:
         try:
             while self._running:
                 try:
-                    packet, pkt_type = await self._read_packet_with_type(reader)
+                    stored = self._connections.get(peer_id)
+                    writer = stored[1] if stored else None
+                    packet, pkt_type = await self._read_packet_with_type(reader, writer)
                     if packet is None:
                         break
 
-                    if pkt_type == PACKET_TYPE_PING:
+                    if pkt_type == PACKET_TYPE_ERROR:
+                        self._last_errors[peer_id] = packet
+                        logger.warning(
+                            f"Peer {peer_id} rejected a frame: {packet.get('reason')} "
+                            f"(size={packet.get('size')}, max={packet.get('max_frame_size')})"
+                        )
+                    elif pkt_type == PACKET_TYPE_PING:
                         pong = {"type": "pong", "timestamp": packet.get("timestamp")}
                         data = json.dumps(pong).encode("utf-8")
                         stored = self._connections.get(peer_id)
@@ -469,7 +490,9 @@ class P2PSocketBridge:
         packet, _ = await self._read_packet_with_type(reader)
         return packet
 
-    async def _read_packet_with_type(self, reader: asyncio.StreamReader) -> Tuple[Optional[Dict], int]:
+    async def _read_packet_with_type(
+        self, reader: asyncio.StreamReader, writer: Optional[asyncio.StreamWriter] = None
+    ) -> Tuple[Optional[Dict], int]:
         """
         Read a single length-prefixed JSON packet with type byte.
         Returns (packet_dict, packet_type).
@@ -479,11 +502,14 @@ class P2PSocketBridge:
             header = await reader.readexactly(5)
             length = struct.unpack("!I", header[:4])[0]
             pkt_type = header[4]
-            if length > 10 * 1024 * 1024:
+            if length > self.max_frame_size:
                 logger.warning(
-                    f"Packet too large: {length} bytes (limit 10 MiB), dropping "
-                    f"connection — very large tensor payloads should go through "
-                    f"the TCP/SHM transports instead of the event bridge"
+                    f"Frame too large: {length} bytes exceeds cap "
+                    f"{self.max_frame_size} bytes, sending explicit error to sender "
+                    f"instead of silently dropping"
+                )
+                await self._send_error(
+                    writer, "frame_too_large", length, self.max_frame_size
                 )
                 return None, 0
             data = await reader.readexactly(length)
@@ -494,6 +520,29 @@ class P2PSocketBridge:
         except Exception as e:
             logger.error(f"Error reading packet: {e}")
             return None, 0
+
+    async def _send_error(
+        self,
+        writer: Optional[asyncio.StreamWriter],
+        reason: str,
+        size: int,
+        max_frame_size: int,
+    ):
+        """Send an explicit error packet back to a peer instead of silently dropping."""
+        if writer is None or writer.is_closing():
+            return
+        try:
+            error_pkt = {
+                "type": "error",
+                "reason": reason,
+                "size": size,
+                "max_frame_size": max_frame_size,
+            }
+            data = json.dumps(error_pkt).encode("utf-8")
+            writer.write(struct.pack("!IB", len(data), PACKET_TYPE_ERROR) + data)
+            await writer.drain()
+        except Exception as e:
+            logger.debug(f"Failed to send error packet: {e}")
 
     async def _send_handshake(self, writer: asyncio.StreamWriter, pkt_type: int = PACKET_TYPE_HANDSHAKE):
         """Send identification handshake to a peer."""

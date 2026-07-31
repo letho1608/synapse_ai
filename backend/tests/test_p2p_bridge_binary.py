@@ -10,6 +10,11 @@ swallowed by the event router — every inter-node tensor was silently dropped.
 Also verifies the latency-probe echo: LatencyProber sends a raw 1KB blob that
 does not speak the framed handshake protocol; the bridge must echo it back so
 bandwidth measurement works against the production listener.
+
+Large-frame handling: frames up to the configured cap (default 256 MiB) are
+delivered intact even when they exceed the old 10 MiB limit; a frame beyond a
+configured cap gets an explicit error packet back to the sender instead of a
+silent drop.
 """
 import asyncio
 import random
@@ -28,11 +33,11 @@ from synapse.transport.codec import decode_tensor, encode_tensor
 class _MeshNode:
     """Minimal node: a real Libp2pNode whose P2PSocketBridge listens on port."""
 
-    def __init__(self, node_id: str, port: int):
+    def __init__(self, node_id: str, port: int, max_frame_size: int = None):
         self.id = node_id
         self.port = port
         self.er = EventRouter()
-        self.libp2p = Libp2pNode(node_id, port, self.er)
+        self.libp2p = Libp2pNode(node_id, port, self.er, max_frame_size=max_frame_size)
 
     @property
     def bridge(self):
@@ -156,3 +161,96 @@ async def test_latency_prober_measures_bandwidth_against_bridge():
     assert entry.bandwidth_mbps > 0, f"bandwidth not measured: {entry}"
 
     await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_large_frame_over_old_10mib_cap_is_delivered():
+    """A frame larger than the old hardcoded 10 MiB limit (a 12 MB float32
+    tensor expands to ~24 MB of JSON hex) is now delivered intact end-to-end
+    with the default 256 MiB cap — the silent-drop regression is gone."""
+    a = _MeshNode("br-lg-a", 59141)
+    b = _MeshNode("br-lg-b", 59142)
+    await a.start()
+    await b.start()
+
+    received = []
+
+    async def on_tensor(event):
+        data = event.data
+        tensor, metadata = decode_tensor(data["bin"])
+        received.append((tensor.copy(), metadata))
+
+    b.er.subscribe("synapse/inference/tensor/br-lg-b", on_tensor)
+
+    await a.connect_to(b, "127.0.0.1:59142")
+    await asyncio.sleep(0.5)
+
+    # 3M float32 = 12 MB raw; JSON hex encoding doubles the frame to ~24 MB,
+    # comfortably past the old 10 MiB cap but inside the new 256 MiB default.
+    expected = np.arange(3_000_000, dtype=np.float32).reshape(3000, 1000)
+    payload = {"bin": encode_tensor(
+        expected,
+        metadata={"request_id": "req-big", "shard": {"model_id": "m",
+                                                     "start_layer": 0, "end_layer": 8, "n_layers": 8}},
+    )}
+    await a.er.publish("synapse/inference/tensor/br-lg-b", payload, origin="local")
+
+    for _ in range(100):
+        if received:
+            break
+        await asyncio.sleep(0.1)
+
+    assert received, "large tensor never arrived on node B (silently dropped?)"
+    tensor, metadata = received[0]
+    assert tensor.shape == (3000, 1000)
+    assert np.array_equal(tensor, expected)
+    assert metadata["request_id"] == "req-big"
+
+    await a.stop()
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_oversized_frame_gets_explicit_error_back_to_sender():
+    """With a small configured cap, an oversized frame is NOT silently
+    dropped: the receiver answers with an explicit error packet and the
+    sender records it (subscriber never sees the payload)."""
+    small_cap = 4096
+    a = _MeshNode("br-err-a", 59151, max_frame_size=small_cap)
+    b = _MeshNode("br-err-b", 59152, max_frame_size=small_cap)
+    await a.start()
+    await b.start()
+
+    received = []
+
+    async def on_tensor(event):
+        received.append(event.data)
+
+    b.er.subscribe("synapse/inference/tensor/br-err-b", on_tensor)
+
+    await a.connect_to(b, "127.0.0.1:59152")
+    await asyncio.sleep(0.5)
+
+    # 2K float32 = 8 KB raw -> ~16 KB hex frame, far beyond the 4096 cap.
+    big = np.arange(2048, dtype=np.float32)
+    await a.er.publish(
+        "synapse/inference/tensor/br-err-b",
+        {"bin": encode_tensor(big, metadata={"request_id": "req-big2"})},
+        origin="local",
+    )
+
+    err = None
+    for _ in range(50):
+        err = a.bridge._last_errors.get("br-err-b")
+        if err:
+            break
+        await asyncio.sleep(0.1)
+
+    assert err is not None, "sender never received an explicit error packet"
+    assert err.get("reason") == "frame_too_large", f"unexpected error: {err}"
+    assert err.get("max_frame_size") == small_cap
+    assert err.get("size", 0) > small_cap
+    assert not received, "oversized payload must not reach the subscriber"
+
+    await a.stop()
+    await b.stop()
