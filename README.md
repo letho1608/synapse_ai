@@ -21,10 +21,10 @@ Synapse AI is a **true distributed supercomputing system** that pools ALL hardwa
 | Ignore network topology | **Latency-aware clustering**: nodes with <1ms latency get adjacent shards; cross-region nodes get independent shards |
 | Serial tensor forwarding blocks the pipeline | **Async non-blocking forwarding**: tensor sent as soon as ready; next micro-batch starts immediately |
 | Training runs on a single node | **Distributed DDP + all-reduce**: every node computes gradients on its shard in parallel, then synchronizes |
-| Node failure kills the request | **Dynamic rebalancing**: failed node's shard reassigned live; state recovered from JSON checkpoint (no pickle) |
+| Node failure kills the request | **Dynamic rebalancing**: failed node's shard reassigned live; dead node's JSON checkpoint (no pickle) is written and staged for the survivor — resume-from-checkpoint is pending (see Known Limitations) |
 | Same speed with 1 node or 100 nodes | **Pipeline-parallel speedup**: every added node increases capacity and keeps stages busy in parallel; wall-clock gains follow the scaling table below |
 
-**Verification:** All claims backed by real tests — 220 tests across 30 test modules covering fault tolerance, TCP_NODELAY, resource measurement, ILP partitioning, multi-resource election, decode token verification, pipeline overlap, 1F1B training, binary tensor transport, cross-node checkpoint recovery, zero-copy shared memory, and the web UI root route. Coverage is behavioral: tests drive the shipped production code paths (hardware-dependent backends are stubbed where required) — no source-string assertion tests.
+**Verification:** All claims backed by real tests — 220 tests across 29 test modules covering fault tolerance, TCP_NODELAY, resource measurement, ILP partitioning, multi-resource election, decode token verification, pipeline overlap, 1F1B training, binary tensor transport, cross-node checkpoint recovery, zero-copy shared memory, and the web UI root route. Coverage is behavioral: tests drive the shipped production code paths (hardware-dependent backends are stubbed where required) — no source-string assertion tests.
 
 ---
 
@@ -156,6 +156,9 @@ Speedup is measured against the same workload on 1 node (pipeline-parallel infer
 - **TLS/mTLS between nodes is not implemented.** Intra-cluster tensor traffic (TCP) is unencrypted; run clusters on trusted networks (LAN/Tailscale). This is planned future work.
 - **RDMA/InfiniBand transport is not implemented** — zero-copy shared memory currently covers same-machine nodes only (see Async Tensor Forwarding above).
 - **Checkpoint writes are wired into distributed training steps, but resume-from-checkpoint is not yet applied.** Every distributed training step persists a JSON metadata checkpoint (model id, shard layer range, step) to the shared checkpoint directory, and rebalancing stages the dead node's recovered state for the surviving node — but the survivor does not yet reload weights/KV from that checkpoint before resuming. Checkpoint recovery also depends on a **shared filesystem**: the file written by one node must be readable by the orchestrator on another (`load_latest_checkpoint()` scans the shared directory).
+- **Distributed decode is not prompt-conditioned end to end.** In distributed inference each micro-batch's context is the last token plus verified lookahead guesses, not the full prompt/history; the speculative verification gate is sound (no token predicted from a contaminated context can enter the output), but a live multi-node run generates a continuation of the last token rather than a full-context answer.
+- **The P2P event bridge drops frames larger than 10 MiB** (≈5 MB raw tensor after the JSON+hex framing). Very large hidden states or single-message transfers can hit this limit silently — use the TCP/SHM transports for such payloads.
+- **With the multi-resource LACP path enabled (`--no-tflops-proportional`), partitioning re-runs resource measurement and bandwidth probing on a cadence**: probing is gated to once per 10 s, but each partition recompute still costs ~0.5 s per node in disk-I/O measurement, and the bandwidth estimate is a single-1024-byte-message round-trip proxy (a lower bound, not link capacity).
 - **Multi-node behavior is verified with in-process simulated nodes** driving the real transport/partition/training code; a hardware multi-machine E2E benchmark run is deferred to future work.
 - **The web UI is a backend-served static dashboard** (no npm dependency) — `GET /` always returns a real page, served by the API process itself.
 
@@ -214,7 +217,7 @@ The cluster self-organizes:
 2. **Probing** → latency + bandwidth matrix built (N×N)
 3. **Multi-resource election** → master node selected by LACP composite score (VRAM + TFLOPS + CPU + RAM + disk I/O + bandwidth + power); uses `resource_scorer` callable when available, falls back to VRAM+FLOPs
 4. **LACP** → master computes optimal shard assignment via Largest Remainder Method (`method="lrm"`, fast) or ILP (`method="ilp"`, optimal via PuLP binary variables `x_{i,l}`)
-5. **Pipeline** → 1F1B micro-batching begins; heartbeat monitoring (2s interval, 5s timeout = `HEARTBEAT_TIMEOUT`) checks every node; dead nodes trigger `check_timeout()` in the monitor loop and `rebalance_after_failure()` repartitions layers among survivors with JSON checkpoint recovery
+5. **Pipeline** → 1F1B micro-batching begins; heartbeat monitoring (2s interval, 5s timeout = `HEARTBEAT_TIMEOUT`) checks every node; dead nodes trigger `check_timeout()` in the monitor loop and `rebalance_after_failure()` repartitions layers among survivors with JSON checkpoint recovery (rebalancing triggers only after the distributed pipeline has been initialized and after discovery has dropped the dead peer from the topology)
 6. **API** → `/v1/chat/completions` serves requests with distributed acceleration
 
 ---

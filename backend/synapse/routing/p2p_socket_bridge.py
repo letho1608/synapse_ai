@@ -480,7 +480,11 @@ class P2PSocketBridge:
             length = struct.unpack("!I", header[:4])[0]
             pkt_type = header[4]
             if length > 10 * 1024 * 1024:
-                logger.error(f"Packet too large: {length} bytes, dropping connection")
+                logger.warning(
+                    f"Packet too large: {length} bytes (limit 10 MiB), dropping "
+                    f"connection — very large tensor payloads should go through "
+                    f"the TCP/SHM transports instead of the event bridge"
+                )
                 return None, 0
             data = await reader.readexactly(length)
             packet = json.loads(data.decode('utf-8'))

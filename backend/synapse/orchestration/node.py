@@ -1659,7 +1659,13 @@ class Node:
           if DEBUG >= 2:
             print(f"[latency] probe failed for {peer.id()}: {e}")
 
-    if self.peers:
+    # Bandwidth/latency probing is gated to at most once per 10 s: the
+    # election scorer and the LACP partition path can call
+    # _build_latency_matrix on a short cadence, and every probe opens a TCP
+    # connection the peer's bridge echoes then closes. Re-probing too
+    # eagerly would turn measurement into standing connection churn.
+    if self.peers and (time.time() - getattr(self, "_last_probe_at", 0.0)) >= 10.0:
+      self._last_probe_at = time.time()
       try:
         loop = asyncio.get_running_loop()
         loop.create_task(probe_peers_background())

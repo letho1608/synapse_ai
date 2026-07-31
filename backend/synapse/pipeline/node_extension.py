@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 import uuid
 from typing import Dict, List, Optional, Tuple, Any
@@ -26,6 +27,9 @@ from synapse.pipeline.gradient_sync import DistributedTrainer, GradientShard
 from synapse.pipeline.scheduler import MicroBatch, MicroBatchOp
 from synapse.pipeline.stage import PipelineStage, StageResult
 from synapse.helpers import DEBUG
+
+_log = logging.getLogger(__name__)
+
 
 def _maybe_span(tracer, name: str, ctx, attrs: dict):
     """Start a tracing span if tracer is available, else no-op context manager."""
@@ -90,8 +94,9 @@ class DistributedPipelineExtension:
         FaultToleranceManager.load_latest_checkpoint() after rebalancing.
 
         Lightweight by design: metadata only (no kv_cache / optimizer state),
-        and exceptions are swallowed so a checkpoint write failure never
-        aborts training.
+        and exceptions are caught so a checkpoint write failure never aborts
+        training — but they are logged at WARNING, not silently swallowed, so
+        a failing checkpoint directory is observable in production.
         """
         try:
             node = self._node
@@ -110,7 +115,13 @@ class DistributedPipelineExtension:
                 step=step,
                 kv_cache=None,
             )
-        except Exception:
+        except Exception as e:
+            _log.warning(
+                "checkpoint write failed for %s (step %s): %s",
+                base_shard.model_id,
+                self._checkpoint_steps.get(base_shard.model_id, 0),
+                e,
+            )
             if DEBUG >= 1:
                 import traceback
                 traceback.print_exc()
@@ -380,8 +391,11 @@ class DistributedPipelineExtension:
                 if updates:
                     await self._node.inference_engine.apply_gradient_updates(shard, updates)
                 # Persist the shard's step to the shared checkpoint directory
-                # so cross-node recovery restores real on-disk state.
-                self._save_shard_checkpoint(base_shard, shard=shard)
+                # so cross-node recovery restores real on-disk state. Only
+                # multi-node steps write checkpoints: a single-node run has no
+                # peer to recover state for, so writing would be pure chatter.
+                if num_stages > 1:
+                    self._save_shard_checkpoint(base_shard, shard=shard)
                 local_loss = self._trainer.average_loss if self._trainer._loss_history else (float(loss) if loss else 0.0)
                 if _train_span is not None:
                     _train_span.set_attribute("loss", local_loss)
@@ -482,14 +496,14 @@ class DistributedPipelineExtension:
         partitions = self._get_partition_assignments(base_shard)
         num_stages = len(partitions)
         if num_stages <= 1:
-            # Single node: plain training step, no pipeline needed.
+            # Single node: plain training step, no pipeline needed. No
+            # checkpoint is written — with no peer, there is no cross-node
+            # recovery value and the write would be per-step disk chatter.
             shard = self._node.get_current_shard(base_shard)
             length = np.ones(max(1, input_ids.shape[0] if input_ids.ndim >= 1 else 1))
             loss, _ = await self._node.inference_engine.train(
                 request_id, shard, input_ids, labels, length, sync_gradients=False,
             )
-            # Persist the shard's step to the shared checkpoint directory.
-            self._save_shard_checkpoint(base_shard, shard=shard)
             return float(loss) if loss is not None else 0.0
 
         rows = max(1, input_ids.shape[0] if input_ids.ndim >= 1 else 1)
