@@ -21,14 +21,38 @@ class TestPartitionerILP:
         import pulp
         assert pulp is not None
 
-    def test_pulp_imported_in_partitioner(self):
-        """Verify partitioner.py imports pulp."""
-        code = open(
-            r"D:\Code\paper\synapse_ai\backend\synapse\topology\partitioner.py"
-        ).read()
-        assert "import pulp" in code or "from pulp" in code, (
-            "Partitioner does not import pulp"
-        )
+    def test_ilp_method_invokes_solver(self, monkeypatch):
+        """compute_partition(method='ilp') invokes the PuLP solver — behavioral,
+        no source inspection."""
+        from synapse.topology import partitioner
+        from synapse.topology.partitioner import compute_partition
+        from synapse.topology.resource_weight import NodeResources
+
+        called = {}
+        orig = partitioner.compute_partition_ilp
+
+        def recording(nodes, latency_matrix=None, total_layers=32, **kwargs):
+            called["invoked"] = True
+            return orig(
+                nodes, latency_matrix=latency_matrix,
+                total_layers=total_layers, **kwargs,
+            )
+
+        monkeypatch.setattr(partitioner, "compute_partition_ilp", recording)
+
+        nodes = {
+            "node0": NodeResources(
+                gpu_vram_mb=8192, gpu_tflops_fp16=20.0, gpu_tflops_fp32=10.0,
+                cpu_cores=8, system_ram_mb=16384,
+            ),
+            "node1": NodeResources(
+                gpu_vram_mb=4096, gpu_tflops_fp16=10.0, gpu_tflops_fp32=5.0,
+                cpu_cores=4, system_ram_mb=8192,
+            ),
+        }
+        result = compute_partition(nodes, None, 16, method="ilp")
+        assert called.get("invoked"), "compute_partition(method='ilp') did not call the ILP solver"
+        assert result.total_layers == 16
 
     def test_compute_partition_ilp_function_exists(self):
         """Verify compute_partition_ilp is defined and callable."""

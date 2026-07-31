@@ -12,7 +12,8 @@ from synapse.topology.topology import Topology
 from synapse.topology.device_capabilities import device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.topology.partitioning_strategy import Partition, map_partitions_to_shards, TFLOPSProportionalPartitioner
 from synapse.topology.partitioner import compute_partition, LACPPartition, ShardAssignment
-from synapse.topology.resource_weight import NodeResources
+from synapse.topology.resource_weight import NodeResources, ResourceScorer, apply_measured_bandwidth
+from synapse.topology.latency_matrix import LatencyMatrix, LatencyEntry, LatencyProber
 from synapse import DEBUG
 from synapse.helpers import AsyncCallbackSystem
 from synapse.loading import RepoProgressEvent
@@ -42,6 +43,8 @@ class Node:
     default_sample_temperature: float = 0.0,
     max_concurrent_requests: int = 32,
     topology_viz: Optional[Any] = None,
+    partition_method: str = "lrm",
+    tflops_proportional: bool = True,
   ):
     self.id = _id
     self.inference_engine = inference_engine
@@ -60,8 +63,21 @@ class Node:
     self.lookahead_window = 3
     self.transport_quantization = "int8"
     
-    # Initialize Election Manager
-    self.election_manager = ElectionManager(self.id, self.event_router)
+    # Initialize Election Manager. The LACP composite resource scorer is wired
+    # in so the elected master's weight derives from the multi-resource score
+    # (VRAM, TFLOPS, CPU, RAM, disk, bandwidth, latency, power) instead of the
+    # default 1.0. The weight is (re)computed once hardware is known and again
+    # whenever the cluster topology grows.
+    self._resource_scorer = ResourceScorer()
+    self.election_manager = ElectionManager(
+        self.id,
+        self.event_router,
+        resource_scorer=self._election_resource_scorer,
+    )
+
+    # Real bandwidth probing for same-machine/peer links (TCP echo probes).
+    self._latency_prober = LatencyProber()
+    self._measured_bandwidth: Dict[str, float] = {}
 
     # LACP Distributed Pipeline Extension
     self._distributed_pipeline = None
@@ -69,8 +85,15 @@ class Node:
     # LACP TCP Transport for binary tensor forwarding
     self.tcp_transport: Optional[Any] = None
 
+    # LACP zero-copy shared-memory transport for same-machine peers
+    self.shm_transport: Optional[Any] = None
+
     # LACP Fault Tolerance Manager
     self.fault_tolerance = None
+
+    # Most recent LACP rebalance result (kept so the recovered cross-node
+    # checkpoint staged by rebalance_after_failure is not discarded).
+    self._last_rebalance_result = None
 
     # Tracks whether distributed inference is currently active across multiple nodes.
     # Set to True when distributed pipeline starts, False on fallback to single-node.
@@ -92,7 +115,14 @@ class Node:
     self.topology_viz = topology_viz
     self.default_sample_temperature = default_sample_temperature
     self.num_micro_batches = 1
-    self.tflops_proportional = True  # Use TFLOPS-proportional sharding by default (Cake concept)
+    self.tflops_proportional = tflops_proportional  # TFLOPS-proportional sharding (multi-resource LACP off by default)
+    # Partition method for the LACP multi-resource path: "lrm" (Largest
+    # Remainder, fast) or "ilp" (PuLP integer programming, optimal). The
+    # production partitioner path reads this knob and passes it to
+    # compute_partition(method=...). Selectable via the --partition-method
+    # CLI flag or the Node constructor (the production partitioner can use
+    # the PuLP ILP solver through configuration).
+    self.partition_method: str = partition_method
     
     self.peers = []
     
@@ -174,6 +204,9 @@ class Node:
   async def start(self, wait_for_peers: int = 0) -> None:
     if DEBUG >= 1: print("Starting node: Getting device capabilities...")
     self.device_capabilities = await device_capabilities()
+    # Election weight must derive from the LACP composite resource score, not
+    # the default 1.0 — compute it now that real hardware is known.
+    self._refresh_election_weight()
     
     if DEBUG >= 1: print("Starting node: Starting Event Router and P2P Mesh...")
     await self.event_router.start()
@@ -211,6 +244,18 @@ class Node:
         if DEBUG >= 1:
             print(f"[TCP] Failed to start binary transport: {e}")
         self.tcp_transport = None
+
+    # Start zero-copy shared-memory transport for same-machine peers
+    try:
+        from synapse.transport.shm_transport import SharedMemoryTransport
+        self.shm_transport = SharedMemoryTransport(node_id=self.id)
+        await self.shm_transport.start()
+        if DEBUG >= 1:
+            print(f"[SHM] Zero-copy shared-memory transport ready (node {self.id})")
+    except Exception as e:
+        if DEBUG >= 1:
+            print(f"[SHM] Failed to start shared-memory transport: {e}")
+        self.shm_transport = None
 
     # Start distributed pipeline extension
     if self._distributed_pipeline:
@@ -301,6 +346,22 @@ class Node:
         
     if hasattr(self, "event_router") and self.event_router:
         await self.event_router.stop()
+
+    # Stop binary tensor transports (releases shared-memory segments)
+    if self.shm_transport is not None:
+        try:
+            await self.shm_transport.stop()
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"[SHM] Error stopping shared-memory transport: {e}")
+        self.shm_transport = None
+    if self.tcp_transport is not None:
+        try:
+            await self.tcp_transport.stop()
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"[TCP] Error stopping binary transport: {e}")
+        self.tcp_transport = None
 
   async def on_p2p_status(self, event: Event):
     """Handle opaque status updates from other nodes via P2P."""
@@ -398,22 +459,40 @@ class Node:
             for nid in alive_nodes:
               if nid in self.topology.nodes:
                 nodes_resources[nid] = NodeResources.from_device_capabilities(self.topology.nodes[nid])
+            latency_matrix = self._build_latency_matrix()
+            apply_measured_bandwidth(nodes_resources, latency_matrix, self.id)
             result = compute_partition(
               nodes=nodes_resources,
+              latency_matrix=latency_matrix,
               total_layers=total_layers,
               model_id="",
+              method=self.partition_method,
             )
             new_assignments = {}
             for a in result.assignments:
               new_assignments[a.node_id] = (a.start_layer, a.end_layer)
             return new_assignments
 
-          await self.fault_tolerance.rebalance_after_failure(
+          rebalance_result = await self.fault_tolerance.rebalance_after_failure(
             dead_node_id=dead_id,
             current_assignments=current_assignments,
             total_layers=32,
             lacp_partition_fn=repartition,
           )
+          # Consume the result instead of discarding it: the recovered
+          # cross-node checkpoint is staged for the surviving node that takes
+          # over the dead node's shard range, retrievable via
+          # fault_tolerance.get_recovery_checkpoint(<target>).
+          self._last_rebalance_result = rebalance_result
+          if rebalance_result.recovered_from_checkpoint and rebalance_result.recovery_checkpoint:
+            ckpt = rebalance_result.recovery_checkpoint
+            target = rebalance_result.recovery_target_node
+            if DEBUG >= 1:
+              print(
+                f"!!! [LACP_FAULT] Recovered checkpoint for {dead_id} "
+                f"(step {ckpt.step}, layers {ckpt.start_layer}-{ckpt.end_layer}) "
+                f"staged for node {target}"
+              )
 
   async def on_p2p_tensor(self, event: Event):
     """Handle incoming tensor for inference via P2P."""
@@ -684,7 +763,8 @@ class Node:
         result_payload = {
             "request_id": request_id,
             "tokens": intermediate_result,
-            "is_finished": is_finished
+            "is_finished": is_finished,
+            "micro_batch_id": inference_state.get("microbatch_id", 0) if inference_state else 0,
         }
 
         # 1. Publish to request_id-based topic (general broadcast)
@@ -1261,7 +1341,36 @@ class Node:
       if failed_connects: print(f"Failed to connect peers: {_pretty(failed_connects)}")
 
     self.peers = next_peers
+    self._register_transport_peers()
     return len(peers_added) > 0 or len(peers_removed) > 0 or len(peers_updated) > 0
+
+  def _register_transport_peers(self):
+    """Register every peer on the binary transports.
+
+    The TCP transport registers all peers; same-machine peers are additionally
+    registered on the zero-copy shared-memory transport so node-to-node tensor
+    traffic between co-located nodes can bypass TCP entirely.
+    """
+    import socket as _socket
+    from synapse.transport.shm_transport import is_same_machine
+
+    own_addr = f"{_socket.gethostname()}:0"
+    for peer in self.peers or []:
+      try:
+        addr = peer.addr()
+        peer_id = peer.id()
+      except Exception:
+        continue
+      if self.tcp_transport is not None:
+        try:
+          self.tcp_transport.register_peer(addr, peer_id)
+        except Exception:
+          pass
+      if self.shm_transport is not None and is_same_machine(addr, own_addr):
+        try:
+          self.shm_transport.register_peer(addr, peer_id)
+        except Exception:
+          pass
 
   async def select_best_inference_engine(self):
     supported_engines = self.get_supported_inference_engines()
@@ -1350,6 +1459,9 @@ class Node:
 
     next_topology.active_node_id = self.election_manager.current_master_id
     self.topology = next_topology
+    # Cluster composition changed: refresh the election weight so a stronger
+    # node's master weight reflects the LACP composite score over the cluster.
+    self._refresh_election_weight()
     if self.topology_viz:
       self.topology_viz.update_visualization(self.topology, self._compute_lacp_partition(), self.id)
 
@@ -1409,6 +1521,49 @@ class Node:
     # in the case of opaque status, we also want to receive our own opaque statuses
     self.on_opaque_status.trigger_all(request_id, status)
 
+  def _election_resource_scorer(self, node_id: str) -> float:
+    """
+    LACP composite resource score for master-election weighting.
+
+    Computes cluster-relative normalized scores over the nodes this node
+    currently knows about (same topology view every node converges on), so a
+    stronger node gets a higher election weight. Falls back to the node's own
+    device capabilities when the node is not yet in the topology.
+    """
+    try:
+      nodes_resources = {}
+      for nid, dc in self.topology.nodes.items():
+        nr = NodeResources.from_device_capabilities(dc)
+        if nid == self.id:
+          m = self._current_metrics
+          nr.gpu_util_pct = m.gpu_util_pct
+          nr.system_ram_used_mb = m.ram_used_mb
+          nr.current_power_w = m.gpu_power_w
+        nodes_resources[nid] = nr
+      if node_id not in nodes_resources:
+        nodes_resources[node_id] = NodeResources.from_device_capabilities(
+          self.device_capabilities
+        )
+      latency_matrix = self._build_latency_matrix()
+      apply_measured_bandwidth(nodes_resources, latency_matrix, self.id)
+      scores = self._resource_scorer.compute_scores(nodes_resources)
+      return scores.get(node_id, (0.0, None))[0]
+    except Exception:
+      return 0.0
+
+  def _refresh_election_weight(self) -> None:
+    """
+    Recompute the election base weight from current hardware + LACP composite.
+    Called when hardware is detected and when the cluster topology changes.
+    """
+    try:
+      vram_gb = float(getattr(self.device_capabilities, "memory", 0) or 0) / 1024.0
+      flops = getattr(self.device_capabilities, "flops", None)
+      fp32_flops = float(getattr(flops, "fp32", 0) or 0)
+      self.election_manager.set_base_compute_weight(vram_gb, fp32_flops)
+    except Exception:
+      pass
+
   def _compute_lacp_partition(self, base_shard: Optional[Shard] = None) -> List[Partition]:
     """Compute partition using TFLOPS-proportional (default) or LACP multi-resource scoring."""
     num_layers = base_shard.n_layers if base_shard and base_shard.n_layers > 0 else 32
@@ -1430,11 +1585,16 @@ class Node:
 
     latency_matrix = self._build_latency_matrix()
 
+    # Propagate measured network bandwidth into resource scores so the
+    # partitioner weights real links, not the 1000 Mbps placeholder.
+    apply_measured_bandwidth(nodes_resources, latency_matrix, self.id)
+
     lacp_result = compute_partition(
         nodes=nodes_resources,
         latency_matrix=latency_matrix,
         total_layers=num_layers,
         model_id=model_id,
+        method=self.partition_method,
     )
 
     partitions = []
@@ -1446,10 +1606,12 @@ class Node:
         ))
     return partitions
 
-  def _build_latency_matrix(self) -> Optional[Dict[str, Dict[str, float]]]:
+  def _build_latency_matrix(self) -> Optional[LatencyMatrix]:
     """
     Build latency matrix for LACP partitioning.
     Uses real-time EWMA forward latencies (Adaptive LACP) to react to network jitter.
+    Returns a LatencyMatrix (the type compute_partition expects), or None when
+    fewer than two nodes are present.
     """
     node_ids = list(self.topology.nodes.keys())
     if len(node_ids) < 2:
@@ -1478,6 +1640,21 @@ class Node:
                   self._latency_cache[nid][self.id] = latency_ms
               if DEBUG >= 1:
                 print(f"[latency] probed {peer.id()}: {latency_ms:.1f}ms")
+          # Bandwidth probe (best-effort): real TCP echo round-trips over the
+          # peer's address. The measured value lands in _measured_bandwidth and
+          # is injected into every matrix entry built from the cache, so
+          # partitioner/election resource scores reflect real link capacity.
+          try:
+            entry = await asyncio.wait_for(
+              self._latency_prober.probe(peer.id(), peer.addr(), timeout=2.0),
+              timeout=3.0,
+            )
+            if entry and entry.bandwidth_mbps > 0:
+              self._measured_bandwidth[peer.id()] = entry.bandwidth_mbps
+              if DEBUG >= 1:
+                print(f"[latency] bandwidth to {peer.id()}: {entry.bandwidth_mbps:.1f} Mbps")
+          except Exception:
+            pass
         except (asyncio.TimeoutError, Exception) as e:
           if DEBUG >= 2:
             print(f"[latency] probe failed for {peer.id()}: {e}")
@@ -1489,7 +1666,23 @@ class Node:
       except RuntimeError:
         pass
 
-    return self._latency_cache
+    # Convert the raw {from_node: {to_node: ms}} cache into a LatencyMatrix
+    # so compute_partition / HierarchicalClusterer receive the type they
+    # expect (LatencyMatrix with .nodes and .entries). Measured bandwidth is
+    # attached to the master->peer entries (NodeResources.bandwidth_mbps is
+    # documented as "measured to master").
+    matrix = LatencyMatrix()
+    for nid in node_ids:
+      for other, latency_ms in self._latency_cache.get(nid, {}).items():
+        bw = self._measured_bandwidth.get(other, 0.0) if nid == self.id else 0.0
+        matrix.set(LatencyEntry(
+          from_node=nid,
+          to_node=other,
+          latency_ms=float(latency_ms),
+          bandwidth_mbps=bw,
+        ))
+
+    return matrix
 
   def _setup_p2p_rpc_handlers(self):
     """Setup listeners for P2P RPC requests (Health, Topology)."""

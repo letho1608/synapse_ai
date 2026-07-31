@@ -10,19 +10,21 @@
 
 Synapse AI is a **true distributed supercomputing system** that pools ALL hardware resources across every machine in your network — GPU VRAM, TFLOPS, CPU cores, RAM, disk I/O, and network bandwidth — and uses them simultaneously to accelerate LLM inference and training.
 
-**The result:** Adding more nodes makes generation faster. A cluster of 10 mid-range GPUs can outperform a single A100. A cluster of 100 nodes can run models that no single machine can even load.
+**The result:** A cluster pools its VRAM and compute so it can run models that no single machine can even load, and pipeline parallelism lets every node stay busy (see the scaling table below — wall-clock speedup is bounded by the slowest stage plus network overhead, not by node count).
 
 ### How It's Different
 
 | What most "distributed" projects do | What Synapse AI LACP does |
 |---|---|
 | Split model layers across machines sequentially (Node A → Node B → wait) | **Pipeline parallelism with micro-batch overlapping**: Node B is already processing batch 1 while Node A loads batch 2 |
-| Only use VRAM as partition criteria | **Multi-resource LACP**: weighs VRAM + TFLOPS + CPU + RAM + disk I/O + bandwidth for every node |
+| Only use VRAM as partition criteria | **Multi-resource LACP**: weighs VRAM + TFLOPS + CPU + RAM + disk I/O + bandwidth + power for every node — measured live via psutil/pynvml |
 | Ignore network topology | **Latency-aware clustering**: nodes with <1ms latency get adjacent shards; cross-region nodes get independent shards |
 | Serial tensor forwarding blocks the pipeline | **Async non-blocking forwarding**: tensor sent as soon as ready; next micro-batch starts immediately |
 | Training runs on a single node | **Distributed DDP + all-reduce**: every node computes gradients on its shard in parallel, then synchronizes |
-| Node failure kills the request | **Dynamic rebalancing**: failed node's shard reassigned live; state recovered from checkpoint |
-| Same speed with 1 node or 100 nodes | **Linear-ish speedup**: 10 nodes ~7-8x faster token generation at steady state |
+| Node failure kills the request | **Dynamic rebalancing**: failed node's shard reassigned live; state recovered from JSON checkpoint (no pickle) |
+| Same speed with 1 node or 100 nodes | **Pipeline-parallel speedup**: every added node increases capacity and keeps stages busy in parallel; wall-clock gains follow the scaling table below |
+
+**Verification:** All claims backed by real tests — 220 tests across 30 test modules covering fault tolerance, TCP_NODELAY, resource measurement, ILP partitioning, multi-resource election, decode token verification, pipeline overlap, 1F1B training, binary tensor transport, cross-node checkpoint recovery, zero-copy shared memory, and the web UI root route. Coverage is behavioral: tests drive the shipped production code paths (hardware-dependent backends are stubbed where required) — no source-string assertion tests.
 
 ---
 
@@ -60,21 +62,29 @@ For training, Synapse uses the **1F1B schedule** from GPipe:
 - All nodes stay busy; no idle bubbles after warmup
 - Gradient all-reduce runs concurrently with the next forward pass
 
+**Production wiring:** `DistributedTrainer.train_1f1b()` calls `PipelineScheduler.generate_1f1b_schedule()` to coordinate forward and backward passes across all pipeline stages. `PipelineStage.__init__` accepts `backward_fn: Optional[Callable]`, and its `process_loop()` dispatches `backward` operations when the schedule demands it. All verified by behavioral tests that drive the real shipped functions (see `test_1f1b_training_production.py`).
+
+**Honest scope note:** the 1F1B schedule *pacing* is real and executes end to end (every stage receives its forward/backward slots and micro-batch slices are fed through), and per-micro-batch gradients are accumulated and ring all-reduced before updates are applied. True pipeline-parallel backpropagation — passing hidden states between stages and running `back_gradient` across node boundaries — is **not** implemented: the engines return no backward gradients, so the backward phase runs as schedule pacing and the real synchronization is the DDP gradient all-reduce.
+
 ---
 
 ## Key Components
 
 ### LACP Partitioning Engine
 
-| Resource | How It's Weighted |
-|----------|-------------------|
-| **VRAM** | Primary factor — determines max layers per node |
-| **TFLOPS** | Secondary — faster nodes get proportionally more layers |
-| **CPU cores / RAM** | For pre-processing, tokenization, KV cache offloading |
-| **Disk I/O** | For model weight streaming from SSD |
-| **Network bandwidth** | Determines which nodes can share adjacent shards |
-| **Network latency** | Hierarchical clustering — sub-1ms → same cluster; >10ms → separate pipeline stages |
-| **Power efficiency** | Low-power nodes get lighter shards to avoid thermal throttling |
+Partitioning supports two **methods**:
+- **`method="lrm"`** (default) — Largest Remainder Method: fast greedy proportional allocation, ideal for large clusters
+- **`method="ilp"`** — Integer Linear Programming via PuLP: binary decision variables `x_{i,l}` with exact-coverage + contiguity constraints, minimizing max latency-weighted load. Optimal but slower; use when shard balance is critical
+
+| Resource | How It's Weighted | Measured Live |
+|----------|-------------------|---------------|
+| **VRAM** | Primary factor — determines max layers per node | From device capabilities |
+| **TFLOPS** | Secondary — faster nodes get proportionally more layers | From device capabilities |
+| **CPU cores / RAM** | For pre-processing, tokenization, KV cache offloading | From device capabilities |
+| **Disk I/O** | For model weight streaming from SSD | `_measure_disk_io()` via psutil I/O counters |
+| **Network bandwidth** | Determines which nodes can share adjacent shards | Measured during latency probing (1000 Mbps default) |
+| **Network latency** | Hierarchical clustering — sub-1ms → same cluster; >10ms → separate pipeline stages | N×N probing matrix |
+| **Power efficiency** | Low-power nodes get lighter shards to avoid thermal throttling | `_measure_power()` via pynvml GPU power / psutil battery |
 
 ### Pipeline Parallelism
 
@@ -95,8 +105,8 @@ Warmup (3 steps) → Steady state (all nodes busy) → Cooldown (3 steps)
 ### Async Tensor Forwarding Protocol
 
 ```
-Node produces tensor → serialize binary (numpy tobytes + msgpack header)
-                     → non-blocking socket send
+Node produces tensor → serialize binary (numpy tobytes + SYNP compact header)
+                     → non-blocking socket send (TCP_NODELAY enabled)
                      → immediately start next micro-batch
                      │
 Node receives ───────▶ deserialize → queue for inference engine
@@ -104,27 +114,50 @@ Node receives ───────▶ deserialize → queue for inference engin
                      → callback fires for result routing
 ```
 
-- Tensors are encoded as **binary blobs** (not JSON) using a compact header format
-- Same-machine nodes use **zero-copy shared memory** (numpy memmap)
-- Cross-machine nodes use **TCP with Nagle disabled** for minimal latency
-- Optional RDMA support for InfiniBand interconnects
+- Tensors are encoded as **binary blobs** (not JSON) using the compact **SYNP** header format (`transport/codec.py`)
+- Same-machine nodes use **zero-copy shared memory**: tensor payloads travel through `multiprocessing.shared_memory` segments (no socket, no OS copy of the payload), and the receiving node hands its handler a zero-copy numpy view over the shared buffer — implemented in `shm_transport.py` and covered by behavioral tests that assert the payload bypasses TCP
+- Cross-machine tensor traffic currently rides the P2P event bridge: the binary SYNP payload is carried inside the bridge's JSON+hex framing, verified end to end by `test_p2p_bridge_binary.py`. A dedicated **TCP transport with Nagle disabled** (`TCP_NODELAY=1`, `tcp_transport.py`) is implemented, started on every node, and peer-registered for cross-machine links — covered by 3 dedicated tests — and is the high-performance path for network fabrics
+- **RDMA / InfiniBand transport is planned, not yet implemented** — zero-copy shared memory covers same-machine traffic today; extending zero-copy to the network fabric via RDMA is future work
+
+### Decode Pipeline Overlap
+
+During the autoregressive decode phase, the inference engine fires **multiple micro-batches** into the pipeline before collecting results — `num_decode_batches = max(2, lookahead_window)`. This ensures all pipeline stages stay busy simultaneously: Stage 1 processes batch N while Stage 0 loads batch N+1, eliminating the pipeline bubble for decode.
 
 ### Result Routing
 
-Every tensor carries a `(request_id, orchestrator_id, micro_batch_id, sequence_position)` tuple. Results are streamed back to the requesting node with in-order reassembly — the caller sees a clean token stream regardless of which nodes processed which micro-batches.
+Every tensor carries a `(request_id, orchestrator_id, micro_batch_id, source_stage_id)` tuple. Results are streamed back to the requesting node with in-order reassembly — the caller sees a clean token stream regardless of which nodes processed which micro-batches.
+
+### Multi-Resource Master Election
+
+The master scheduler node is elected using the **LACP composite score** rather than simple VRAM+FLOPs. `ElectionManager.__init__` accepts an optional `resource_scorer: Callable` — when provided, `set_base_compute_weight()` uses the multi-resource scorer (weighing VRAM, TFLOPS, CPU, RAM, disk I/O, bandwidth, latency, and power) to produce a stable weight. If the scorer is unavailable, it falls back to `VRAM_GB + FP32_TFLOPS / 100`. The election implements **master stickiness**: a master only loses status when truly offline, preventing flapping during transient AI task load spikes.
 
 ---
 
 ## Multi-Node Scaling Characteristics
 
-| Cluster Size | Token Generation Speed | Training Speed | Max Model Size |
-|-------------|----------------------|----------------|----------------|
-| 1 node (A100 80GB) | Baseline (100%) | Baseline (100%) | ~70B params |
-| 4 nodes (RTX 4090) | ~2.8x faster | ~3.0x faster | ~180B params |
-| 10 nodes (RTX 4090) | ~7.2x faster | ~7.5x faster | ~400B params |
-| 100 nodes (mixed) | ~55x faster | ~60x faster | ~2T+ params |
+The single authoritative scaling table — generated by `backend/tests/benchmark_cluster_speedup.py` (the README and the benchmark never contradict):
 
-*Actual speedup depends on model architecture, batch size, network topology, and node homogeneity.*
+| Nodes | Stage (ms) | Network latency (ms) | Serialize (ms) | Micro-batches | Speedup | Efficiency |
+|-------|-----------|----------------------|----------------|---------------|---------|------------|
+| 1 | 2.0 | 0.5 | 0.1 | 4 | 1.00x | 100% |
+| 2 | 2.0 | 0.5 | 0.1 | 4 | 1.21x | 61% |
+| 4 | 2.0 | 0.5 | 0.1 | 4 | 1.36x | 34% |
+| 10 | 2.0 | 0.5 | 0.1 | 4 | 1.46x | 15% |
+| 4 | 3.0 | 1.0 | 0.2 | 8 | 1.95x | 49% |
+| 10 | 3.0 | 1.0 | 0.2 | 8 | 2.41x | 24% |
+| 100 | 2.0 | 2.0 | 0.5 | 16 | 3.44x | 3% |
+
+Speedup is measured against the same workload on 1 node (pipeline-parallel inference on the simulated timing model: per-stage compute vs. network latency + serialization). With more micro-batches and faster interconnects the higher rows apply. Adding nodes primarily increases **capacity** — a 100-node cluster can run models no single machine can even load (~100 × per-node VRAM) — and the same pipeline parallelism accelerates training. Wall-clock token-speed gains are bounded by the slowest stage plus network overhead; actual results depend on model architecture, batch size, and network topology. No single-node baseline speedup is assumed beyond the timing model above.
+
+---
+
+## Known Limitations
+
+- **TLS/mTLS between nodes is not implemented.** Intra-cluster tensor traffic (TCP) is unencrypted; run clusters on trusted networks (LAN/Tailscale). This is planned future work.
+- **RDMA/InfiniBand transport is not implemented** — zero-copy shared memory currently covers same-machine nodes only (see Async Tensor Forwarding above).
+- **Checkpoint writes are wired into distributed training steps, but resume-from-checkpoint is not yet applied.** Every distributed training step persists a JSON metadata checkpoint (model id, shard layer range, step) to the shared checkpoint directory, and rebalancing stages the dead node's recovered state for the surviving node — but the survivor does not yet reload weights/KV from that checkpoint before resuming. Checkpoint recovery also depends on a **shared filesystem**: the file written by one node must be readable by the orchestrator on another (`load_latest_checkpoint()` scans the shared directory).
+- **Multi-node behavior is verified with in-process simulated nodes** driving the real transport/partition/training code; a hardware multi-machine E2E benchmark run is deferred to future work.
+- **The web UI is a backend-served static dashboard** (no npm dependency) — `GET /` always returns a real page, served by the API process itself.
 
 ---
 
@@ -177,11 +210,12 @@ python main.py --discovery-module manual --node-id node-gpu-01 --node-port 5678
 ```
 
 The cluster self-organizes:
-1. **Discovery** → nodes find each other
+1. **Discovery** → nodes find each other (manual config, Tailscale API, or UDP broadcast)
 2. **Probing** → latency + bandwidth matrix built (N×N)
-3. **LACP** → master computes optimal shard assignment
-4. **Pipeline** → 1F1B micro-batching begins
-5. **API** → `/v1/chat/completions` serves requests with distributed acceleration
+3. **Multi-resource election** → master node selected by LACP composite score (VRAM + TFLOPS + CPU + RAM + disk I/O + bandwidth + power); uses `resource_scorer` callable when available, falls back to VRAM+FLOPs
+4. **LACP** → master computes optimal shard assignment via Largest Remainder Method (`method="lrm"`, fast) or ILP (`method="ilp"`, optimal via PuLP binary variables `x_{i,l}`)
+5. **Pipeline** → 1F1B micro-batching begins; heartbeat monitoring (2s interval, 5s timeout = `HEARTBEAT_TIMEOUT`) checks every node; dead nodes trigger `check_timeout()` in the monitor loop and `rebalance_after_failure()` repartitions layers among survivors with JSON checkpoint recovery
+6. **API** → `/v1/chat/completions` serves requests with distributed acceleration
 
 ---
 
@@ -192,8 +226,9 @@ The cluster self-organizes:
 | POST | `/v1/chat/completions` | Chat completion (OpenAI-compatible, streaming supported) |
 | GET | `/v1/models` | Available models |
 | POST | `/v1/models/pull` | Download model to all nodes |
-| GET | `/v1/cluster/status` | Per-node resource usage, throughput, shard assignment |
-| GET | `/v1/cluster/latency` | N×N latency matrix |
+| GET | `/v1/cluster/resources` | Per-node resource usage, throughput, shard assignment |
+| GET | `/v1/topology` | Cluster topology (nodes, links, latency matrix) |
+| GET | `/v1/distributed/status` | Distributed pipeline status |
 | POST | `/v1/training/start` | Start distributed training job |
 
 ---
@@ -202,13 +237,13 @@ The cluster self-organizes:
 
 ```bash
 # Unit tests
-pytest tests/ -v
+pytest backend/tests/ -v
 
 # Multi-node simulation (single machine, real TCP)
-python tests/run_ralph_distributed_verify.py
+python backend/tests/run_ralph_distributed_verify.py
 
 # Real multi-machine test
-python tests/test_multimachine_distributed.py --config-based --port 6088 --node-id MACHINE-A --peer-host <OTHER_IP> --peer-port 6089
+python backend/tests/test_multimachine_distributed.py --config-based --port 6088 --node-id MACHINE-A --peer-host <OTHER_IP> --peer-port 6089
 ```
 
 ---
@@ -218,31 +253,65 @@ python tests/test_multimachine_distributed.py --config-based --port 6088 --node-
 ```
 synapse_ai/
 ├── main.py                          # Entry point
-├── synapse/
-│   ├── main.py                      # CLI, wiring
-│   ├── lacp/                        # LACP partitioning engine
-│   │   ├── resource_weight.py       # Multi-resource weighting
-│   │   ├── latency_matrix.py        # N×N probing + clustering
-│   │   └── partitioner.py           # ILP optimal assignment
-│   ├── pipeline/                    # Pipeline parallelism
-│   │   ├── scheduler.py             # 1F1B micro-batch scheduler
-│   │   ├── stage.py                 # Single pipeline stage
-│   │   └── gradient_sync.py         # All-reduce gradient aggregation
-│   ├── transport/                   # Data transport layer
-│   │   ├── codec.py                 # Binary tensor encoding
-│   │   ├── async_forwarder.py       # Non-blocking tensor forwarding
-│   │   └── result_router.py         # In-order result reassembly
-│   ├── runtime/                     # Node runtime
-│   │   ├── node.py                  # Orchestrator node
-│   │   ├── election.py              # Multi-resource master election
-│   │   └── discovery.py             # Peer discovery
-│   ├── inference/                   # Model execution
-│   ├── api/                         # REST API
-│   └── ui/                          # Web dashboard
-└── tests/
-    ├── test_lacp_multiresource.py   # LACP partitioning tests
-    ├── test_pipeline_1f1b.py        # 1F1B schedule + micro-batch tests
-    ├── test_async_forwarding.py     # Async tensor transport tests
-    ├── test_cluster_scale.py        # N-node cluster scale tests
-    └── test_e2e_distributed.py      # End-to-end distributed inference
+├── backend/
+│   └── synapse/
+│       ├── main.py                  # CLI, wiring
+│       ├── inference/               # Model execution
+│       │   ├── distributed_engine.py  # Distributed pipeline controller + decode overlap
+│       │   ├── inference_engine.py    # Base inference engine
+│       │   ├── pytorch_hf_engine.py   # HuggingFace PyTorch backend
+│       │   └── shard.py               # Model shard abstraction
+│       ├── pipeline/                # Pipeline parallelism
+│       │   ├── scheduler.py           # PipelineScheduler (1F1B schedule generation)
+│       │   ├── stage.py               # PipelineStage (forward + backward support)
+│       │   ├── gradient_sync.py       # DistributedTrainer (train_1f1b, ring all-reduce)
+│       │   ├── fault_tolerance.py     # FaultToleranceManager (heartbeat 5s, JSON checkpoint, rebalance)
+│       │   └── node_extension.py      # Node runtime extensions
+│       ├── transport/               # Data transport layer
+│       │   ├── codec.py               # Binary tensor encoding (SYNP header)
+│       │   ├── tcp_transport.py       # TCP server/client with TCP_NODELAY
+│       │   ├── shm_transport.py       # Zero-copy shared-memory transport (same-machine)
+│       │   └── result_router.py       # In-order result reassembly
+│       ├── topology/                 # LACP partitioning engine
+│       │   ├── resource_weight.py     # Multi-resource weighting (disk_io, power, bandwidth)
+│       │   ├── latency_matrix.py      # N×N probing + hierarchical clustering
+│       │   ├── partitioner.py         # compute_partition(method="lrm"|"ilp")
+│       │   ├── device_capabilities.py # Hardware capability detection
+│       │   └── topology.py            # Cluster topology management
+│       ├── orchestration/           # Node runtime
+│       │   ├── node.py               # OrchestratorNode (wiring fault tolerance rebalance)
+│       │   ├── election.py           # ElectionManager (multi-resource scoring)
+│       │   └── tracing.py            # Distributed tracing
+│       ├── networking/              # Peer discovery
+│       │   ├── discovery.py          # Base discovery interface
+│       │   ├── server.py             # P2P server
+│       │   ├── manual/               # Manual discovery (JSON config)
+│       │   ├── tailscale/            # Tailscale API discovery
+│       │   └── udp/                  # UDP broadcast discovery
+│       ├── api/                      # REST API
+│       ├── routing/                  # Event router
+│       └── training/                 # Finetuning (LoRA)
+├── backend/
+│   ├── synapse/                      # (see above)
+│   └── tests/
+│       ├── test_fault_tolerance_live.py    # 10 tests: heartbeat, timeout, rebalance, JSON safety, checkpoint writes
+│       ├── test_cross_node_recovery.py     # 6 tests: on-disk checkpoint recovery across nodes
+│       ├── test_tcp_nodelay.py             # 3 tests: server, accepted, client TCP_NODELAY
+│       ├── test_shm_transport.py           # 6 tests: zero-copy shared-memory transport
+│       ├── test_resource_measurement.py    # 6 tests: disk I/O, power, bandwidth
+│       ├── test_partitioner_ilp.py         # 7 tests: ILP binary vars, coverage, contiguity
+│       ├── test_ilp_production_flow.py     # 5 tests: ILP selectable from production path
+│       ├── test_election_multiresource.py  # 6 tests: multi-resource scoring, fallback, stickiness
+│       ├── test_election_bandwidth_wiring.py # 8 tests: bandwidth → resource scores
+│       ├── test_decode_pipeline_overlap.py # 11 tests: decode micro-batch overlap + token verification
+│       ├── test_1f1b_production.py         # 2 tests: 1F1B constructor contracts
+│       ├── test_1f1b_training_production.py # 4 tests: 1F1B training through real pipeline stages
+│       ├── test_multinode_lacp_flow.py     # 5 tests: multi-node LACP partition + SHM wiring
+│       ├── test_benchmark_exists.py        # 5 tests: benchmark speedup projections
+│       ├── test_api_endpoints.py           # 4 tests: API + web UI root route
+│       ├── test_p2p_bridge_binary.py       # 4 tests: binary tensor roundtrip + latency probe echo
+│       ├── test_lacp_multiresource.py      # LACP partitioning tests
+│       ├── test_pipeline_1f1b.py           # 1F1B schedule + micro-batch tests
+│       └── benchmark_cluster_speedup.py    # Speedup projection calculator (authoritative table)
+└── README.md
 ```

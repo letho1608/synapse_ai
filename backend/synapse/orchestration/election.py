@@ -128,10 +128,14 @@ class ElectionManager:
                         logger.info(f"Node {self.node_id} is still Master (stickiness active)")
                     self.current_master_id = self.node_id
                 elif self.current_master_id in self.active_nodes:
+                    # Current master is still alive: stickiness prevents
+                    # flapping. Never reassign the master while it is online —
+                    # otherwise node B would elect itself while node A (the
+                    # current master) keeps itself, producing a split brain.
                     self._master_became_offline_at = None
                     if new_master_id != self.current_master_id:
                         logger.info(f"Node {self.node_id} recognizes {self.current_master_id} as Master (sticky)")
-                    self.current_master_id = new_master_id
+                    # Keep current_master_id unchanged: no reassignment.
                 else:
                     if self._master_became_offline_at is None:
                         self._master_became_offline_at = now

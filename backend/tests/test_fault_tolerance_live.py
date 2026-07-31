@@ -5,12 +5,16 @@ Verifies the fixes for:
 - B2: check_timeout() is called in _monitor_loop (not orphaned)
 - B3: pickle replaced with JSON-safe serialization
 - M2: HEARTBEAT_TIMEOUT matches README 5s claim
+
+All tests are behavioral: they run the shipped monitor loop, write real
+checkpoint files, and drive the production Node.check_fault_tolerance() path.
 """
 import asyncio
-import time
 import json
-import os
 import tempfile
+import time
+
+import numpy as np
 import pytest
 
 
@@ -29,25 +33,56 @@ class TestFaultToleranceLive:
         from synapse.pipeline.fault_tolerance import FaultToleranceManager
         assert FaultToleranceManager.HEARTBEAT_INTERVAL == 2.0
 
-    def test_check_timeout_called_in_monitor_loop(self):
-        """Verify _monitor_loop calls check_timeout on registered nodes.
-        
-        This is the critical fix: before, check_timeout was only called from
-        tests. Now _monitor_loop iterates self._health and calls check_timeout().
-        """
-        ft_code = open(
-            r"D:\Code\paper\synapse_ai\backend\synapse\pipeline\fault_tolerance.py"
-        ).read()
-        
-        # Verify _monitor_loop contains a call to check_timeout
-        assert "check_timeout" in ft_code, (
-            "check_timeout() not found in fault_tolerance.py"
-        )
-        
-        # Verify it appears inside a loop over _health keys
-        assert "h.check_timeout" in ft_code, (
-            "_monitor_loop does not call check_timeout() on health entries"
-        )
+    @pytest.mark.asyncio
+    async def test_monitor_loop_detects_timeout(self):
+        """The REAL _monitor_loop task detects a node whose heartbeat expired."""
+        from synapse.pipeline.fault_tolerance import FaultToleranceManager
+
+        ft = FaultToleranceManager(node_id="test_orch")
+        ft.register_node("node2")
+        ft.record_heartbeat("node2")
+        ft.HEARTBEAT_INTERVAL = 0.1
+        ft.HEARTBEAT_TIMEOUT = 1.0
+        # 6s-old heartbeat exceeds the 1s test timeout.
+        ft._health["node2"].last_heartbeat = time.time() - 6.0
+
+        await ft.start()
+        try:
+            for _ in range(50):
+                if not ft._health["node2"].is_alive:
+                    break
+                await asyncio.sleep(0.1)
+            assert not ft._health["node2"].is_alive, (
+                "monitor loop never timed out the stale node"
+            )
+            assert "node2" in ft.get_dead_nodes()
+        finally:
+            await ft.stop()
+
+    @pytest.mark.asyncio
+    async def test_monitor_loop_sets_pending_rebalance(self):
+        """The shipped monitor loop calls check_timeout and flags the dead node
+        for rebalance (behavioral — no source inspection)."""
+        from synapse.pipeline.fault_tolerance import FaultToleranceManager
+
+        ft = FaultToleranceManager(node_id="test_orch")
+        ft.register_node("node2")
+        ft.record_heartbeat("node2")
+        ft.HEARTBEAT_INTERVAL = 0.1
+        ft.HEARTBEAT_TIMEOUT = 1.0
+        ft._health["node2"].last_heartbeat = time.time() - 6.0
+
+        await ft.start()
+        try:
+            for _ in range(50):
+                if ft._pending_rebalance == "node2":
+                    break
+                await asyncio.sleep(0.1)
+            assert ft._pending_rebalance == "node2", (
+                "monitor loop did not flag the dead node for rebalance"
+            )
+        finally:
+            await ft.stop()
 
     @pytest.mark.asyncio
     async def test_check_timeout_detects_dead_node(self):
@@ -61,10 +96,10 @@ class TestFaultToleranceLive:
         h = NodeHealth(node_id="test_node")
         h.record_heartbeat()
         assert h.is_alive is True
-        
+
         # Simulate old heartbeat by tampering with last_heartbeat
         h.last_heartbeat = time.time() - 10.0  # 10s old
-        
+
         # check_timeout should detect this
         timed_out = h.check_timeout(timeout_s=5.0)
         assert timed_out is True
@@ -72,64 +107,45 @@ class TestFaultToleranceLive:
         assert h.consecutive_misses >= 1
 
     @pytest.mark.asyncio
-    async def test_monitor_loop_detects_timeout(self):
-        """Full integration: FaultToleranceManager._monitor_loop detects timeout."""
+    async def test_save_checkpoint_writes_plain_json(self):
+        """Checkpoint files are written as plain JSON text (no pickle, no
+        binary protocol markers) — verified by reading the real file bytes."""
         from synapse.pipeline.fault_tolerance import FaultToleranceManager
-        
-        ft = FaultToleranceManager(node_id="test_orch")
-        ft.register_node("node2")
-        ft.record_heartbeat("node2")
-        
-        # Run one monitor cycle — node2 is alive, should still be alive
-        ft._health["node2"].last_heartbeat = time.time() - 6.0  # 6s old, > 5s timeout
-        ft.HEARTBEAT_TIMEOUT = 1.0  # Speed up for test
-        wait_event = asyncio.Event()
-        
-        async def fast_monitor():
-            """Override _monitor_loop with a single-check version for testing."""
-            await asyncio.sleep(0.1)
-            for nid in list(ft._health.keys()):
-                h = ft._health[nid]
-                h.check_timeout(ft.HEARTBEAT_TIMEOUT)
-            wait_event.set()
-        
-        # Run the check
-        await fast_monitor()
-        await asyncio.wait_for(wait_event.wait(), timeout=5.0)
-        
-        # Node2 should now be detected as dead
-        assert not ft._health["node2"].is_alive
-        dead = ft.get_dead_nodes()
-        assert "node2" in dead
 
-    def test_save_checkpoint_no_pickle(self):
-        """Verify checkpoint serialization does NOT use pickle (eliminates RCE)."""
-        ft_code = open(
-            r"D:\Code\paper\synapse_ai\backend\synapse\pipeline\fault_tolerance.py"
-        ).read()
-        assert "pickle.dump" not in ft_code, (
-            "pickle.dump still present in fault_tolerance.py"
-        )
-        assert "pickle.load" not in ft_code, (
-            "pickle.load still present in fault_tolerance.py"
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ft = FaultToleranceManager(node_id="test_node", checkpoint_dir=tmpdir)
+            path = ft.save_checkpoint(
+                model_id="test-model",
+                start_layer=0,
+                end_layer=7,
+                step=1,
+                kv_cache={"layer_0": [1, 2, 3]},
+            )
 
-    def test_save_checkpoint_uses_json(self):
-        """Verify checkpoint files are saved as JSON (safe serialization)."""
-        ft_code = open(
-            r"D:\Code\paper\synapse_ai\backend\synapse\pipeline\fault_tolerance.py"
-        ).read()
-        assert "json.dump" in ft_code, "save_checkpoint does not use json.dump"
-        assert "json.load" in ft_code, "load_checkpoint does not use json.load"
+            with open(path, "rb") as f:
+                raw = f.read()
+            # Pickle protocol frames start with 0x80; JSON never does.
+            assert b"\x80" not in raw, "checkpoint contains pickle protocol bytes"
+            text = raw.decode("utf-8")
+            data = json.loads(text)
+            assert data["model_id"] == "test-model"
+            assert data["node_id"] == "test_node"
+            assert data["kv_cache"] == {"layer_0": [1, 2, 3]}
+
+            # And it loads back through the shipped loader.
+            loaded = ft.load_checkpoint("test-model", 0, 7, 1)
+            assert loaded is not None
+            assert loaded.start_layer == 0
+            assert loaded.end_layer == 7
 
     @pytest.mark.asyncio
     async def test_checkpoint_json_roundtrip(self):
         """Verify checkpoint save/load roundtrip works with JSON serialization."""
         from synapse.pipeline.fault_tolerance import FaultToleranceManager
-        
+
         with tempfile.TemporaryDirectory() as tmpdir:
             ft = FaultToleranceManager(node_id="test_node", checkpoint_dir=tmpdir)
-            
+
             # Save a checkpoint
             path = ft.save_checkpoint(
                 model_id="test-model",
@@ -138,7 +154,7 @@ class TestFaultToleranceLive:
                 step=1,
                 kv_cache={"layer_0": [1, 2, 3]},
             )
-            
+
             # Verify file is valid JSON
             with open(path, "r") as f:
                 data = json.load(f)
@@ -146,7 +162,7 @@ class TestFaultToleranceLive:
             assert data["start_layer"] == 0
             assert data["end_layer"] == 7
             assert data["node_id"] == "test_node"
-            
+
             # Load it back
             loaded = ft.load_checkpoint("test-model", 0, 7, 1)
             assert loaded is not None
@@ -156,13 +172,250 @@ class TestFaultToleranceLive:
 
     @pytest.mark.asyncio
     async def test_rebalance_after_failure_wired_in_node(self):
-        """Verify rebalance_after_failure() is called from node.py check_fault_tolerance."""
-        node_code = open(
-            r"D:\Code\paper\synapse_ai\backend\synapse\orchestration\node.py"
-        ).read()
-        assert "rebalance_after_failure" in node_code, (
-            "rebalance_after_failure() not called from node.py"
+        """Node.check_fault_tolerance() invokes rebalance_after_failure() and
+        consumes the result (behavioral — drives the real production method)."""
+        from synapse.inference.inference_engine import InferenceEngine
+        from synapse.orchestration.node import Node
+        from synapse.pipeline.fault_tolerance import FaultToleranceManager
+        from synapse.routing import EventRouter
+        from synapse.routing.libp2p_node import Libp2pNode
+        from synapse.topology.device_capabilities import DeviceCapabilities, DeviceFlops
+        from synapse.topology.topology import Topology
+
+        class _DummyEngine(InferenceEngine):
+            async def encode(self, shard, prompt):
+                return np.array([])
+
+            async def sample(self, x):
+                return np.array([1])
+
+            async def decode(self, shard, tokens):
+                return ""
+
+            async def infer_tensor(self, rid, s, t, state=None):
+                return np.array([]), {}
+
+            async def load_checkpoint(self, s, p):
+                pass
+
+        def _dc(vram_mb, fp16_tflops):
+            return DeviceCapabilities(
+                model="Test-GPU", chip="Test-Chip", memory=vram_mb,
+                flops=DeviceFlops(fp32=fp16_tflops / 2, fp16=fp16_tflops, int8=fp16_tflops * 2),
+                cpu_cores=4, disk_gb=100, system_ram_mb=8192,
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            router = EventRouter()
+            libp2p = Libp2pNode("master", 59999, router)
+            node = Node(
+                _id="master",
+                event_router=router,
+                libp2p_node=libp2p,
+                inference_engine=_DummyEngine(),
+                shard_downloader=None,
+            )
+            node.tflops_proportional = False
+            topo = Topology()
+            topo.update_node("node-a", _dc(4096, 2.0))
+            topo.update_node("node-b", _dc(6144, 3.0))
+            node.topology = topo
+
+            ft = FaultToleranceManager("master", checkpoint_dir=tmpdir)
+            ft.register_node("node-a")
+            ft.register_node("node-b")
+            ft._health["node-b"].is_alive = False
+            ft._health["node-b"].is_blacklisted = True
+            node.fault_tolerance = ft
+            node._distributed_pipeline = object()  # truthy: distributed mode on
+
+            await node.check_fault_tolerance()
+
+            assert node._last_rebalance_result is not None, (
+                "check_fault_tolerance() did not consume a rebalance result"
+            )
+            result = node._last_rebalance_result
+            assert result.success
+            # node-b dropped, survivors get the full layer range.
+            assert "node-b" not in result.new_assignments
+
+    @pytest.mark.asyncio
+    async def test_distributed_ddp_step_writes_json_checkpoint(self, monkeypatch, tmp_path):
+        """A distributed training step persists a real JSON checkpoint to the
+        shared checkpoint directory — C-H1: production code writes checkpoints
+        after every training step, so cross-node recovery restores real
+        on-disk state (behavioral: drives train_step_distributed end to end)."""
+        from synapse.inference.inference_engine import InferenceEngine
+        from synapse.inference.shard import Shard
+        from synapse.orchestration.node import Node
+        from synapse.pipeline.gradient_sync import DistributedTrainer
+        from synapse.routing import EventRouter
+        from synapse.routing.libp2p_node import Libp2pNode
+        from synapse.topology.device_capabilities import DeviceCapabilities, DeviceFlops
+        from synapse.topology.topology import Topology
+
+        class _CkptEngine(InferenceEngine):
+            async def encode(self, shard, prompt):
+                return np.array([])
+
+            async def sample(self, x):
+                return np.array([1])
+
+            async def decode(self, shard, tokens):
+                return ""
+
+            async def infer_tensor(self, rid, s, t, state=None):
+                return np.array([]), {}
+
+            async def load_checkpoint(self, s, p):
+                pass
+
+            async def train(self, request_id, shard, example, target, length,
+                            backgrad=None, loss="forward", sync_gradients=False):
+                return 1.5, {"w": np.array([0.5, -0.25], dtype=np.float32)}
+
+            async def apply_gradient_updates(self, shard, updates):
+                pass
+
+        def _dc(vram_mb, fp16_tflops):
+            return DeviceCapabilities(
+                model="Test-GPU", chip="Test-Chip", memory=vram_mb,
+                flops=DeviceFlops(fp32=fp16_tflops / 2, fp16=fp16_tflops, int8=fp16_tflops * 2),
+                cpu_cores=4, disk_gb=100, system_ram_mb=8192,
+            )
+
+        router = EventRouter()
+        libp2p = Libp2pNode("node-a", 59999, router)
+        node = Node(
+            _id="node-a",
+            event_router=router,
+            libp2p_node=libp2p,
+            inference_engine=_CkptEngine(),
+            shard_downloader=None,
         )
-        assert "check_fault_tolerance" in node_code, (
-            "check_fault_tolerance() not found in node.py"
+        node.tflops_proportional = False
+        topo = Topology()
+        topo.update_node("node-a", _dc(4096, 2.0))
+        topo.update_node("node-b", _dc(6144, 3.0))
+        node.topology = topo
+
+        # Point the (lazily created) fault-tolerance manager at tmp_path.
+        node._lazy_init_fault_tolerance()
+        node.fault_tolerance.checkpoint_dir = str(tmp_path)
+
+        # No real ring I/O in the test.
+        async def fake_step(self, local_gradients, local_loss, send_fn=None, recv_fn=None):
+            return {"w": np.zeros(2, dtype=np.float32)}
+
+        monkeypatch.setattr(DistributedTrainer, "step", fake_step)
+
+        ext = node.distributed_pipeline
+        input_ids = np.array([[1, 2, 3], [4, 5, 6]])
+        labels = np.array([[2, 3, 4], [5, 6, 7]])
+        loss = await ext.train_step_distributed(
+            Shard(model_id="qwen", start_layer=0, end_layer=31, n_layers=32),
+            input_ids, labels, request_id="req-ckpt-ddp",
         )
+        assert loss == pytest.approx(1.5)
+
+        # A real JSON checkpoint file now exists in the checkpoint directory.
+        files = [p for p in tmp_path.iterdir() if p.suffix == ".ckpt"]
+        assert len(files) == 1, (
+            f"expected one checkpoint file, got {[f.name for f in tmp_path.iterdir()]}"
+        )
+        raw = files[0].read_bytes()
+        assert b"\x80" not in raw, "checkpoint contains pickle protocol bytes"
+        data = json.loads(raw.decode("utf-8"))
+        assert data["model_id"] == "qwen"
+        assert data["node_id"] == "node-a"
+        assert data["step"] == 1
+        # The shard range is node-a's actual LACP partition slice (first in
+        # ring order), i.e. real on-disk state for this node's shard.
+        assert 0 <= data["start_layer"] <= data["end_layer"] <= 31
+
+    @pytest.mark.asyncio
+    async def test_distributed_1f1b_step_writes_json_checkpoint(self, monkeypatch, tmp_path):
+        """The 1F1B production path also persists a JSON checkpoint after the
+        schedule completes (same C-H1 wiring on the pipeline-parallel path)."""
+        from synapse.inference.inference_engine import InferenceEngine
+        from synapse.inference.shard import Shard
+        from synapse.orchestration.node import Node
+        from synapse.pipeline.gradient_sync import DistributedTrainer
+        from synapse.routing import EventRouter
+        from synapse.routing.libp2p_node import Libp2pNode
+        from synapse.topology.device_capabilities import DeviceCapabilities, DeviceFlops
+        from synapse.topology.topology import Topology
+
+        class _CkptEngine(InferenceEngine):
+            async def encode(self, shard, prompt):
+                return np.array([])
+
+            async def sample(self, x):
+                return np.array([1])
+
+            async def decode(self, shard, tokens):
+                return ""
+
+            async def infer_tensor(self, rid, s, t, state=None):
+                return np.array([]), {}
+
+            async def load_checkpoint(self, s, p):
+                pass
+
+            async def train(self, request_id, shard, example, target, length,
+                            backgrad=None, loss="forward", sync_gradients=False):
+                return 1.5, {"w": np.array([0.5, -0.25], dtype=np.float32)}
+
+            async def apply_gradient_updates(self, shard, updates):
+                pass
+
+        def _dc(vram_mb, fp16_tflops):
+            return DeviceCapabilities(
+                model="Test-GPU", chip="Test-Chip", memory=vram_mb,
+                flops=DeviceFlops(fp32=fp16_tflops / 2, fp16=fp16_tflops, int8=fp16_tflops * 2),
+                cpu_cores=4, disk_gb=100, system_ram_mb=8192,
+            )
+
+        router = EventRouter()
+        libp2p = Libp2pNode("node-a", 59999, router)
+        node = Node(
+            _id="node-a",
+            event_router=router,
+            libp2p_node=libp2p,
+            inference_engine=_CkptEngine(),
+            shard_downloader=None,
+        )
+        node.tflops_proportional = False
+        topo = Topology()
+        topo.update_node("node-a", _dc(4096, 2.0))
+        topo.update_node("node-b", _dc(6144, 3.0))
+        node.topology = topo
+
+        node._lazy_init_fault_tolerance()
+        node.fault_tolerance.checkpoint_dir = str(tmp_path)
+
+        async def fake_step(self, local_gradients, local_loss, send_fn=None, recv_fn=None):
+            return {"w": np.zeros(2, dtype=np.float32)}
+
+        monkeypatch.setattr(DistributedTrainer, "step", fake_step)
+
+        ext = node.distributed_pipeline
+        input_ids = np.array([[1, 2, 3], [4, 5, 6]])
+        labels = np.array([[2, 3, 4], [5, 6, 7]])
+        loss = await ext.train_step_distributed(
+            Shard(model_id="qwen", start_layer=0, end_layer=31, n_layers=32),
+            input_ids, labels, request_id="req-ckpt-1f1b",
+            schedule="1f1b",
+        )
+        assert loss == pytest.approx(1.5)
+
+        files = [p for p in tmp_path.iterdir() if p.suffix == ".ckpt"]
+        assert len(files) == 1, (
+            f"expected one checkpoint file, got {[f.name for f in tmp_path.iterdir()]}"
+        )
+        raw = files[0].read_bytes()
+        assert b"\x80" not in raw, "checkpoint contains pickle protocol bytes"
+        data = json.loads(raw.decode("utf-8"))
+        assert data["model_id"] == "qwen"
+        assert data["node_id"] == "node-a"
+        assert data["step"] == 1

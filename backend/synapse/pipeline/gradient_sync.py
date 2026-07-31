@@ -185,47 +185,63 @@ class DistributedTrainer:
         scheduler = PipelineScheduler(num_micro_batches=num_micro_batches)
         num_stages = len(stages)
         node_ids = [s.node_id for s in stages]
-        
+
         schedule = scheduler.generate_1f1b_schedule(num_stages, num_micro_batches, node_ids=node_ids)
-        
-        # Build per-stage slot map
-        stage_slots = scheduler.slots_for_stage(schedule, 0)
-        for s in stages:
-            if s.stage_id > 0:
-                stage_slots = scheduler.slots_for_stage(schedule, s.stage_id)
-        
+
+        # Micro-batch the training input: every micro-batch is a row-slice of
+        # the batch, so each stage sees a distinct slice per micro-batch.
+        rows = input_data.shape[0] if input_data.ndim >= 1 else 1
+        mb_rows = max(1, rows // num_micro_batches) if num_micro_batches else rows
+
         # Execute pipeline
         stop_events = {s.stage_id: asyncio.Event() for s in stages}
         loop_tasks = [
             asyncio.create_task(s.process_loop(stop_events[s.stage_id]))
             for s in stages
         ]
-        
-        losses = []
+
         try:
+            # Feed every stage its own schedule slots: forward micro-batches
+            # first, then backward micro-batches, coordinated by the 1F1B
+            # schedule (warmup -> steady -> cooldown). Intermediate stages
+            # receive their slice of the batch and run their forward/backward
+            # functions per the schedule; the last stage emits losses.
             for slot in sorted(schedule.slots, key=lambda s: s.step):
-                if slot.stage == 0:
-                    mb_data = input_data.copy() if slot.micro_batch_id > 0 else input_data
+                if 0 <= slot.stage < num_stages:
+                    start = slot.micro_batch_id * mb_rows
+                    mb_data = input_data[start:start + mb_rows]
+                    mb_labels = None
+                    if labels is not None:
+                        mb_labels = labels[start:start + mb_rows]
                     op_name = "backward" if slot.op == MicroBatchOp.BACKWARD else "forward"
                     mb = MicroBatch(
                         batch_id=slot.micro_batch_id,
                         data=mb_data,
-                        labels=labels,
+                        labels=mb_labels,
                         metadata={"op": op_name, "step": slot.step},
                     )
-                    await stages[0].enqueue_input(mb)
-            
-            # Collect results from last stage
+                    await stages[slot.stage].enqueue_input(mb)
+
+            # Collect forward losses from the last stage. The last stage also
+            # emits backward results (gradient feedback, not losses) — those
+            # are excluded here.
             num_ops = len([s for s in schedule.slots if s.stage == num_stages - 1])
+            losses = []
             for _ in range(num_ops):
                 result = await stages[-1].dequeue_output(timeout=30.0)
-                if result is not None:
-                    losses.append(float(np.mean(result.data)) if hasattr(result.data, "__iter__") else 0.0)
+                if result is None:
+                    continue
+                try:
+                    val = float(np.mean(result.data))
+                except Exception:
+                    continue
+                if np.isfinite(val):
+                    losses.append(val)
         finally:
             for evt in stop_events.values():
                 evt.set()
             for task in loop_tasks:
                 task.cancel()
             await asyncio.gather(*loop_tasks, return_exceptions=True)
-        
+
         return losses

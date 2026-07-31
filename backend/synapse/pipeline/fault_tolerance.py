@@ -20,6 +20,7 @@ import asyncio
 import time
 import json
 import os
+import glob
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Set, Tuple, Any
@@ -73,6 +74,12 @@ class RebalanceResult:
     added_nodes: List[str] = field(default_factory=list)
     new_assignments: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     recovered_from_checkpoint: bool = False
+    # The checkpoint recovered for the dead node (loaded from disk when the
+    # checkpoint was written by a different process), and the surviving node
+    # whose new shard range absorbs the dead node's layers — that node must
+    # load this checkpoint to resume training/inference from the last state.
+    recovery_checkpoint: Optional[ShardCheckpoint] = None
+    recovery_target_node: Optional[str] = None
     downtime_ms: float = 0.0
     success: bool = False
 
@@ -95,6 +102,9 @@ class FaultToleranceManager:
         self.checkpoint_dir = checkpoint_dir
         self._health: Dict[str, NodeHealth] = {}
         self._checkpoints: Dict[str, List[ShardCheckpoint]] = defaultdict(list)
+        # Recovered cross-node checkpoints staged for the surviving node that
+        # takes over a dead node's shard range: {target_node_id: ShardCheckpoint}.
+        self._recovery_checkpoints: Dict[str, ShardCheckpoint] = {}
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
         self._pending_rebalance: Optional[str] = None  # node_id being rebalanced
@@ -154,7 +164,11 @@ class FaultToleranceManager:
             optimizer_state=optimizer_state,
         )
 
-        filename = f"{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
+        # Prefix the filename with the node id so checkpoints written by
+        # different nodes never collide for identical shard ranges, and so a
+        # cross-node recovery (a *different* FaultToleranceManager looking for
+        # this node's state) can find the file on the shared checkpoint dir.
+        filename = f"{self.node_id}_{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
         filepath = os.path.join(self.checkpoint_dir, filename)
 
         # Use JSON-safe serialization (convert numpy arrays if present)
@@ -193,18 +207,57 @@ class FaultToleranceManager:
             return None
 
     def load_latest_checkpoint(self, node_id: str) -> Optional[ShardCheckpoint]:
-        """Load the most recent checkpoint for a node (used during recovery)."""
-        ckpts = self._checkpoints.get(node_id, [])
-        if not ckpts:
+        """Load the most recent checkpoint for a node (used during recovery).
+
+        Checks the in-memory checkpoints saved by this process first, then
+        falls back to scanning the shared checkpoint directory for files this
+        node wrote to disk. The disk fallback is what makes *cross-node*
+        recovery work: the orchestrator's own memory never holds checkpoints
+        saved by a different (dead) node — only the on-disk state does.
+        """
+        ckpts = list(self._checkpoints.get(node_id, []))
+        if ckpts:
+            return max(ckpts, key=lambda c: c.timestamp)
+
+        # Cross-node fallback: scan disk for files saved by this node.
+        prefix = f"{node_id}_"
+        newest: Optional[ShardCheckpoint] = None
+        try:
+            entries = os.listdir(self.checkpoint_dir)
+        except OSError:
             return None
-        return max(ckpts, key=lambda c: c.timestamp)
+        for fname in entries:
+            if not fname.startswith(prefix) or not fname.endswith(".ckpt"):
+                continue
+            data = self._json_deserialize(os.path.join(self.checkpoint_dir, fname))
+            if data is None:
+                continue
+            ckpt = ShardCheckpoint(**{k: v for k, v in data.items() if k in ShardCheckpoint.__dataclass_fields__})
+            if newest is None or ckpt.timestamp > newest.timestamp:
+                newest = ckpt
+        return newest
 
     def load_checkpoint(
         self, model_id: str, start_layer: int, end_layer: int, step: int
     ) -> Optional[ShardCheckpoint]:
-        """Load a specific checkpoint from disk (JSON format)."""
-        filename = f"{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
-        filepath = os.path.join(self.checkpoint_dir, filename)
+        """Load a specific checkpoint from disk (JSON format).
+
+        Matches both the legacy filename (no node prefix) and the current
+        node-prefixed format. If several nodes saved the same shard range, the
+        most recently modified file wins.
+        """
+        legacy = f"{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
+        patterns = (
+            f"*_{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt",
+            legacy,
+        )
+        candidates = []
+        for pattern in patterns:
+            candidates.extend(glob.glob(os.path.join(self.checkpoint_dir, pattern)))
+        candidates = [c for c in candidates if os.path.isfile(c)]
+        if not candidates:
+            return None
+        filepath = max(candidates, key=os.path.getmtime)
 
         data = self._json_deserialize(filepath)
         if data is None:
@@ -251,14 +304,30 @@ class FaultToleranceManager:
             new_assignments = await lacp_partition_fn(alive, total_layers)
             result.new_assignments = new_assignments
 
-            # Load checkpoint for dead node's shard range
+            # Load checkpoint for dead node's shard range (cross-node: this
+            # falls back to the on-disk state the dead node itself saved).
             dead_shard = current_assignments.get(dead_node_id)
             if dead_shard:
                 ckpt = self.load_latest_checkpoint(dead_node_id)
                 if ckpt:
                     result.recovered_from_checkpoint = True
-                    # The new node receiving this shard range should load this checkpoint
-                    result.new_assignments["_recovery_checkpoint"] = ckpt
+                    # Find the surviving node whose new shard range absorbs
+                    # the dead node's layers — that node must resume from this
+                    # checkpoint. (Never stuff the checkpoint into the
+                    # assignments dict; that is a per-node layer map.)
+                    target = None
+                    for nid, (s, e) in new_assignments.items():
+                        if s <= dead_shard[0] <= e:
+                            target = nid
+                            break
+                    if target is None and new_assignments:
+                        target = next(iter(new_assignments))
+                    result.recovery_checkpoint = ckpt
+                    result.recovery_target_node = target
+                    if target:
+                        # Stage the recovered state so the survivor can pull it
+                        # via get_recovery_checkpoint() and resume training.
+                        self._recovery_checkpoints[target] = ckpt
 
             result.downtime_ms = (time.time() - start_time) * 1000
             result.success = True
@@ -267,6 +336,11 @@ class FaultToleranceManager:
             result.success = False
 
         return result
+
+    def get_recovery_checkpoint(self, node_id: str) -> Optional[ShardCheckpoint]:
+        """Return the cross-node checkpoint staged for a node during the last
+        rebalance, or None if no recovery state was recovered for it."""
+        return self._recovery_checkpoints.get(node_id)
 
     # ── Monitor Loop ───────────────────────────────────────
 

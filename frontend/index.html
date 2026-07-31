@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synapse — LACP Control Plane</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #0d1117; color: #e6edf3; line-height: 1.5;
+  }
+  header {
+    padding: 18px 24px; background: #161b22; border-bottom: 1px solid #30363d;
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: 0.3px; }
+  header .tag { color: #58a6ff; font-size: 12px; border: 1px solid #1f6feb;
+    padding: 2px 8px; border-radius: 999px; }
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+  .card h2 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.6px; color: #8b949e; }
+  .card .value { font-size: 22px; font-weight: 600; }
+  .card .sub { font-size: 12px; color: #8b949e; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 500; }
+  .status-ok { color: #3fb950; } .status-warn { color: #d29922; }
+  .error { color: #f85149; font-size: 13px; }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; color: #8b949e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Synapse</h1>
+  <span class="tag">LACP</span>
+  <span id="dist-status" style="margin-left:auto;font-size:12px;color:#8b949e">connecting…</span>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <div class="card" style="margin-top:16px">
+    <h2>Cluster topology</h2>
+    <table id="topo-table">
+      <thead><tr><th>Node</th><th>Status</th><th>Details</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <pre id="topo-raw"></pre>
+  </div>
+</main>
+<script>
+async function refresh() {
+  const cards = document.getElementById('cards');
+  const tbody = document.querySelector('#topo-table tbody');
+  const raw = document.getElementById('topo-raw');
+  try {
+    const info = await (await fetch('/v1/system/info')).json();
+    cards.innerHTML = [
+      ['Status', info.status || 'unknown', ''],
+      ['Version', info.version || '—', ''],
+      ['Uptime (s)', info.uptime_seconds ?? '—', ''],
+      ['Distributed mode', info.distributed_status || 'single-node', '']
+    ].map(([k, v, s]) => `<div class="card"><h2>${k}</h2><div class="value">${v}</div><div class="sub">${s}</div></div>`).join('');
+    document.getElementById('dist-status').textContent =
+      (info.distributed_status || 'single-node') + ' · ' + (info.version || '');
+  } catch (e) {
+    cards.innerHTML = `<div class="card"><h2>Status</h2><div class="value error">API unavailable</div><div class="sub">${e}</div></div>`;
+  }
+  try {
+    const topo = await (await fetch('/v1/topology')).json();
+    tbody.innerHTML = '';
+    const nodes = topo.nodes || topo || [];
+    for (const n of nodes) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${n.id || n.node_id || '?'}</td>` +
+        `<td class="${n.status === 'online' || n.status === 'healthy' ? 'status-ok' : 'status-warn'}">${n.status || 'unknown'}</td>` +
+        `<td>${(n.device || n.device_name || '')} ${n.host || ''}</td>`;
+      tbody.appendChild(tr);
+    }
+    raw.textContent = JSON.stringify(topo, null, 2);
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="3" class="error">Topology API unavailable: ${e}</td></tr>`;
+    raw.textContent = '';
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

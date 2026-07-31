@@ -201,6 +201,36 @@ def _measure_dummy_bandwidth() -> Dict[str, float]:
     return {"bandwidth_mbps": 1000.0}  # 1 Gbps default, overwritten by probing
 
 
+def apply_measured_bandwidth(
+    nodes_resources: Dict[str, NodeResources],
+    latency_matrix: Optional["LatencyMatrix"],
+    self_node_id: str = "",
+) -> None:
+    """
+    Copy measured network bandwidth from the latency matrix into each node's
+    NodeResources so composite scores (LACP partitioning + master election)
+    reflect real network capacity instead of the 1000 Mbps placeholder.
+
+    Uses the entry from self_node_id -> node when available (bandwidth to the
+    master is the figure NodeResources.bandwidth_mbps documents), otherwise
+    falls back to any matrix entry touching the node.
+    """
+    if not latency_matrix:
+        return
+    for nid in nodes_resources:
+        entry = None
+        if self_node_id:
+            entry = latency_matrix.get(self_node_id, nid)
+        if entry is None or entry.bandwidth_mbps <= 0:
+            for f, to_entries in latency_matrix.entries.items():
+                e = to_entries.get(nid)
+                if e and e.bandwidth_mbps > 0:
+                    entry = e
+                    break
+        if entry and entry.bandwidth_mbps > 0:
+            nodes_resources[nid].bandwidth_mbps = float(entry.bandwidth_mbps)
+
+
 # ──────────────────────────────────────────────────────────
 # Resource normalization → 0.0-1.0 scores
 # ──────────────────────────────────────────────────────────
@@ -294,6 +324,24 @@ class ResourceScorer:
         lat_min, lat_max = _range(lambda r: r.latency_ms)
         pwr_min, pwr_max = _range(lambda r: r.power_limit_w - r.current_power_w)
 
+        # True only when every node reports identical values on every resource
+        # dimension. In that case normalization collapses to 0 for everyone and
+        # the raw-utilization formula below is the only differentiator. When
+        # the cluster is heterogeneous, a node that is the min on every
+        # dimension genuinely has zero normalized resources and must NOT be
+        # boosted by the identical-cluster fallback (that would let the weakest
+        # node win master election).
+        cluster_identical = (
+            vram_min == vram_max
+            and tflops_min == tflops_max
+            and cpu_min == cpu_max
+            and ram_min == ram_max
+            and disk_min == disk_max
+            and bw_min == bw_max
+            and lat_min == lat_max
+            and pwr_min == pwr_max
+        )
+
         results = {}
         for nid, r in zip(ids, resources):
             tflops = r.gpu_tflops_fp16 + r.gpu_tflops_fp32
@@ -334,9 +382,11 @@ class ResourceScorer:
                 + self.weights.power_headroom * ns.power_headroom
             )
 
-            # Apply utilization penalties proportionally to the weights
-            # If all nodes are identical (base_composite == 0), use raw utilization
-            if base_composite > 0:
+            # Apply utilization penalties proportionally to the weights.
+            # The raw-utilization formula is used only when the whole cluster
+            # is identical (base_composite == 0 for everyone); otherwise a node
+            # with zero normalized resources keeps its true (low) score.
+            if base_composite > 0 or not cluster_identical:
                 composite = base_composite * (
                     1.0
                     + self.weights.tflops * (gpu_util_penalty - 1.0)

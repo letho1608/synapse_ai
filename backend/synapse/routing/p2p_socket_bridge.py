@@ -284,7 +284,34 @@ class P2PSocketBridge:
         logger.debug(f"Incoming connection from {addr}")
 
         try:
-            peer_info = await self._read_packet(reader)
+            # Peek the frame header ourselves so raw latency probes (which do
+            # not speak the framed protocol) can be answered with an echo.
+            header = await asyncio.wait_for(reader.readexactly(5), timeout=5.0)
+            length = struct.unpack("!I", header[:4])[0]
+
+            # LatencyProber compatibility: a probe is a bare PROBE_SIZE-byte
+            # blob whose leading 4 bytes are the top of a packed "!dQ"
+            # timestamp — always a huge number, never a valid frame length
+            # (10MB cap). Echo the whole blob back so the prober's RTT and
+            # bandwidth measurement succeed against the production listener
+            # (previously the probe was dropped as "Packet too large" and
+            # bandwidth stayed at its hardcoded default).
+            if length <= 0 or length > 10 * 1024 * 1024:
+                try:
+                    from synapse.topology.latency_matrix import LatencyProber
+                    probe_size = LatencyProber.PROBE_SIZE
+                except Exception:
+                    probe_size = 1024
+                rest = await asyncio.wait_for(
+                    reader.readexactly(probe_size - len(header)), timeout=5.0
+                )
+                writer.write(header + rest)
+                await writer.drain()
+                self._close_writer(writer)
+                return
+
+            payload = await asyncio.wait_for(reader.readexactly(length), timeout=5.0)
+            peer_info = json.loads(payload.decode("utf-8"))
             if not peer_info or peer_info.get("type") != "handshake":
                 logger.warning(f"Invalid handshake from {addr}")
                 self._close_writer(writer)
@@ -379,7 +406,11 @@ class P2PSocketBridge:
                 "dtype": str(obj.dtype),
             }
         if isinstance(obj, bytes):
-            return obj.hex()
+            # Tag raw bytes so the receiver can restore the exact bytes object.
+            # Plain obj.hex() is NOT reversible: the receiver would see a hex
+            # string and feed it to decode_tensor() (which expects bytes),
+            # silently dropping every binary tensor sent between nodes.
+            return {"__bytes__": True, "data": obj.hex()}
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
     async def _read_loop(self, peer_id: str, reader: asyncio.StreamReader):
@@ -419,13 +450,15 @@ class P2PSocketBridge:
 
     @staticmethod
     def _json_deserialize(data):
-        """Recursively convert serialized numpy arrays back from hex encoding."""
+        """Recursively convert serialized numpy arrays/bytes back from hex."""
         import numpy as np
 
         if isinstance(data, dict):
             if data.get("__np__"):
                 arr = np.frombuffer(bytes.fromhex(data["data"]), dtype=np.dtype(data["dtype"]))
                 return arr.reshape(data["shape"])
+            if data.get("__bytes__"):
+                return bytes.fromhex(data["data"])
             return {k: P2PSocketBridge._json_deserialize(v) for k, v in data.items()}
         if isinstance(data, list):
             return [P2PSocketBridge._json_deserialize(item) for item in data]

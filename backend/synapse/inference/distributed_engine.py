@@ -25,6 +25,41 @@ from synapse.transport.result_router import ResultRouter, RoutedResult
 from synapse.helpers import DEBUG
 
 
+def verify_speculative_tokens(
+    guesses: List[int],
+    batch_tokens: List[List[int]],
+) -> List[int]:
+    """
+    Verify speculative decode micro-batches against the true context.
+
+    batch_tokens[i] holds the tokens predicted by the micro-batch whose
+    context was [last] + guesses[:i] (batch 0 sees only the true context
+    [last]). A token is accepted only when every guess that feeds its
+    context has been verified by the previous batch's prediction, so no
+    token predicted from a contaminated context is ever appended to the
+    output.
+
+    Returns the accepted token sequence (in order). The result is empty
+    when nothing can be verified (e.g. batch 0 produced no tokens).
+    """
+    accepted: List[int] = []
+    if not batch_tokens or not batch_tokens[0]:
+        return accepted
+    # Batch 0 predicts from the true context [last]: always valid.
+    accepted.append(batch_tokens[0][0])
+    for i in range(1, len(batch_tokens)):
+        prev_guess = guesses[i - 1] if i - 1 < len(guesses) else None
+        if prev_guess is None or not batch_tokens[i - 1]:
+            break
+        # Batch i-1's prediction must confirm guess i-1 before we trust
+        # batch i (whose context assumed guesses[:i] were all correct).
+        if batch_tokens[i - 1][0] != prev_guess:
+            break
+        if batch_tokens[i]:
+            accepted.append(batch_tokens[i][0])
+    return accepted
+
+
 class DistributedInferenceSession:
     """
     Per-request state for distributed inference across multiple nodes.
@@ -145,6 +180,14 @@ class DistributedPipelineController:
             if token_ids is None or token_ids.size == 0:
                 return []
 
+            # Real encoders (e.g. PyTorchHFEngine.encode) return a flattened
+            # 1-D token array; the pipeline expects (1, seq_len). Normalize so
+            # the prompt phase below (token_ids.shape[1], slicing) works and
+            # multi-node inference does not crash and silently fall back to a
+            # single node.
+            if token_ids.ndim == 1:
+                token_ids = token_ids.reshape(1, -1)
+
             first_stage_node_id, first_stage_shard = partition_assignments[0]
             last_stage_node_id, last_stage_shard = partition_assignments[-1]
 
@@ -227,8 +270,13 @@ class DistributedPipelineController:
                 decode_batches = []
                 
                 for db_idx in range(num_decode_batches):
-                    # Each micro-batch gets its own candidate tokens
-                    batch_guesses = guesses[db_idx:] if db_idx < len(guesses) else []
+                    # Each micro-batch extends the TRUE context by a PREFIX of
+                    # guesses: batch 0 sees [last], batch 1 sees [last, g0],
+                    # batch 2 sees [last, g0, g1], ... A token is only ever
+                    # accepted after every guess feeding its context has been
+                    # verified by the previous batch's prediction, so no token
+                    # from a contaminated context can leak into the output.
+                    batch_guesses = guesses[:db_idx]
                     candidate_tokens = [all_generated_tokens[-1]] + batch_guesses
                     input_tensor = np.array([candidate_tokens], dtype=np.int64)
                     decode_batches.append((db_idx, input_tensor))
@@ -254,23 +302,14 @@ class DistributedPipelineController:
                 
                 if not decode_results:
                     break
-                
-                # Verify guesses across all micro-batch results
-                all_accepted = []
-                for db_idx, result in enumerate(decode_results):
-                    if result.tokens:
-                        batch_guesses = guesses[db_idx:] if db_idx < len(guesses) else []
-                        accepted_count = 1  # Always accept the first actual prediction
-                        for g_idx in range(len(batch_guesses)):
-                            if g_idx < len(result.tokens) and result.tokens[g_idx] == batch_guesses[g_idx]:
-                                accepted_count += 1
-                            else:
-                                break
-                        verified_tokens = result.tokens[:accepted_count]
-                        all_accepted.extend(verified_tokens)
-                        if result.is_finished:
-                            break
-                
+
+                # Verify guesses across all micro-batch results. Order by
+                # micro-batch id so batch i's prediction is matched against
+                # the context [last] + guesses[:i] regardless of arrival order.
+                decode_results.sort(key=lambda r: r.micro_batch_id)
+                all_accepted = verify_speculative_tokens(
+                    guesses, [r.tokens for r in decode_results]
+                )
                 if not all_accepted:
                     break
                 
@@ -334,7 +373,7 @@ class DistributedPipelineController:
             metadata={
                 "request_id": request_id,
                 "shard": target_shard.to_dict(),
-                "inference_state": {"is_prompt": is_prompt},
+                "inference_state": {"is_prompt": is_prompt, "microbatch_id": microbatch_id},
                 "_orchestrator_id": self.node_id,
                 "microbatch_id": microbatch_id,
                 "_sent_at": time.time(),
@@ -362,13 +401,14 @@ class DistributedPipelineController:
             data = event.data if hasattr(event, 'data') else event
             tokens = data.get("tokens", [])
             is_finished = data.get("is_finished", False)
+            micro_batch_id = data.get("micro_batch_id", 0)
             if DEBUG >= 1:
                 print(f"[{request_id}] [DISTRIBUTED] P2P result received: tokens={tokens}, finished={is_finished}")
             collected_result.append(
                 RoutedResult(
                     request_id=request_id,
                     orchestrator_id=self.node_id,
-                    micro_batch_id=0,
+                    micro_batch_id=micro_batch_id,
                     source_stage_id=last_stage_shard.start_layer,
                     tokens=list(tokens),
                     is_finished=is_finished,

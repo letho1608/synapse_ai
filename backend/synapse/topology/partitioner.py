@@ -256,7 +256,19 @@ def compute_partition_ilp(
     prob += max_load
     
     # Solve
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[status] != "Optimal":
+        # Solver failed or the problem was infeasible: fall back to the
+        # Largest Remainder method so the cluster still gets a valid
+        # contiguous partition instead of a garbage/incomplete one.
+        return compute_partition(
+            nodes=nodes,
+            latency_matrix=latency_matrix,
+            total_layers=total_layers,
+            model_id=model_id,
+            weights=weights,
+            num_micro_batches=num_micro_batches,
+        )
     
     # Extract solution
     # Determine which node gets which layer range

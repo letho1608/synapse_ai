@@ -1,8 +1,10 @@
 import pytest
 from synapse.api.chatgpt_api import ChatGPTAPI
 from unittest.mock import MagicMock
-from aiohttp.test_utils import make_mocked_request
+from aiohttp.test_utils import make_mocked_request, TestClient, TestServer
 import json
+import tempfile
+from pathlib import Path
 
 class MockNode:
     def __init__(self):
@@ -40,3 +42,33 @@ async def test_get_system_stats():
     assert 'cpu' in data
     assert 'memory' in data
     assert 'uptime' in data
+
+
+@pytest.mark.asyncio
+async def test_root_route_serves_real_page():
+    """GET / is registered unconditionally and serves a real HTML page."""
+    node = MockNode()
+    api = ChatGPTAPI(node=node, inference_engine_classname="PyTorchEngine")
+    client = TestClient(TestServer(api.app))
+    await client.start_server()
+    try:
+        resp = await client.get('/')
+        assert resp.status == 200
+        assert 'text/html' in resp.headers.get('Content-Type', '')
+        body = await resp.text()
+        assert '<html' in body.lower()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_root_falls_back_to_bundled_page_when_frontend_missing():
+    """Even with no on-disk frontend, GET / returns the bundled page."""
+    node = MockNode()
+    api = ChatGPTAPI(node=node, inference_engine_classname="PyTorchEngine")
+    api.static_dir = Path(tempfile.mkdtemp())  # empty dir -> no index.html
+    req = make_mocked_request('GET', '/')
+    resp = await api.handle_root(req)
+    assert resp.status == 200
+    assert '<html' in resp.text.lower()
+    assert 'Synapse' in resp.text

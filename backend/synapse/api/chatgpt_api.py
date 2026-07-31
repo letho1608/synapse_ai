@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import psutil
+import numpy as np
 from pathlib import Path
 from transformers import AutoTokenizer
 from typing import List, Literal, Union, Dict, Optional, Set, Any
@@ -34,6 +35,53 @@ from synapse.inference.tokenizers import resolve_tokenizer
 from synapse.api.function_calling import build_tool_instructions, parse_tool_call, parse_tool_calls, run_tool_and_format, run_tools_parallel
 from synapse.api.tools.intent_trigger import detect_tool_intent
 from synapse.api.tools.format_vi import format_tool_result_vi
+
+
+# Bundled fallback page served at GET / when no on-disk frontend exists, so the
+# root route always returns a real page (backend-served, no npm dependency).
+_DEFAULT_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synapse — LACP Control Plane</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; }
+  header { padding: 16px 24px; background: #161b22; border-bottom: 1px solid #30363d; }
+  header h1 { margin: 0; font-size: 18px; }
+  main { padding: 24px; max-width: 800px; margin: 0 auto; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-top: 16px; }
+  .ok { color: #3fb950; } .err { color: #f85149; }
+  pre { white-space: pre-wrap; font-size: 12px; color: #8b949e; }
+</style>
+</head>
+<body>
+<header><h1>Synapse <span style="color:#58a6ff;font-size:12px;border:1px solid #1f6feb;padding:2px 8px;border-radius:999px">LACP</span></h1></header>
+<main>
+  <div class="card" id="status"><h2>Status</h2><p class="ok">API reachable</p></div>
+  <div class="card"><h2>Cluster topology</h2><pre id="topo">loading…</pre></div>
+</main>
+<script>
+async function refresh() {
+  try {
+    const info = await (await fetch('/v1/system/info')).json();
+    document.getElementById('status').innerHTML = '<h2>Status</h2><p class="ok">' +
+      (info.distributed_status || 'single-node') + ' · v' + (info.version || '?') + '</p>';
+  } catch (e) {
+    document.getElementById('status').innerHTML = '<h2>Status</h2><p class="err">API unavailable</p>';
+  }
+  try {
+    const topo = await (await fetch('/v1/topology')).json();
+    document.getElementById('topo').textContent = JSON.stringify(topo, null, 2);
+  } catch (e) {
+    document.getElementById('topo').textContent = 'Topology unavailable';
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
 
 
 class Message:
@@ -339,10 +387,12 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/settings/save", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/cluster/resources", self.handle_get_cluster_resources), {"*": cors_options})
     # Static: PHẢI dùng prefix /_static/ (không dùng "/") vì add_static("/") match mọi path và chỉ cho GET/HEAD -> POST sẽ 405
-    if "__compiled__" not in globals():
-      self.static_dir = Path(__file__).parent.parent.parent.parent/"frontend"
-      self.app.router.add_get("/", self.handle_root)
-      self.app.router.add_static("/_static/", self.static_dir, name="static")
+    # Root route + static assets are registered unconditionally so GET / always
+    # serves a real page even when the frontend dev server is not running.
+    self.static_dir = Path(__file__).parent.parent.parent.parent/"frontend"
+    self.static_dir.mkdir(parents=True, exist_ok=True)
+    self.app.router.add_get("/", self.handle_root)
+    self.app.router.add_static("/_static/", self.static_dir, name="static")
       
     self.app.middlewares.append(self.timeout_middleware)
     self.app.middlewares.append(self.log_request)
@@ -499,7 +549,9 @@ class ChatGPTAPI:
       resp.headers["Pragma"] = "no-cache"
       resp.headers["Expires"] = "0"
       return resp
-    return web.FileResponse(self.static_dir / "index.html")
+    # No on-disk frontend (e.g. frontend dir was removed): serve the bundled
+    # fallback page so GET / still returns a real page.
+    return web.Response(text=_DEFAULT_DASHBOARD_HTML, content_type="text/html")
 
   def _get_gpu_info(self) -> str:
     """Lấy thông tin GPU từ device_capabilities (hỗ trợ NVIDIA, AMD, Apple, Intel, Ascend)."""
@@ -2549,7 +2601,11 @@ class ChatGPTAPI:
       step_count = 0
       effective_max_length = max_length
       world_size = len(getattr(self.node, "peers", [])) + 1
-      ext = getattr(self.node, "_pipeline_extension", None)
+      # LACP DistributedPipelineExtension is exposed via the real
+      # `distributed_pipeline` property (lazy-initialized); never read the
+      # non-existent `_pipeline_extension` attribute, which silently disabled
+      # multi-node 1F1B training and fell back to single-node enqueue.
+      ext = getattr(self.node, "distributed_pipeline", None)
       lr_val = float((job.get("learning_rate") or "1e-5").strip()) if job.get("learning_rate") else 1e-5
       save_every = int(job.get("save_every", 5))
       checkpoint_dir = (job.get("checkpoint_dir") or "").strip() or str(get_checkpoints_dir(model))
@@ -2599,6 +2655,7 @@ class ChatGPTAPI:
                   base_shard, example_np, target_np,
                   request_id=str(uuid.uuid4()),
                   learning_rate=lr_val,
+                  schedule="1f1b",
                 )
               else:
                 loss = await self.node.enqueue_example(
