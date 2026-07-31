@@ -8,7 +8,6 @@ import traceback
 # Add backend directory to Python path so we can import from it
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.join(ROOT_DIR, "backend")
-FRONTEND_DIR = os.path.join(ROOT_DIR, "frontend")
 sys.path.insert(0, BACKEND_DIR)
 
 # Terminal logs capturing needs to be done here
@@ -59,34 +58,20 @@ def _check_gpu_environment() -> None:
 
 def run():
     parser = argparse.ArgumentParser(description="Universal Synapse Launcher")
-    parser.add_argument("--no-frontend", action="store_true", help="Do not launch the web frontend")
-    
+    # Retained for CLI compatibility: the web UI is a backend-served static
+    # dashboard (no Node.js dev server), so this flag is a no-op.
+    parser.add_argument("--no-frontend", action="store_true", help="No-op: the web UI is served by the backend (no Node.js dependency)")
+
     # Parse known args, pass the rest to the backend core
     args, unknown_args = parser.parse_known_args()
 
     install_terminal_log()
     _check_gpu_environment()
 
-    frontend_proc = None
-    if not args.no_frontend:
-        print("[INFO] Starting Frontend Dev Server...")
-        # Only start frontend if we are on Windows, we use shell=True and npm command
-        npm_cmd = "npm.cmd" if os.name == "nt" else "npm"
-        try:
-            # Install dependencies first if node_modules doesn't exist
-            if not os.path.exists(os.path.join(FRONTEND_DIR, "node_modules")):
-                print("[INFO] Installing Frontend dependencies...")
-                subprocess.run([npm_cmd, "install"], cwd=FRONTEND_DIR)
-            
-            # Start dev server
-            frontend_proc = subprocess.Popen([npm_cmd, "run", "dev"], cwd=FRONTEND_DIR)
-        except Exception as e:
-            print(f"[ERROR] Failed to start frontend: {e}")
-
     try:
         while True:
             print("\n[INFO] Starting Backend System...")
-            print("[INFO] Press Ctrl+C to stop both Frontend and Backend\n")
+            print("[INFO] Press Ctrl+C to stop\n")
             
             script_path = os.path.join(BACKEND_DIR, "synapse", "main.py")
             cmd = [sys.executable, script_path] + unknown_args
@@ -106,16 +91,6 @@ def run():
         traceback.print_exc()
     finally:
         print("\n[INFO] Exiting...")
-        if frontend_proc is not None:
-            print("[INFO] Terminating Frontend Server...")
-            try:
-                # Terminate the frontend process tree gracefully
-                if os.name == 'nt':
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(frontend_proc.pid)], capture_output=True)
-                else:
-                    frontend_proc.terminate()
-            except Exception:
-                pass
 
 if __name__ == "__main__":
     run()

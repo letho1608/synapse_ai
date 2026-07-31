@@ -219,6 +219,7 @@ class DistributedTrainer:
                         data=mb_data,
                         labels=mb_labels,
                         metadata={"op": op_name, "step": slot.step},
+                        step=slot.step,
                     )
                     await stages[slot.stage].enqueue_input(mb)
 

@@ -24,6 +24,7 @@ import json
 import socket
 import struct
 import uuid
+from collections import OrderedDict
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, Optional
 
@@ -67,15 +68,25 @@ class SharedMemoryTransport:
     # In-process registry: node_id -> transport (same-machine deployments).
     _local_registry: Dict[str, "SharedMemoryTransport"] = {}
 
-    def __init__(self, node_id: str):
+    # Upper bound on concurrently retained segment handles: beyond this the
+    # oldest segments are released so `_active` cannot grow without limit.
+    DEFAULT_MAX_ACTIVE_SEGMENTS = 256
+
+    def __init__(
+        self,
+        node_id: str,
+        max_active_segments: int = DEFAULT_MAX_ACTIVE_SEGMENTS,
+    ):
         self.node_id = node_id
         self._on_tensor: Optional[Callable[[TensorMessage], None]] = None
         # addr -> peer_id for registered same-machine peers.
         self._peer_ids: Dict[str, str] = {}
         # peer_id -> control notifier(segment_name).
         self._local_notify: Dict[str, Callable[[str], None]] = {}
-        # Shared segments kept alive while their numpy views are in use.
-        self._active: Dict[str, Any] = {}
+        # Shared segments kept alive while their numpy views are in use,
+        # most-recently-used last; evicts the oldest past the cap.
+        self._active: "OrderedDict[str, Any]" = OrderedDict()
+        self.max_active_segments = max_active_segments
         # Observability: segment names seen / sent (used by behavioral tests).
         self.segments_sent: list = []
         self.segments_seen: list = []
@@ -111,6 +122,25 @@ class SharedMemoryTransport:
             except Exception:
                 pass
         self._active.clear()
+
+    def _track_active(self, name: str, shm: Any) -> None:
+        """Retain a segment handle, evicting the oldest when over the cap.
+
+        The cap bounds `_active` (it never shrinks on its own otherwise):
+        once `max_active_segments` handles are held, the least-recently-used
+        segment is released. Eviction only closes/unlinks the local handle;
+        the mapping stays alive while the peer (or an in-flight numpy view)
+        still holds a handle to the same segment.
+        """
+        self._active[name] = shm
+        self._active.move_to_end(name)
+        while len(self._active) > self.max_active_segments:
+            _old_name, old_shm = self._active.popitem(last=False)
+            try:
+                old_shm.close()
+                old_shm.unlink()
+            except Exception:
+                pass
 
     def register_peer(self, addr: str, peer_id: str) -> None:
         """Register a same-machine peer.
@@ -186,7 +216,7 @@ class SharedMemoryTransport:
         # attach fail with FileNotFoundError. Holding the handle keeps the
         # mapping alive for the segment's whole lifetime; _release_all() on
         # stop() closes (and on POSIX unlinks) every segment on both sides.
-        self._active[name] = shm
+        self._track_active(name, shm)
         self.segments_sent.append(name)
         self.shm_sends += 1
         # Control notification only — the payload stays in shared memory.
@@ -234,7 +264,7 @@ class SharedMemoryTransport:
             tensor = np.ndarray(shape=shape, dtype=dtype, buffer=view)
 
             # Keep the segment alive while the view is in use.
-            self._active[segment_name] = shm
+            self._track_active(segment_name, shm)
 
             msg = TensorMessage(
                 request_id=str(meta.get("request_id", "")),

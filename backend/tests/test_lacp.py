@@ -46,7 +46,7 @@ def test_node_resources():
 
 # --- Test 3: Cluster ---
 
-def test_lacp3_cluster():
+def test_lacp_cluster():
     """Test Cluster dataclass (LACP)."""
     from synapse.topology.latency_matrix import Cluster
     
@@ -55,7 +55,7 @@ def test_lacp3_cluster():
     assert len(cluster.nodes) == 3
     assert "A" in cluster.nodes
     assert "D" not in cluster.nodes
-    print(" [OK] test_lacp3_cluster")
+    print(" [OK] test_lacp_cluster")
 
 
 # --- Test 4: LACP HierarchicalClusterer ---
@@ -347,7 +347,7 @@ def test_async_forwarder_create():
 
 # --- Test 12: Integration - Full LACP flow ---
 
-def test_lacp3_full_integration():
+def test_lacp_full_integration():
     """Test full LACP flow: resource scoring → cluster → partition → pipeline."""
     from synapse.topology.partitioner import compute_partition
     from synapse.topology.resource_weight import NodeResources
@@ -401,7 +401,7 @@ def test_lacp3_full_integration():
     )
     assert schedule.num_stages == len(result.assignments)
     
-    print(" [OK] test_lacp3_full_integration")
+    print(" [OK] test_lacp_full_integration")
 
 
 # --- Test 13: Verify LargestRemainder removed ---
@@ -431,7 +431,7 @@ if __name__ == "__main__":
     tests = [
         test_import_lacp_modules,
         test_node_resources,
-        test_lacp3_cluster,
+        test_lacp_cluster,
         test_hierarchical_clusterer,
         test_hierarchical_clusterer_fallback,
         test_resource_scorer,
@@ -445,7 +445,7 @@ if __name__ == "__main__":
         test_fault_tolerance_manager,
         test_checkpoint_save_load,
         test_async_forwarder_create,
-        test_lacp3_full_integration,
+        test_lacp_full_integration,
         test_largest_remainder_removed,
     ]
     

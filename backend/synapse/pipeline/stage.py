@@ -108,7 +108,7 @@ class PipelineStage:
         result = StageResult(
             micro_batch_id=micro_batch.batch_id,
             data=result_data,
-            step=micro_batch.step if hasattr(micro_batch, "step") else 0,
+            step=micro_batch.step,
             elapsed_ms=elapsed,
         )
         return result
@@ -143,7 +143,13 @@ class PipelineStage:
                 continue
 
     async def forward(self, input_data: np.ndarray, micro_batch_id: int = 0, metadata: Optional[Dict] = None) -> np.ndarray:
-        mb = MicroBatch(batch_id=micro_batch_id, data=input_data, metadata=metadata or {})
+        meta = metadata or {}
+        mb = MicroBatch(
+            batch_id=micro_batch_id,
+            data=input_data,
+            metadata=meta,
+            step=int(meta.get("step", 0)),
+        )
         result = await self.run_forward(mb)
         return result.data
 
@@ -165,7 +171,7 @@ class PipelineStage:
         result = StageResult(
             micro_batch_id=micro_batch.batch_id,
             data=result_data,
-            step=micro_batch.step if hasattr(micro_batch, "step") else 0,
+            step=micro_batch.step,
             elapsed_ms=elapsed,
             op="backward",
         )
@@ -224,6 +230,7 @@ class PipelineExecutor:
                     batch_id=mb_id,
                     data=input_data.copy() if mb_id > 0 else input_data,
                     metadata={"step": mb_id},
+                    step=mb_id,
                 )
                 result = await stage.run_forward(mb)
                 results[mb_id] = result.data
@@ -243,6 +250,7 @@ class PipelineExecutor:
                     batch_id=slot.micro_batch_id,
                     data=input_data.copy(),
                     metadata={"step": slot.step},
+                    step=slot.step,
                 )
                 await self.stages[0].enqueue_input(mb)
 
@@ -274,6 +282,7 @@ class PipelineExecutor:
                 batch_id=mb_id,
                 data=input_data.copy() if mb_id > 0 else input_data,
                 metadata={"step": mb_id},
+                step=mb_id,
             )
             result = await asyncio.wait_for(
                 stage.run_forward(mb), timeout=timeout / num_micro_batches

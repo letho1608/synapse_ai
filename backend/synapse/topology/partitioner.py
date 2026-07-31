@@ -201,20 +201,15 @@ def compute_partition_ilp(
                 prob += y[(i, l)] <= 1 - x[(i, l-1)]
                 # y[i][l] ≥ x[i][l] - x[i][l-1]
                 prob += y[(i, l)] >= x[(i, l)] - x[(i, l-1)]
-    
-    # Constraint 5: Contiguity via ordered positions
-    # Each node's layers must be contiguous
-    M = total_layers
-    for i in range(num_nodes):
-        # For any position l where this node has a layer:
-        # Number of layers before this position must not exceed a gap
-        # If y[i][l] = 1, then for all k < l, x[i][k] = 0
-        for l in range(total_layers):
-            prob += pulp.lpSum([x[(i, k)] for k in range(l)]) <= l * (1 - y[(i, l)]) + l * y[(i, l)]
-            # If y[i][l] = 1, then for all k > start, layers are assigned until the next node's start
-            for k in range(l, total_layers):
-                prob += x[(i, k)] <= 1 - y[(i, l)] + x[(i, k)]
-    
+
+    # NOTE: contiguity needs no separate constraints. Every run of layers has
+    # exactly one start (Constraint 4), each node may start at most one run
+    # (Constraint 2), and layer 0 starts exactly one run (Constraint 3), so
+    # each node's assigned layers form one contiguous range. The former
+    # "Contiguity via ordered positions" block was removed: both of its
+    # constraints were tautologies (l*(1-y) + l*y == l and
+    # x <= 1 - y + x), so they never constrained anything.
+
     # Simplify: enforce ordering of node start positions
     # Use a big-M formulation for pipeline order
     for i in range(num_nodes):

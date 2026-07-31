@@ -50,6 +50,7 @@ class MicroBatch:
     labels: Optional[np.ndarray] = None  # for training
     attention_mask: Optional[np.ndarray] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    step: int = 0  # global pipeline step that produced this micro-batch
 
 
 @dataclass
