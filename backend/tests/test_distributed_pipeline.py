@@ -437,6 +437,117 @@ class TestCollectResultP2P:
 
         await controller.stop()
 
+    @pytest.mark.asyncio
+    async def test_collect_result_rejects_wrong_micro_batch(self):
+        """B2: _collect_result must not accept the first result on the topic
+        when it belongs to a different micro-batch — it keeps waiting for the
+        requested batch identity instead of misattributing the result."""
+        from synapse.inference.distributed_engine import DistributedPipelineController
+        from synapse.inference.shard import Shard
+
+        router = EventRouter()
+        controller = DistributedPipelineController(
+            node_id="orchestrator",
+            inference_engine=None,
+            event_router=router,
+        )
+        await controller.start()
+
+        request_id = "test-collect-batch-003"
+
+        async def do_collect():
+            return await controller._collect_result(
+                request_id=request_id,
+                last_stage_node_id="node-last",
+                last_stage_shard=Shard("test-model", 0, 5, 6),
+                timeout=5.0,
+                expected_micro_batch_id=1,
+            )
+
+        collect_task = asyncio.create_task(do_collect())
+        await asyncio.sleep(0.1)
+
+        result_topic = f"synapse/inference/result/{request_id}"
+        # Wrong micro-batch (0) arrives first: must be ignored, still waiting.
+        await router.publish(result_topic, {
+            "tokens": [999, 998],
+            "request_id": request_id,
+            "is_finished": False,
+            "micro_batch_id": 0,
+        })
+        await asyncio.sleep(0.2)
+        assert not collect_task.done(), "wrong micro-batch id was accepted"
+
+        # The requested micro-batch (1) arrives: collected.
+        await router.publish(result_topic, {
+            "tokens": [101, 102],
+            "request_id": request_id,
+            "is_finished": False,
+            "micro_batch_id": 1,
+        })
+        result = await asyncio.wait_for(collect_task, timeout=3.0)
+        assert result is not None
+        assert result.tokens == [101, 102]
+        assert result.micro_batch_id == 1
+
+        await controller.stop()
+
+    @pytest.mark.asyncio
+    async def test_collect_result_rejects_wrong_source_stage(self):
+        """B2: results published by a stage other than the expected last stage
+        are ignored even when the micro-batch id matches."""
+        from synapse.inference.distributed_engine import DistributedPipelineController
+        from synapse.inference.shard import Shard
+
+        router = EventRouter()
+        controller = DistributedPipelineController(
+            node_id="orchestrator",
+            inference_engine=None,
+            event_router=router,
+        )
+        await controller.start()
+
+        request_id = "test-collect-stage-004"
+
+        async def do_collect():
+            return await controller._collect_result(
+                request_id=request_id,
+                last_stage_node_id="node-last",
+                last_stage_shard=Shard("test-model", 0, 5, 6),
+                timeout=5.0,
+                expected_micro_batch_id=0,
+                expected_source_stage_id=5,
+            )
+
+        collect_task = asyncio.create_task(do_collect())
+        await asyncio.sleep(0.1)
+
+        result_topic = f"synapse/inference/result/{request_id}"
+        # Same micro-batch but from a different stage: ignored.
+        await router.publish(result_topic, {
+            "tokens": [777],
+            "request_id": request_id,
+            "is_finished": False,
+            "micro_batch_id": 0,
+            "source_stage_id": 3,
+        })
+        await asyncio.sleep(0.2)
+        assert not collect_task.done(), "wrong source stage was accepted"
+
+        # Correct stage publishes: collected.
+        await router.publish(result_topic, {
+            "tokens": [5, 6, 7],
+            "request_id": request_id,
+            "is_finished": False,
+            "micro_batch_id": 0,
+            "source_stage_id": 5,
+        })
+        result = await asyncio.wait_for(collect_task, timeout=3.0)
+        assert result is not None
+        assert result.tokens == [5, 6, 7]
+
+        await controller.stop()
+
 
 class TestE2EDistributedPipeline:
     """End-to-end test: simulate 3-node distributed inference."""

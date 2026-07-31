@@ -204,9 +204,11 @@ class DistributedPipelineController:
 
                 # Pipeline fill: send micro-batches to first stage sequentially
                 prompt_results: List[int] = []
-                async def collect_prompt_result() -> None:
+                async def collect_prompt_result(mb_idx: int) -> None:
                     res = await self._collect_result(
                         request_id, last_stage_node_id, last_stage_shard, timeout=120.0,
+                        expected_micro_batch_id=mb_idx,
+                        expected_source_stage_id=last_stage_shard.start_layer,
                     )
                     if res is not None and res.tokens:
                         prompt_results.extend(res.tokens)
@@ -218,8 +220,8 @@ class DistributedPipelineController:
                         microbatch_id=mb_idx,
                     )
 
-                for _ in micro_batches:
-                    await collect_prompt_result()
+                for mb_idx, _ in micro_batches:
+                    await collect_prompt_result(mb_idx)
 
                 if prompt_results:
                     all_generated_tokens.extend(prompt_results)
@@ -241,9 +243,22 @@ class DistributedPipelineController:
 
                 result = await self._collect_result(
                     request_id, last_stage_node_id, last_stage_shard, timeout=60.0,
+                    expected_micro_batch_id=0,
+                    expected_source_stage_id=last_stage_shard.start_layer,
                 )
                 if result is not None and result.tokens:
                     all_generated_tokens.extend(result.tokens)
+                    # Stream the prompt-phase continuation exactly like the
+                    # micro-batched branch does, so buffer/UI consumers see
+                    # the full generation.
+                    if on_token_callback:
+                        try:
+                            if asyncio.iscoroutinefunction(on_token_callback):
+                                await on_token_callback(request_id, result.tokens, False)
+                            else:
+                                on_token_callback(request_id, result.tokens, False)
+                        except Exception as e:
+                            if DEBUG >= 1: print(f"[{request_id}] on_token_callback error: {e}")
 
             # Decode phase: true pipeline-parallel micro-batch overlapping
             # Instead of sending one batch and waiting, fire multiple micro-batches
@@ -269,15 +284,19 @@ class DistributedPipelineController:
                 num_decode_batches = max(2, lookahead_window)  # At least 2 for overlap
                 decode_batches = []
                 
+                # Full true context for every decode micro-batch: the entire
+                # prompt plus the verified generation history. The model is
+                # conditioned on the whole context, not just the last token.
+                full_context = token_ids.flatten().tolist() + list(all_generated_tokens)
                 for db_idx in range(num_decode_batches):
-                    # Each micro-batch extends the TRUE context by a PREFIX of
-                    # guesses: batch 0 sees [last], batch 1 sees [last, g0],
-                    # batch 2 sees [last, g0, g1], ... A token is only ever
+                    # Each micro-batch extends the true context by a PREFIX of
+                    # guesses: batch 0 sees [prompt ... history], batch 1 adds
+                    # g0, batch 2 adds g0, g1, ... A token is only ever
                     # accepted after every guess feeding its context has been
                     # verified by the previous batch's prediction, so no token
                     # from a contaminated context can leak into the output.
                     batch_guesses = guesses[:db_idx]
-                    candidate_tokens = [all_generated_tokens[-1]] + batch_guesses
+                    candidate_tokens = full_context + batch_guesses
                     input_tensor = np.array([candidate_tokens], dtype=np.int64)
                     decode_batches.append((db_idx, input_tensor))
                 
@@ -291,11 +310,15 @@ class DistributedPipelineController:
                         microbatch_id=db_idx,
                     )
                 
-                # Collect results from the last stage as they complete
+                # Collect results from the last stage as they complete, each
+                # matched to its micro-batch so an out-of-order result is
+                # never misattributed (batch identity check).
                 decode_results = []
-                for _ in decode_batches:
+                for db_idx in range(len(decode_batches)):
                     next_result = await self._collect_result(
                         request_id, last_stage_node_id, last_stage_shard, timeout=30.0,
+                        expected_micro_batch_id=db_idx,
+                        expected_source_stage_id=last_stage_shard.start_layer,
                     )
                     if next_result is not None:
                         decode_results.append(next_result)
@@ -388,13 +411,18 @@ class DistributedPipelineController:
         last_stage_node_id: str,
         last_stage_shard: Shard,
         timeout: float = 30.0,
+        expected_micro_batch_id: Optional[int] = None,
+        expected_source_stage_id: Optional[int] = None,
     ) -> Optional[RoutedResult]:
         result_event = asyncio.Event()
         collected_result: List[RoutedResult] = []
 
         # Listen on P2P result topic. The last node in the chain publishes
         # to "synapse/inference/result/{request_id}" via process_inference_result,
-        # which the orchestrator's on_p2p_result handler receives.
+        # which the orchestrator's on_p2p_result handler receives. Results are
+        # filtered by batch identity (micro_batch_id and, when present, the
+        # publishing stage) so an out-of-order or foreign result is never
+        # misattributed to this collection.
         result_topic = f"synapse/inference/result/{request_id}"
 
         def on_p2p_result(event: Any):
@@ -402,6 +430,19 @@ class DistributedPipelineController:
             tokens = data.get("tokens", [])
             is_finished = data.get("is_finished", False)
             micro_batch_id = data.get("micro_batch_id", 0)
+            source_stage_id = data.get("source_stage_id", None)
+            if expected_micro_batch_id is not None and micro_batch_id != expected_micro_batch_id:
+                if DEBUG >= 1:
+                    print(f"[{request_id}] [DISTRIBUTED] Ignoring result for micro_batch {micro_batch_id} (expected {expected_micro_batch_id})")
+                return
+            if (
+                expected_source_stage_id is not None
+                and source_stage_id is not None
+                and source_stage_id != expected_source_stage_id
+            ):
+                if DEBUG >= 1:
+                    print(f"[{request_id}] [DISTRIBUTED] Ignoring result from stage {source_stage_id} (expected {expected_source_stage_id})")
+                return
             if DEBUG >= 1:
                 print(f"[{request_id}] [DISTRIBUTED] P2P result received: tokens={tokens}, finished={is_finished}")
             collected_result.append(

@@ -154,6 +154,8 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
     result = list(result)
     if len(img.tensor_data) > 0:
       result = np.frombuffer(img.tensor_data, dtype=np.dtype(img.dtype)).reshape(img.shape)
+    tokens = result.reshape(-1).tolist() if isinstance(result, np.ndarray) else list(result)
+    self.node._on_token_received(request_id, tokens, is_finished)
     self.node.on_token.trigger_all(request_id, result, is_finished)
     return node_service_pb2.Empty()
 

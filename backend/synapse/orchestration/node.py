@@ -106,6 +106,12 @@ class Node:
 
     self.buffered_token_output: Dict[str, Tuple[List[int], bool]] = {}
     self._prompt_token_ids: Dict[str, np.ndarray] = {}
+    # Request ids for which THIS node is the sampling stage (it appended the
+    # tokens directly in process_inference_result). Any later delivery of the
+    # same tokens via the on_token stream / P2P loopback is an echo and must
+    # not be double-appended — while genuine adjacent repeats from OTHER
+    # nodes must always be appended.
+    self._locally_sampled: set = set()
     self.buffered_logits: Dict[str, List[np.ndarray]] = {}
     self.buffered_inputs: Dict[str, List[np.ndarray]] = {}
     self.buffered_partials: Dict[str, List[np.ndarray]] = {}
@@ -163,9 +169,6 @@ class Node:
     self.tracer = tracer
 
     self._current_metrics: NodeMetrics = NodeMetrics()
-
-    # Register internal callback for token synchronization in distributed mode
-    self.on_token.register("internal_token_sync").on_next(self._on_token_received)
 
   @property
   def distributed_pipeline(self):
@@ -578,7 +581,11 @@ class Node:
     tokens = data.get("tokens", [])
     is_finished = data.get("is_finished", False)
 
-    self._on_token_received(request_id, tokens, is_finished)
+    # The token buffer is fed by the verified decode-loop callback
+    # (node_extension) or by the sampling node's direct append — the P2P
+    # result is a redundant echo of those. Only the UI/stream callbacks fire
+    # here, so a legitimate adjacent repeated token is never dropped and a
+    # raw unverified guess never double-appends.
     self.trigger_on_token_callbacks(request_id, tokens, is_finished)
 
   async def get_tailscale_nodes(self) -> List[Dict]:
@@ -713,6 +720,9 @@ class Node:
 
         # Add to buffer
         self.buffered_token_output[request_id][0].append(token_value)
+        # This node is the sampling stage: subsequent deliveries of these
+        # tokens (own stream trigger / P2P loopback) are echoes.
+        self._locally_sampled.add(request_id)
         token_emitted = True
         
         # Repetition detection
@@ -778,6 +788,7 @@ class Node:
             "tokens": intermediate_result,
             "is_finished": is_finished,
             "micro_batch_id": inference_state.get("microbatch_id", 0) if inference_state else 0,
+            "source_stage_id": shard.start_layer,
         }
 
         # 1. Publish to request_id-based topic (general broadcast)
@@ -792,6 +803,7 @@ class Node:
           self.buffered_token_output[request_id] = (self.buffered_token_output[request_id][0], True)
         self.outstanding_requests.pop(request_id, None)
         self._prompt_token_ids.pop(request_id, None)
+        self._locally_sampled.discard(request_id)
     
         return np.array(self.buffered_token_output.get(request_id, ([], False))[0])
 
@@ -968,6 +980,7 @@ class Node:
         if shard.is_last_layer():
           if DEBUG >= 1:
             print(f"[{request_id}] Triggering error callback to notify API")
+          self._on_token_received(request_id, [], True)
           self.trigger_on_token_callbacks(request_id, [], True)
         raise
       finally:
@@ -977,6 +990,7 @@ class Node:
         if 'buffered_tokens' in locals(): del buffered_tokens
         if 'result' in locals(): del result
         self.outstanding_requests.pop(request_id, None)
+        self._locally_sampled.discard(request_id)
         self._prompt_token_ids.pop(request_id, None)
         if hasattr(self.inference_engine, "clear_cache"):
             self.inference_engine.clear_cache(request_id)
@@ -1726,20 +1740,20 @@ class Node:
         traceback.print_exc()
 
   def _on_token_received(self, request_id: str, tokens: List[int], is_finished: bool) -> None:
-    """Internal callback to synchronize buffered tokens on orchestrator node."""
+    """Append a token delivery to the request's streaming buffer.
+
+    Real tokens are always appended — including legitimate adjacent repeats,
+    which a naive suffix-dedup would silently drop. Deliveries of tokens this
+    node itself sampled are skipped: the sampler appends directly in
+    process_inference_result, so its own stream trigger / P2P loopback are
+    echoes of that single append.
+    """
     if request_id not in self.buffered_token_output:
       self.buffered_token_output[request_id] = ([], False)
-    
+
     current_tokens, _ = self.buffered_token_output[request_id]
-    
-    # We only add tokens that are not already at the END of our buffer.
-    # This prevents double-adding on the node that actually did the sampling.
-    if tokens:
-      # If we receive multiple tokens, we might need a more robust check, 
-      # but usually it's one token at a time in streaming.
-      if not current_tokens or current_tokens[-len(tokens):] != tokens:
-        current_tokens.extend(tokens)
-    
+    if tokens and request_id not in self._locally_sampled:
+      current_tokens.extend(tokens)
     self.buffered_token_output[request_id] = (current_tokens, is_finished)
     if DEBUG >= 2:
       print(f"[{request_id}] Internal buffer updated: {len(current_tokens)} tokens, finished={is_finished}")
