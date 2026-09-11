@@ -109,3 +109,10 @@ Quyết định: synapse xây theo kiểu **CLI terminal**, giữ web UI hiện 
 **Gộp:** QUANT_BPP 1 nguồn (helpers), `_get_all_local_ips` 1 nguồn.
 **Lane sai đã hiệu đính:** `simple_dataset` targets==inputs là quy ước causal-LM (ghi chú, không sửa); `--no-disable-tui` tồn tại qua BooleanOptionalAction (`--tui` không hỏng); `get_devices_for_ui` giữ lại (UI bạn đang làm); test trùng/gộp test + merge partitioner/dataset + frontend scaffold HOÃN (đụng việc bạn + cần quyết sản phẩm).
 **Env máy này (research/plan-followup/10):** torch_directml vỡ DLL (import sau torch = fatal process); model thật chạy CPU được; ILP 2x32/8x32 budget-2s fallback.
+
+## Audit lanes A/B/C đợt 2 (2026-09-11, commit 445d4fb, suite 334 passed)
+
+**Đã nối (có test `test_p2p_wiring` 5 passed):** ACK cho `send_prompt`/`send_tensor` (hết timeout oan 5s); subscribers `example`/`status` + handler RPC `example` (hết black-hole, loss thật thay 0.0 giả); eval/train chạy hàm thật.
+**Đã sửa:** mock capabilities phải có `SYNAPSE_TEST_MODE=1` (+ test_cluster script đã cập nhật); autoscale crash thì log (không còn `[]` câm); train/evaluate base warn 1 lần; power heuristic gắn cờ `power_estimated`; multi_gpu không đăng ký key None; QUANT + IP 1 nguồn (đã liệt kê); settings thêm system_prompt; route download progress; status phơi observability.
+**Đã xóa:** liệt kê ở trên (verify zero-importer trước khi xóa).
+**Hoãn có lý do:** gộp test/partitioner/dataset/frontend (đụng việc bạn); autoscale actuating + INT8 default + TLS on (cần C1/GPU/certs); đo multi-size probe (cần mạng thật).
