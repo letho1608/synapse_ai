@@ -1,0 +1,33 @@
+# Base node install: inference + cluster core only.
+# Platform extras : requirements-windows.txt (pywin32, torch-directml)
+# Assistant/viz   : requirements-tools.txt (graceful "not installed" fallback, see api/tools/*)
+# Packaging/dev   : requirements-dev.txt
+aiofiles
+aiohttp
+aiohttp-cors
+jinja2
+numpy
+nvidia-ml-py
+opentelemetry-api
+prometheus-client
+protobuf
+psutil
+pydantic
+requests==2.33.1
+urllib3==2.0.7
+charset-normalizer==3.4.7
+rich
+setuptools
+tqdm
+transformers
+torch
+peft
+datasets
+accelerate
+anyio
+loguru
+bitsandbytes
+pulp>=2.7.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+diskcache>=5.6.0

@@ -8,29 +8,8 @@ from synapse.networking.discovery import Discovery
 from synapse.networking.peer_handle import PeerHandle
 from synapse.topology.device_capabilities import DeviceCapabilities, device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.helpers import DEBUG, DEBUG_DISCOVERY
+from synapse.helpers import get_all_local_ips as _get_all_local_ips
 from .tailscale_helpers import get_device_id, get_self_tailscale_info, update_device_attributes, get_device_attributes, get_tailscale_devices, Device
-
-
-def _get_all_local_ips() -> Set[str]:
-    """Lấy mọi IPv4 của máy này (kể cả Tailscale 100.x) để nhận diện 'máy này' khi không có tailscale CLI."""
-    ips = set()
-    try:
-        import psutil
-        for _nic, addrs in psutil.net_if_addrs().items():
-            for a in addrs:
-                if getattr(socket, "AF_INET", None) and a.family == socket.AF_INET and a.address:
-                    ips.add(a.address.strip())
-    except Exception:
-        pass
-    if not ips:
-        try:
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
-            if ip and not ip.startswith("127."):
-                ips.add(ip)
-        except Exception:
-            pass
-    return ips
 
 
 class TailscaleDiscovery(Discovery):

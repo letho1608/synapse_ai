@@ -96,8 +96,13 @@ class FaultToleranceManager:
 
     HEARTBEAT_INTERVAL = 2.0   # seconds between heartbeats
     HEARTBEAT_TIMEOUT = 5.0    # seconds before considering node dead (matches README claim)
-    CHECKPOINT_INTERVAL = 30.0  # seconds between state snapshots
+    # NOTE (T1.1): there is intentionally NO periodic snapshot interval.
+    # A former CHECKPOINT_INTERVAL constant was dead (no loop ever read it);
+    # snapshots are written per training step via node_extension hooks, not on
+    # a timer, so an inference-only cluster writes nothing. Do not re-add an
+    # interval saver without retention bounds (see manifest cap below).
     MAX_MISSES = 3             # consecutive missed heartbeats before blacklisting
+    MANIFEST_KEEP = 10         # max manifest entries retained per (node, model)
 
     def __init__(self, node_id: str, checkpoint_dir: str = None):
         if checkpoint_dir is None:
@@ -182,6 +187,18 @@ class FaultToleranceManager:
         self._json_serialize(data, filepath)
 
         self._checkpoints[self.node_id].append(ckpt)
+        # T1.1: index the file in the sidecar manifest (best-effort: a
+        # manifest failure must never fail the checkpoint write itself).
+        # Hash the text-mode round-trip (not raw bytes): on Windows the file
+        # is written with \r\n translation, so a raw-byte hash would never
+        # match the receiver's text hash. Both sides hash canonical text.
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                canonical = f.read()
+            self._update_manifest(ckpt, len(canonical.encode("utf-8")),
+                                  self._sha256_text(canonical))
+        except Exception:
+            pass
         return filepath
 
     @staticmethod
@@ -345,6 +362,167 @@ class FaultToleranceManager:
             result.success = False
 
         return result
+
+    @staticmethod
+    def _safe_name(name: str) -> str:
+        """Confine a node/model id to a flat filename segment (H5 traversal)."""
+        base = os.path.basename(str(name or ""))
+        base = "".join(c if (c.isalnum() or c in ("-", "_", ".", ":")) else "_" for c in base)
+        return base or "unknown"
+
+    def _confine(self, filename: str) -> str:
+        """Resolve filename inside checkpoint_dir or raise (H5 traversal)."""
+        candidate = (self.checkpoint_dir and os.path.abspath(self.checkpoint_dir)) or os.path.abspath(".")
+        target = os.path.abspath(os.path.join(candidate, os.path.basename(filename)))
+        if os.path.commonpath([candidate, target]) != candidate:
+            raise ValueError("checkpoint path escapes checkpoint_dir: %r" % filename)
+        return target
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def _sha256_text(text: str) -> str:
+        """Canonical-text hash shared with the P2P pull path (T1.1)."""
+        import hashlib
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _manifest_path(self, node_id: str, model_id: str) -> str:
+        return self._confine(
+            "%s_%s.manifest.json" % (self._safe_name(node_id), self._safe_name(model_id))
+        )
+
+    def _update_manifest(self, ckpt: ShardCheckpoint, size: int, sha256: str) -> None:
+        """Append ckpt to the sidecar manifest (atomic tmp+rename, capped)."""
+        mpath = self._manifest_path(ckpt.node_id, ckpt.model_id)
+        manifest: Dict[str, Any] = {"node_id": ckpt.node_id, "model_id": ckpt.model_id,
+                                    "files": [], "updated_at": time.time()}
+        try:
+            with open(mpath, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict) and isinstance(loaded.get("files"), list):
+                manifest = loaded
+        except (OSError, ValueError):
+            pass
+        files = [e for e in manifest["files"]
+                 if not (e.get("step") == ckpt.step and e.get("start_layer") == ckpt.start_layer
+                         and e.get("end_layer") == ckpt.end_layer)]
+        files.append({"step": ckpt.step, "start_layer": ckpt.start_layer,
+                      "end_layer": ckpt.end_layer,
+                      "path": os.path.basename(ckpt.checkpoint_path or ""),
+                      "size": size, "sha256": sha256, "timestamp": ckpt.timestamp})
+        files.sort(key=lambda e: (e.get("step", 0), e.get("timestamp", 0)))
+        manifest["files"] = files[-self.MANIFEST_KEEP:]
+        manifest["updated_at"] = time.time()
+        tmp = mpath + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        os.replace(tmp, mpath)
+
+    def get_checkpoint_manifest(self, node_id: str, model_id: str) -> Optional[Dict[str, Any]]:
+        """Read the sidecar manifest index, or None if absent/corrupt."""
+        try:
+            with open(self._manifest_path(node_id, model_id), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def latest_manifest_step(self, node_id: str, model_id: str) -> Optional[int]:
+        """Newest step in the manifest index (G5 monotonicity source)."""
+        manifest = self.get_checkpoint_manifest(node_id, model_id)
+        if not manifest:
+            return None
+        steps = [e.get("step") for e in manifest.get("files", []) if isinstance(e.get("step"), int)]
+        return max(steps) if steps else None
+
+    def latest_model_step(self, model_id: str) -> Optional[int]:
+        """Newest step WE know for a model (memory + own manifest).
+
+        Training steps are global per model, not per node: a survivor that
+        already trained past step N must refuse a pulled step < N (G5).
+        """
+        best: Optional[int] = None
+        for c in self._checkpoints.get(self.node_id, []):
+            if c.model_id == model_id and (best is None or c.step > best):
+                best = c.step
+        own = self.latest_manifest_step(self.node_id, model_id)
+        if own is not None and (best is None or own > best):
+            best = own
+        return best
+
+    async def prefer_local_then_pull(
+        self,
+        node_id: str,
+        model_id: Optional[str] = None,
+        step: Optional[int] = None,
+        fetch_fn: Optional[callable] = None,
+    ) -> Optional[ShardCheckpoint]:
+        """Dual-read order (T1.1/C2): memory -> shared-dir scan -> P2P pull.
+
+        fetch_fn, when given, is an async callable
+        (node_id, model_id, step) -> Optional[(manifest_entry, file_text)]
+        supplied by the transport layer (transport/checkpoint_pull.py). It is
+        injected — never imported — so this module stays transport-agnostic.
+        Pulled content is sha-verified and step-checked before acceptance.
+        """
+        ckpts = [c for c in self._checkpoints.get(node_id, [])
+                 if (model_id is None or c.model_id == model_id)
+                 and (step is None or c.step == step)]
+        if ckpts:
+            return max(ckpts, key=lambda c: (c.step, c.timestamp))
+        on_disk = self.load_latest_checkpoint(node_id)
+        if on_disk and (model_id is None or on_disk.model_id == model_id) \
+                and (step is None or on_disk.step == step):
+            return on_disk
+        if fetch_fn is None:
+            return None
+        try:
+            fetched = await fetch_fn(node_id, model_id, step)
+        except Exception:
+            return None
+        if not fetched:
+            return None
+        entry, text = fetched[0], fetched[1]
+        try:
+            data = json.loads(text)
+            ckpt = ShardCheckpoint(**{k: v for k, v in data.items()
+                                      if k in ShardCheckpoint.__dataclass_fields__})
+        except (ValueError, TypeError):
+            return None
+        # sha-verify before acceptance (H5): recompute over canonical dump.
+        import hashlib as _hl
+        if entry.get("sha256") and entry["sha256"] != _hl.sha256(
+                text.encode("utf-8")).hexdigest():
+            return None
+        if ckpt.node_id != node_id:
+            return None
+        if step is not None and ckpt.step != step:
+            return None
+        # Step monotonicity (G5): training steps are global per model — never
+        # accept a pulled step older than the newest step WE know for it.
+        local_latest = self.latest_model_step(ckpt.model_id)
+        if local_latest is not None and ckpt.step < local_latest:
+            return None
+        # Persist into OUR dir (shared-nothing) so the next lookup is local.
+        filename = "%s_%s_L%s-%s_step%s.ckpt" % (
+            self._safe_name(ckpt.node_id), self._safe_name(ckpt.model_id),
+            ckpt.start_layer, ckpt.end_layer, ckpt.step)
+        try:
+            dest = self._confine(filename)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(text)
+            ckpt.checkpoint_path = dest
+        except (OSError, ValueError):
+            return None
+        self._checkpoints[node_id].append(ckpt)
+        return ckpt
 
     def get_recovery_checkpoint(self, node_id: str) -> Optional[ShardCheckpoint]:
         """Return the cross-node checkpoint staged for a node during the last

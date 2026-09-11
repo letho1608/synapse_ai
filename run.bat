@@ -5,15 +5,15 @@ color 0A
 echo ===================================================
 echo               SYNAPSE AI LAUNCHER                  
 echo ===================================================
-echo Starting Synapse Server (Backend + Frontend)...
+echo Starting Synapse Server (Backend, web UI served by backend, no Node.js needed)...
 python main.py
 
 echo.
 
 echo.
-echo Both servers are starting in the background of this window.
-echo - Backend will run on its configured API port (default: 52415)
-echo - Frontend will run on Vite's dev port (default: 5173)
+echo Backend is starting in this window.
+echo - Backend API on its configured port (default: 52415)
+echo - Web UI is a static page served by the backend itself (GET /); no Vite/Node.js.
 echo.
-echo Press Ctrl+C to stop both servers.
+echo Press Ctrl+C to stop the server.
 pause

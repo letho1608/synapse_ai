@@ -141,6 +141,10 @@ class Node:
     self.event_router.subscribe("synapse/cluster/status", self.on_p2p_status)
     self.event_router.subscribe(f"synapse/inference/tensor/{self.id}", self.on_p2p_tensor)
     self.event_router.subscribe(f"synapse/inference/prompt/{self.id}", self.on_p2p_prompt)
+    # C-W4: peer-sent training examples + opaque status had publishers but no
+    # subscribers (black holes). Route them into enqueue_example/on_node_status.
+    self.event_router.subscribe(f"synapse/inference/example/{self.id}", self.on_p2p_example)
+    self.event_router.subscribe(f"synapse/inference/status/{self.id}", self.on_p2p_status_direct)
     # CRITICAL FIX: Subscribe to BOTH request_id and node_id result topics.
     # The last-layer node publishes to result/{self.id}, but also
     # publishes to result/{orchestrator_id}. We need to listen on our own ID
@@ -230,9 +234,11 @@ class Node:
         if DEBUG >= 1: print(f"Starting discovery module: {type(self.discovery).__name__}")
         await self.discovery.start()
     
-    if DEBUG >= 1: print(f"P2P Node started. Waiting for {wait_for_peers} peers (simulated)...")
-    if wait_for_peers > 0:
-        await asyncio.sleep(2.0) # Grace period for P2P connection
+    if DEBUG >= 1: print(f"P2P Node started. Waiting for {wait_for_peers} peers...")
+    if hasattr(self, "discovery") and self.discovery:
+        if wait_for_peers > 0:
+            await asyncio.sleep(2.0)  # Grace period for peer processes to bind sockets.
+        await self.update_peers(wait_for_peers)
     if DEBUG >= 1: print(f"Peers updated: {len(self.peers)} peers")
     
     if DEBUG >= 1: print("Starting node: Collecting topology...")
@@ -265,6 +271,23 @@ class Node:
             print(f"[SHM] Failed to start shared-memory transport: {e}")
         self.shm_transport = None
 
+    # T1.2: wire binary transports into process_tensor (receiver side).
+    # Handlers are sync per the transport contract; fan out via _schedule_task.
+    # SHM delivery is same-process-only (see transport/shm_transport); TCP
+    # chunks reassemble in TensorTCPTransport before reaching the handler.
+    try:
+        if self.tcp_transport is not None:
+            self.tcp_transport.set_tensor_handler(
+                lambda msg: self._schedule_task(
+                    self._on_transport_tensor(msg, "tcp"), "transport_tensor"))
+        if self.shm_transport is not None:
+            self.shm_transport.set_tensor_handler(
+                lambda msg: self._schedule_task(
+                    self._on_transport_tensor(msg, "shm"), "transport_tensor"))
+    except Exception as e:
+        if DEBUG >= 1:
+            print(f"[TRANSPORT] handler wiring failed: {e}")
+
     # Start distributed pipeline extension unconditionally: rebalancing and
     # partition checks in check_fault_tolerance() gate on
     # self._distributed_pipeline, so a node that dies before the first
@@ -285,6 +308,16 @@ class Node:
         # rebalanced even if discovery never drops it).
         self.event_router.subscribe("synapse/cluster/heartbeat", self._on_ft_heartbeat)
         self._schedule_task(self._ft_heartbeat_loop(), "ft_heartbeat")
+        # T3.3 (advisory-only): capability + demand gossip on the same mesh.
+        # Old peers ignore these topics; handlers store with hygiene caps.
+        try:
+          from synapse.topology.capability import CAPABILITIES_TOPIC, DEMAND_TOPIC
+          self._peer_capabilities = {}
+          self._peer_demand = {}
+          self.event_router.subscribe(CAPABILITIES_TOPIC, self._on_capability)
+          self.event_router.subscribe(DEMAND_TOPIC, self._on_demand)
+        except Exception:
+          pass
 
     self.cluster_state.update_node(self.id, {
         "device": str(self.device_capabilities),
@@ -296,6 +329,7 @@ class Node:
 
   async def _cluster_state_heartbeat(self) -> None:
     """Periodically update own node state and broadcast to cluster."""
+    beats = 0
     while True:
         await asyncio.sleep(5.0)
         self.cluster_state.update_node(self.id, {
@@ -309,6 +343,17 @@ class Node:
         except Exception as e:
             if DEBUG >= 1:
                 print(f"Cluster state broadcast failed: {e}")
+        # T3.3 advisory (default ON, observe-only): aggregate gossip demand
+        # every ~6th beat so operators see the loop working live. Set
+        # SYNAPSE_AUTOSCALE=off to silence. Advisory HINTS (not actions) are
+        # evaluated only under SYNAPSE_AUTOSCALE=advise; actuating stays
+        # gated on the C1 live gate — "on" currently means "advise".
+        beats += 1
+        if beats % 6 == 0:
+            try:
+                await self._log_demand_summary()
+            except Exception:
+                pass
 
   async def _broadcast_cluster_state(self) -> None:
     """Broadcast cluster state to all peers via P2P event router."""
@@ -444,6 +489,7 @@ class Node:
   async def _ft_heartbeat_loop(self):
     """Periodically publish this node's fault-tolerance heartbeat over the
     event mesh (B5): peers record it regardless of topology membership."""
+    beats = 0
     while True:
       try:
         interval = 2.0
@@ -456,11 +502,114 @@ class Node:
             {"type": "heartbeat", "node_id": self.id},
             origin="local",
           )
+        # T3.3: capability + demand every ~5th beat (~10 s, advisory-only).
+        beats += 1
+        if beats % 5 == 0:
+          try:
+            await self._publish_capability_demand()
+          except Exception:
+            pass
       except asyncio.CancelledError:
         break
       except Exception as e:
         if DEBUG >= 1:
           print(f"[FT_HEARTBEAT] publish failed: {e}")
+
+  async def _publish_capability_demand(self) -> None:
+    """Publish our capability + demand docs (T3.3, best-effort)."""
+    from synapse.topology.capability import (
+      CAPABILITIES_TOPIC, DEMAND_TOPIC, build_capability_doc, build_demand_doc)
+    from synapse.helpers import VERSION as _VER
+    eng = getattr(self, "inference_engine", None)
+    model_ids = [getattr(eng, "_model_id", None)] if eng is not None else []
+    model_ids = [m for m in model_ids if m]
+    await self.event_router.publish(CAPABILITIES_TOPIC, build_capability_doc(
+      self.id, getattr(self, "device_capabilities", None),
+      model_ids=model_ids, version=_VER), origin="local")
+    outstanding = getattr(self, "outstanding_requests", {})
+    in_flight = len(outstanding) if hasattr(outstanding, "__len__") else 0
+    maxc = getattr(self, "max_concurrent_requests", 32) or 32
+    await self.event_router.publish(DEMAND_TOPIC, build_demand_doc(
+      self.id, model_id=model_ids[0] if model_ids else "",
+      req_per_min=None, queue_depth=max(0, in_flight - maxc),
+      in_flight=in_flight), origin="local")
+
+  async def _on_capability(self, event: Event):
+    """Store a peer's capability doc (T3.3, bounded)."""
+    try:
+      from synapse.topology.capability import store_bounded
+      data = event.data
+      if isinstance(data, dict):
+        nid = data.get("node_id")
+        if nid and nid != self.id:
+          store = getattr(self, "_peer_capabilities", None)
+          if store is None:
+            store = {}
+            self._peer_capabilities = store
+          store_bounded(store, nid, data)
+    except Exception:
+      pass
+
+  async def _on_demand(self, event: Event):
+    """Store a peer's demand doc (T3.3, bounded)."""
+    try:
+      from synapse.topology.capability import store_bounded
+      data = event.data
+      if isinstance(data, dict):
+        nid = data.get("node_id")
+        if nid and nid != self.id:
+          store = getattr(self, "_peer_demand", None)
+          if store is None:
+            store = {}
+            self._peer_demand = store
+          store_bounded(store, nid, data)
+    except Exception:
+      pass
+
+  async def _log_demand_summary(self) -> None:
+    """Aggregate gossip demand and log it (T3.3, observe-only).
+
+    SYNAPSE_AUTOSCALE=off silences this. =advise additionally evaluates
+    advisory HINTS (never actions) using the pipeline truth that every
+    partitioned node serves the one sharded model; standby = topology
+    nodes outside the partition. Actuating ("on" meaning actions) stays
+    gated on the C1 live gate — today "on" behaves as "advise".
+    """
+    import os as _os
+    if _os.getenv("SYNAPSE_AUTOSCALE", "on") == "off":
+      return
+    try:
+      from synapse.topology.capability import aggregate_demand
+      from synapse.orchestration.autoscale import evaluate
+      docs = list(getattr(self, "_peer_demand", {}).values())
+      agg = aggregate_demand(docs)
+      if DEBUG >= 1:
+        print(f"[AUTOSCALE] demand summary: {agg}")
+      if _os.getenv("SYNAPSE_AUTOSCALE", "on") not in ("advise", "on"):
+        return
+      try:
+        parts = self._compute_lacp_partition()
+        serving_nodes = [p.node_id for p in parts]
+      except Exception:
+        return
+      topo_ids = list(getattr(self.topology, "nodes", {}).keys())
+      standby = [nid for nid in topo_ids if nid not in serving_nodes]
+      # Standby registry (T3.3): topology members holding zero layers.
+      # Published in the summary so operators (and future actuating mode)
+      # see promotion candidates; computation stays advisory-only.
+      self._last_standby = standby
+      models = {getattr(getattr(self.inference_engine, "shard", None),
+                        "model_id", "") or ""}
+      servers = {m: serving_nodes for m in models}
+      hints = evaluate(agg, servers, standby)
+      if hints and DEBUG >= 1:
+        print(f"[AUTOSCALE] advisory hints (no action taken): {hints}")
+      self._last_autoscale_hints = hints
+      if DEBUG >= 1 and (standby or hints):
+        print(f"[AUTOSCALE] serving={serving_nodes} standby={standby}")
+    except Exception as e:
+      if DEBUG >= 1:
+        print(f"[AUTOSCALE] summary failed: {e}")
 
   async def _on_ft_heartbeat(self, event: Event):
     """Record a peer's fault-tolerance heartbeat (B5)."""
@@ -473,6 +622,27 @@ class Node:
     except Exception as e:
       if DEBUG >= 1:
         print(f"[FT_HEARTBEAT] record failed: {e}")
+
+  def _infer_total_layers(self, current_assignments) -> int:
+    """Total transformer layers without hardcoding 32 (H4).
+
+    Preference: loaded engine shard -> widest assigned range -> 32.
+    """
+    try:
+      eng = getattr(self, "inference_engine", None)
+      n = getattr(getattr(eng, "shard", None), "n_layers", None)
+      if isinstance(n, int) and n > 0:
+        return n
+    except Exception:
+      pass
+    try:
+      if current_assignments:
+        widest = max(e for _, e in current_assignments.values())
+        if isinstance(widest, int) and widest >= 0:
+          return widest + 1
+    except Exception:
+      pass
+    return 32
 
   async def check_fault_tolerance(self) -> None:
     """LACP: Dynamic Fault Tolerance with rebalancing on node failure."""
@@ -512,8 +682,11 @@ class Node:
 
           current_assignments = {}
           partitions = self._compute_lacp_partition()
+          # H4: never hardcode 32 — prefer the loaded shard's layer count,
+          # else the widest assigned range, else 32 as last resort.
+          total_layers = self._infer_total_layers(None)
           for p in partitions:
-            num_layers = 32
+            num_layers = total_layers
             start = int(p.start * num_layers)
             end = min(int(p.end * num_layers) - 1, num_layers - 1)
             current_assignments[p.node_id] = (start, end)
@@ -541,7 +714,7 @@ class Node:
           rebalance_result = await self.fault_tolerance.rebalance_after_failure(
             dead_node_id=dead_id,
             current_assignments=current_assignments,
-            total_layers=32,
+            total_layers=total_layers,
             lacp_partition_fn=repartition,
           )
           # Consume the result instead of discarding it: the recovered
@@ -568,9 +741,24 @@ class Node:
                   model_id=ckpt.model_id,
                   start_layer=ckpt.start_layer,
                   end_layer=ckpt.end_layer,
-                  n_layers=32,
+                  n_layers=self._infer_total_layers(current_assignments),
                 )
-                await engine.load_checkpoint(shard, ckpt.checkpoint_path)
+                # B1: the engine reports whether weights were REALLY restored.
+                # A False here means metadata-only resume (degraded, not silent).
+                restored = await engine.load_checkpoint(shard, ckpt.checkpoint_path)
+                if not restored:
+                  self._last_recovery_degraded = {
+                    "dead_node_id": dead_id, "target": target,
+                    "step": ckpt.step, "reason": "weights_not_restored",
+                  }
+                  if DEBUG >= 1:
+                    print(
+                      f"!!! [LACP_FAULT] Recovery DEGRADED for {dead_id}: "
+                      f"checkpoint step {ckpt.step} staged for {target} but "
+                      f"weights were NOT restored (metadata-only resume)"
+                    )
+                else:
+                  self._last_recovery_degraded = None
 
   async def on_p2p_tensor(self, event: Event):
     """Handle incoming tensor for inference via P2P."""
@@ -618,6 +806,55 @@ class Node:
         orchestrator_id = data.get("_orchestrator_id")
 
     await self.process_tensor(shard, tensor_data, request_id, inference_state, orchestrator_id=orchestrator_id)
+    await self._ack_peer(data if isinstance(data, dict) else metadata)
+
+  async def _ack_peer(self, data) -> None:
+    """C-W1: answer P2PPeerHandle ack waits; absent key = fire-and-forget."""
+    try:
+      topic = data.get("_ack_topic") if isinstance(data, dict) else None
+      if topic:
+        await self.event_router.publish(topic, True, origin=self.id)
+    except Exception:
+      pass
+
+  def _decode_p2p_array(self, raw, shape, dtype):
+    """Decode a peer-sent array (bytes post-bridge, hex str, or list)."""
+    import numpy as np
+    if isinstance(raw, (bytes, bytearray)):
+      buf = bytes(raw)
+    elif isinstance(raw, str):
+      buf = bytes.fromhex(raw)
+    else:
+      return np.array(raw, dtype=np.dtype(dtype)).reshape(shape)
+    return np.frombuffer(buf, dtype=np.dtype(dtype)).reshape(shape)
+
+  async def on_p2p_example(self, event: Event):
+    """C-W4: route a peer-sent training example into enqueue_example."""
+    data = event.data if isinstance(event.data, dict) else {}
+    try:
+      shard = Shard.from_dict(data.get("shard"))
+      example = self._decode_p2p_array(data.get("example"), data.get("example_shape"), data.get("example_dtype"))
+      target = self._decode_p2p_array(data.get("target"), data.get("target_shape"), data.get("target_dtype"))
+      length = self._decode_p2p_array(data.get("length"), data.get("length_shape"), data.get("length_dtype"))
+      await self.enqueue_example(shard, example, target, length,
+                                 bool(data.get("train", False)), data.get("request_id"))
+    except Exception as e:
+      if DEBUG >= 1:
+        print(f"[P2P] on_p2p_example failed: {e}")
+
+  async def on_p2p_status_direct(self, event: Event):
+    """C-W4: route a peer-sent opaque status into on_node_status."""
+    try:
+      data = event.data if isinstance(event.data, dict) else {}
+      request_id = data.get("request_id", "")
+      status = data.get("status", "")
+      node_id = getattr(event, "origin", "") or ""
+      if not isinstance(status, str):
+        status = json.dumps(status)
+      self.on_node_status(request_id, {"type": "node_status", "node_id": node_id, "status": status})
+    except Exception as e:
+      if DEBUG >= 1:
+        print(f"[P2P] on_p2p_status_direct failed: {e}")
 
   async def on_p2p_prompt(self, event: Event):
     """Handle incoming prompt for inference via P2P."""
@@ -635,6 +872,7 @@ class Node:
         self._request_orchestrator_map[request_id] = orchestrator_id
     
     await self.process_prompt(shard, prompt, request_id, inference_state)
+    await self._ack_peer(data)
 
   async def on_p2p_result(self, event: Event):
     """Handle incoming inference results/tokens via P2P."""
@@ -663,11 +901,17 @@ class Node:
       api_key = self.discovery.tailscale_api_key
       tailnet = self.discovery.tailnet
     
-    # Fallback nếu không có discovery hoặc discovery không phải Tailscale
+    # Fallback nếu không có discovery hoặc discovery không phải Tailscale.
+    # C-W10: canonical env names via helpers (TAILSCALE_API_KEY/TS_API_KEY,
+    # TAILSCALE_TAILNET/TS_TAILNET/TAILNET_NAME legacy) — same as backend main.
     if not api_key:
-      api_key = os.getenv("TS_API_KEY") or os.getenv("TAILSCALE_API_KEY")
+      from synapse.helpers import get_tailscale_env
+      _env_key, _env_tailnet = get_tailscale_env()
+      api_key = api_key or _env_key
     if not tailnet:
-      tailnet = os.getenv("TS_TAILNET") or os.getenv("TAILSCALE_TAILNET")
+      from synapse.helpers import get_tailscale_env
+      _env_key, _env_tailnet = get_tailscale_env()
+      tailnet = tailnet or _env_tailnet
       
     # Tailscale credentials must be set via environment variables
     if not api_key or not tailnet:
@@ -1330,12 +1574,17 @@ class Node:
     if target_id == self.id:
       return await self.process_tensor(target_shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
     else:
-      logger.info(f"[P2P_MESH] Publishing work to Node: {target_id} (INT8 Quantized)")
-      
       start_send = time.perf_counter()
-      is_hidden_states = np.issubdtype(tensor.dtype, np.floating)
-      quantize = is_hidden_states 
-      
+      # B4: exact-dtype default. INT8 only with explicit opt-in
+      # (SYNAPSE_TRANSPORT_INT8=1 or a negotiated offer flag).
+      try:
+        from synapse.transport.router import should_quantize as _should_q
+        quantize = _should_q(str(tensor.dtype))
+      except Exception:
+        quantize = False
+      if DEBUG >= 2:
+        print(f"[P2P_MESH] Publishing work to Node: {target_id} (quantize_int8={quantize})")
+
       encoded_payload = encode_tensor(
         tensor,
         metadata={
@@ -1347,8 +1596,52 @@ class Node:
         },
         quantize_int8=quantize
       )
-      
-      await self.event_router.publish(f"synapse/inference/tensor/{target_id}", {"bin": encoded_payload})
+
+      # T1.2: auto-route (opt-in SYNAPSE_CHUNKED_TCP=1 for tcp-chunked/shm;
+      # bridge legacy stays the default). Every decision is counted (B3);
+      # a failed fast path falls through to the bridge, never silent loss.
+      routed = False
+      try:
+        from synapse.transport.router import choose_transport as _choose
+        _addr = None
+        try:
+          for _p in (self.peers or []):
+            if _p.id() == target_id:
+              _addr = _p.addr()
+              break
+        except Exception:
+          _addr = None
+        _tcp = getattr(self, "tcp_transport", None)
+        _shm = getattr(self, "shm_transport", None)
+        _route, _reason = _choose(
+          self.id, target_id, _addr, len(encoded_payload),
+          shm_registered=bool(_shm is not None and _addr and _shm.is_local_peer(_addr)),
+          tcp_registered=bool(_tcp is not None and _addr and _addr in _tcp._peer_map),
+        )
+        if _route == "tcp-chunked" and _addr is not None and _tcp is not None:
+          routed = await _tcp.send_blob_chunked(_addr, encoded_payload)
+          self._record_transport("tcp-chunked" if routed else "tcp-chunked:fallback")
+        elif _route == "shm" and _addr is not None and _shm is not None:
+          routed = await _shm.send_tensor(
+            request_id, int(target_shard.start_layer), tensor, _addr,
+            metadata={
+              "shard": target_shard.to_dict(),
+              "inference_state": inference_state,
+              "_orchestrator_id": orchestrator_id,
+              "micro_batch_id": 0,
+              "source_stage": int(target_shard.start_layer),
+            },
+          )
+          self._record_transport("shm" if routed else "shm:fallback")
+        else:
+          self._record_transport("bridge")
+      except Exception as e:
+        self._record_transport("bridge:router-error")
+        if DEBUG >= 1:
+          print(f"[TRANSPORT] Router error, using bridge: {e}")
+
+      if not routed:
+        await self.event_router.publish(f"synapse/inference/tensor/{target_id}", {"bin": encoded_payload})
       
       elapsed = time.perf_counter() - start_send
       if target_id not in self._last_forward_latencies:
@@ -1357,6 +1650,51 @@ class Node:
           self._last_forward_latencies[target_id] = 0.7 * self._last_forward_latencies[target_id] + 0.3 * elapsed
           
       return None
+
+  def _transport_counter(self):
+    """Lazy transport_selected counters (B3 observability, no __init__ churn)."""
+    counts = getattr(self, "_transport_counts", None)
+    if counts is None:
+      counts = {}
+      self._transport_counts = counts
+    return counts
+
+  def _record_transport(self, route: str) -> None:
+    try:
+      counts = self._transport_counter()
+      counts[route] = counts.get(route, 0) + 1
+    except Exception:
+      pass
+
+  async def _on_transport_tensor(self, msg, via: str) -> None:
+    """Route a TensorMessage from binary transports into process_tensor.
+
+    The SYNP metadata carries the sender's shard dict (see forward_tensor);
+    SHM senders must include the same "shard" key in metadata. Messages
+    without a shard are dropped explicitly and counted (never silent).
+    """
+    try:
+      meta = msg.metadata or {}
+      shard_d = meta.get("shard")
+      if not isinstance(shard_d, dict):
+        self._record_transport(via + ":drop-no-shard")
+        if DEBUG >= 1:
+          print(f"[TRANSPORT] Dropping {via} tensor without shard metadata "
+                f"(request {getattr(msg, 'request_id', '?')})")
+        return
+      base_shard = Shard.from_dict(shard_d)
+      self._record_transport(via)
+      await self.process_tensor(
+        base_shard,
+        msg.tensor,
+        meta.get("request_id", getattr(msg, "request_id", None)),
+        meta.get("inference_state"),
+        orchestrator_id=meta.get("_orchestrator_id", getattr(msg, "orchestrator_id", None)),
+      )
+    except Exception as e:
+      self._record_transport(via + ":error")
+      if DEBUG >= 1:
+        print(f"[TRANSPORT] Error routing {via} tensor: {e}")
 
   def get_partition_index(self, offset: int = 0, base_shard: Optional[Shard] = None):
     if not self.topology.nodes:
@@ -1752,11 +2090,16 @@ class Node:
         try:
           if hasattr(peer, 'ping') and callable(peer.ping):
             latency_ms = await asyncio.wait_for(peer.ping(timeout=2.0), timeout=3.0)
+            # P2 (was: one peer's ping fanned out to EVERY self->other cell,
+            # masking slow peers behind one fast one): record per-peer only.
             if latency_ms > 0:
-              for nid in node_ids:
-                if nid != self.id:
-                  self._latency_cache[self.id][nid] = latency_ms
-                  self._latency_cache[nid][self.id] = latency_ms
+              try:
+                if peer.id() in self._latency_cache.get(self.id, {}):
+                  self._latency_cache[self.id][peer.id()] = latency_ms
+                if self.id in self._latency_cache.get(peer.id(), {}):
+                  self._latency_cache[peer.id()][self.id] = latency_ms
+              except Exception:
+                pass
               if DEBUG >= 1:
                 print(f"[latency] probed {peer.id()}: {latency_ms:.1f}ms")
           # Bandwidth probe (best-effort): real TCP echo round-trips over the
@@ -1794,12 +2137,17 @@ class Node:
     # Convert the raw {from_node: {to_node: ms}} cache into a LatencyMatrix
     # so compute_partition / HierarchicalClusterer receive the type they
     # expect (LatencyMatrix with .nodes and .entries). Measured bandwidth is
-    # attached to the master->peer entries (NodeResources.bandwidth_mbps is
-    # documented as "measured to master").
+    # attached symmetrically on self<->peer edges (was: master->peer only,
+    # so election weights were view-dependent under asymmetric links).
     matrix = LatencyMatrix()
     for nid in node_ids:
       for other, latency_ms in self._latency_cache.get(nid, {}).items():
-        bw = self._measured_bandwidth.get(other, 0.0) if nid == self.id else 0.0
+        if nid == self.id:
+          bw = self._measured_bandwidth.get(other, 0.0)
+        elif other == self.id:
+          bw = self._measured_bandwidth.get(nid, 0.0)
+        else:
+          bw = 0.0
         matrix.set(LatencyEntry(
           from_node=nid,
           to_node=other,
@@ -1810,9 +2158,38 @@ class Node:
     return matrix
 
   def _setup_p2p_rpc_handlers(self):
-    """Setup listeners for P2P RPC requests (Health, Topology)."""
+    """Setup listeners for P2P RPC requests (Health, Topology, Example)."""
     self.event_router.subscribe(f"synapse/rpc/health/request/{self.id}", self.on_p2p_health_request)
     self.event_router.subscribe(f"synapse/rpc/topology/request/{self.id}", self.on_p2p_topology_request)
+    # C-W5: train=True example RPC had a caller but no handler (always
+    # TimeoutError -> fake 0.0 loss). Reply with the real local loss.
+    self.event_router.subscribe(f"synapse/rpc/example/request/{self.id}", self.on_p2p_example_rpc)
+
+  async def on_p2p_example_rpc(self, event: Event):
+    """Answer a peer's train=True example RPC with the real local loss."""
+    try:
+      data = event.data if isinstance(event.data, dict) else {}
+      response_topic = data.get("_response_topic")
+      shard = Shard.from_dict(data.get("shard"))
+      loss = await self.enqueue_example(
+        shard,
+        self._decode_p2p_array(data.get("example"), data.get("example_shape"), data.get("example_dtype")),
+        self._decode_p2p_array(data.get("target"), data.get("target_shape"), data.get("target_dtype")),
+        self._decode_p2p_array(data.get("length"), data.get("length_shape"), data.get("length_dtype")),
+        True,
+        data.get("request_id"),
+      )
+      if response_topic:
+        await self.event_router.publish(response_topic, {"loss": loss}, origin=self.id)
+    except Exception as e:
+      if DEBUG >= 1:
+        print(f"[P2P] on_p2p_example_rpc failed: {e}")
+      try:
+        response_topic = (event.data or {}).get("_response_topic")
+        if response_topic:
+          await self.event_router.publish(response_topic, {"loss": 0.0, "error": str(e)[:200]}, origin=self.id)
+      except Exception:
+        pass
 
   async def on_p2p_health_request(self, event: Event):
     try:

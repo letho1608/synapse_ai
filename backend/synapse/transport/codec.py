@@ -35,6 +35,111 @@ import numpy as np
 MAGIC = b"SYNP"  # Synapse Protocol magic bytes
 HEADER_SIZE = 16  # 4 magic + 2 dtype + 2 ndim + 8 reserved
 
+# ── Chunked transfer (T1.2) ──────────────────────────────────────
+# Large SYNP blobs are split into 1 MiB chunks so no single frame ever
+# approaches a transport cap. Chunk wire format (after the transport's own
+# length prefix): CHUNK_MAGIC(4) + transfer_id(16) + index(U32) +
+# total(U32) + flags(U8, FINAL=0x01) + payload_len(U32) + payload.
+CHUNK_MAGIC = b"SYNC"
+CHUNK_SIZE = 1024 * 1024  # 1 MiB payload per chunk
+CHUNK_HEADER = struct.Struct("!16sIIBI")
+CHUNK_HEADER_SIZE = CHUNK_HEADER.size  # 29
+CHUNK_FLAG_FINAL = 0x01
+# Negotiated admission: refuse a transfer whose declared total exceeds this
+# instead of buffering unboundedly (DoS guard, H5).
+MAX_BLOB_BYTES = 4 * 1024 * 1024 * 1024
+CHUNK_TIMEOUT_S = 30.0
+
+
+class ChunkRefused(Exception):
+    """Raised when a chunked transfer is refused (oversize admission)."""
+
+
+def split_blob(blob: bytes, transfer_id: bytes,
+               chunk_size: int = CHUNK_SIZE) -> list:
+    """Split a blob into chunk frames. transfer_id must be 16 bytes."""
+    if len(transfer_id) != 16:
+        raise ValueError("transfer_id must be 16 bytes")
+    if not blob:
+        raise ValueError("cannot chunk an empty blob")
+    total = (len(blob) + chunk_size - 1) // chunk_size
+    if len(blob) > MAX_BLOB_BYTES:
+        raise ChunkRefused("blob %d bytes exceeds admission %d" % (len(blob), MAX_BLOB_BYTES))
+    frames = []
+    for idx in range(total):
+        part = blob[idx * chunk_size:(idx + 1) * chunk_size]
+        flags = CHUNK_FLAG_FINAL if idx == total - 1 else 0
+        frames.append(CHUNK_MAGIC + CHUNK_HEADER.pack(
+            transfer_id, idx, total, flags, len(part)) + part)
+    return frames
+
+
+def parse_chunk_frame(frame: bytes):
+    """Parse one chunk frame -> (transfer_id, idx, total, is_final, payload).
+
+    Raises ValueError when the frame is not a chunk frame.
+    """
+    if len(frame) < 4 + CHUNK_HEADER_SIZE or frame[:4] != CHUNK_MAGIC:
+        raise ValueError("not a chunk frame")
+    transfer_id, idx, total, flags, payload_len = CHUNK_HEADER.unpack(
+        frame[4:4 + CHUNK_HEADER_SIZE])
+    payload = frame[4 + CHUNK_HEADER_SIZE:]
+    if len(payload) != payload_len:
+        raise ValueError("chunk payload length mismatch (%d != %d)"
+                         % (len(payload), payload_len))
+    if total <= 0 or idx >= total:
+        raise ValueError("bad chunk index/total (%d/%d)" % (idx, total))
+    if total * CHUNK_SIZE > MAX_BLOB_BYTES + CHUNK_SIZE:
+        raise ChunkRefused("declared transfer exceeds admission")
+    return transfer_id, idx, total, bool(flags & CHUNK_FLAG_FINAL), payload
+
+
+class ChunkReassembler:
+    """Reassemble chunked blobs. One instance per receiver.
+
+    Missing-chunk timeout discards the buffer (never stalls the pipeline);
+    oversize declarations are refused up front (never pre-allocated).
+    """
+
+    def __init__(self, timeout_s: float = CHUNK_TIMEOUT_S):
+        self.timeout_s = timeout_s
+        self._buf: dict = {}  # transfer_id -> {"total":int,"parts":{int:bytes},"ts":float}
+
+    def add(self, transfer_id: bytes, idx: int, total: int,
+            _is_final: bool, payload: bytes):
+        """Add a chunk. Returns the complete blob when all parts arrived."""
+        now = time.time()
+        self.purge(now)
+        entry = self._buf.get(transfer_id)
+        if entry is None:
+            if total * CHUNK_SIZE > MAX_BLOB_BYTES + CHUNK_SIZE:
+                raise ChunkRefused("declared transfer exceeds admission")
+            entry = {"total": total, "parts": {}, "ts": now}
+            self._buf[transfer_id] = entry
+        if entry["total"] != total:
+            return None  # inconsistent retransmit; ignore
+        if idx not in entry["parts"]:
+            entry["parts"][idx] = payload
+            entry["ts"] = now
+        if len(entry["parts"]) == entry["total"]:
+            ordered = b"".join(entry["parts"][i] for i in range(entry["total"]))
+            del self._buf[transfer_id]
+            return ordered
+        return None
+
+    def purge(self, now: Optional[float] = None) -> int:
+        """Discard timed-out transfers. Returns count discarded."""
+        now = now if now is not None else time.time()
+        stale = [tid for tid, e in self._buf.items()
+                 if now - e["ts"] > self.timeout_s]
+        for tid in stale:
+            del self._buf[tid]
+        return len(stale)
+
+    @property
+    def pending(self) -> int:
+        return len(self._buf)
+
 # dtype encoding table
 DTYPE_MAP = {
     np.dtype("float32"): 0,

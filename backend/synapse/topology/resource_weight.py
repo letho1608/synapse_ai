@@ -83,6 +83,9 @@ class NodeResources:
     # Power
     power_limit_w: float = 0.0    # TDP/TGP in watts
     current_power_w: float = 0.0  # current draw
+    # True when power came from the battery-plugged heuristic instead of
+    # NVML (Lane B: estimates must not score as measurements).
+    power_estimated: bool = False
 
     @classmethod
     def from_device_capabilities(cls, dc) -> "NodeResources":
@@ -120,6 +123,7 @@ class NodeResources:
             bandwidth_mbps=bandwidth_metrics.get("bandwidth_mbps", 0.0),
             power_limit_w=power_metrics.get("power_limit_w", 0.0),
             current_power_w=power_metrics.get("current_power_w", 0.0),
+            power_estimated=bool(power_metrics.get("power_estimated", False)),
         )
 
 
@@ -173,11 +177,14 @@ def _measure_disk_io() -> Dict[str, float]:
 
 def _measure_power() -> Dict[str, float]:
     """Measure GPU power using pynvml, or system power via psutil.
-    
-    Returns dict with power_limit_w (TDP) and current_power_w.
+
+    Returns dict with power_limit_w (TDP), current_power_w, and
+    power_estimated (True when the battery-plugged heuristic filled in
+    because NVML was unavailable — estimates, not measurements).
     Falls back to 0 values if no measurement is possible.
     """
-    result = {"power_limit_w": 0.0, "current_power_w": 0.0}
+    result = {"power_limit_w": 0.0, "current_power_w": 0.0,
+              "power_estimated": False}
     if HAS_PYNVML:
         try:
             pynvml.nvmlInit()
@@ -207,6 +214,7 @@ def _measure_power() -> Dict[str, float]:
             if battery is not None:
                 result["current_power_w"] = battery.power_plugged * 50.0  # rough estimate
                 result["power_limit_w"] = result["current_power_w"] * 1.2
+                result["power_estimated"] = True
         except Exception:
             pass
     return result

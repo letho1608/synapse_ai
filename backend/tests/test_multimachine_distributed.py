@@ -123,20 +123,11 @@ async def run_server(port: int):
         if libp2p._bridge._connections:
             peer = list(libp2p._bridge._connections.keys())[0]
             print(f"[SERVER] Peer connected: {peer}")
-            # Send a test message
-            test_event = {
-                "type": "event",
-                "topic": "synapse/test/hello",
-                "data": {"message": f"Hello from {node_id}!", "timestamp": time.time()},
-                "origin": node_id,
-                "timestamp": time.time()
-            }
-            # Write directly to the connection
-            import struct
-            data = json.dumps(test_event).encode('utf-8')
-            _, writer = libp2p._bridge._connections[peer]
-            writer.write(struct.pack("!I", len(data)) + data)
-            await writer.drain()
+            await router.publish(
+                "synapse/test/hello",
+                {"message": f"Hello from {node_id}!", "timestamp": time.time()},
+                origin=node_id,
+            )
             print(f"[SERVER] Sent hello message to {peer}")
             break
     else:
@@ -180,19 +171,12 @@ async def run_client(port: int, target: str):
     async def on_hello(event):
         print(f"[CLIENT] Received hello: {event.data}")
         received_messages.append(event.data)
-        # Reply back
-        reply = {
-            "type": "event",
-            "topic": "synapse/test/reply",
-            "data": {"message": f"Hello back from {node_id}!", "timestamp": time.time()},
-            "origin": node_id,
-            "timestamp": time.time()
-        }
-        import struct
-        for peer_id, (_, writer) in libp2p._bridge._connections.items():
-            data = json.dumps(reply).encode('utf-8')
-            writer.write(struct.pack("!I", len(data)) + data)
-            await writer.drain()
+        await router.publish(
+            "synapse/test/reply",
+            {"message": f"Hello back from {node_id}!", "timestamp": time.time()},
+            origin=node_id,
+        )
+        for peer_id in libp2p._bridge._connections:
             print(f"[CLIENT] Sent reply to {peer_id}")
         finished.set()
 
@@ -317,29 +301,34 @@ async def run_full_cluster(config_data: dict, my_node_id: str, my_port: int):
         print(f"[{my_node_id}] Is master: {election.is_master()}")
         print(f"[{my_node_id}] Current master: {election.current_master_id}")
 
-        # Verify correct election
-        if election.current_master_id == "MACHINE-A":
+        election_ok = election.current_master_id == "MACHINE-A"
+        if election_ok:
             print(f"[{my_node_id}] Election: CORRECT (MACHINE-A should be master)")
         else:
             print(f"[{my_node_id}] Election: UNEXPECTED")
 
         # Test RPC health checks
         print(f"\n[{my_node_id}] === RPC Health Check ===")
+        health_ok = False
         peers = await discovery.discover_peers()
         if peers:
             peer = next((p for p in peers if p.id() == other_id), None)
             if peer:
                 hc_result = await peer.health_check()
+                health_ok = bool(hc_result)
                 print(f"[{my_node_id}] Health check to {other_id}: {'OK' if hc_result else 'FAIL'}")
 
         # Test topology collection
         print(f"\n[{my_node_id}] === Topology Collection ===")
+        topology_ok = False
         if peers:
             peer = next((p for p in peers if p.id() == other_id), None)
             if peer:
                 topo = await peer.collect_topology(set(), max_depth=2)
                 node_ids = list(topo.nodes.keys()) if hasattr(topo, 'nodes') else []
+                topology_ok = other_id in node_ids and getattr(topo, "active_node_id", None) == "MACHINE-A"
                 print(f"[{my_node_id}] Topology nodes: {node_ids}")
+                print(f"[{my_node_id}] Topology active master: {getattr(topo, 'active_node_id', None)}")
 
         # Stay alive for a bit to allow broadcasts
         await asyncio.sleep(3)
@@ -350,8 +339,9 @@ async def run_full_cluster(config_data: dict, my_node_id: str, my_port: int):
         await libp2p.stop()
         await router.stop()
 
-        print(f"\n[{my_node_id}] ===== FULL CLUSTER TEST: PASS =====")
-        return True
+        success = election_ok and health_ok and topology_ok
+        print(f"\n[{my_node_id}] ===== FULL CLUSTER TEST: {'PASS' if success else 'FAIL'} =====")
+        return success
 
     finally:
         try:
@@ -379,9 +369,15 @@ async def main():
     if args.config_based:
         # Shared config mode: run one node, the other runs the same script
         my_id = args.node_id or f"NODE-{args.port}"
+        if my_id == "MACHINE-A":
+            node_a_port, node_b_port = args.port, args.peer_port
+        elif my_id == "MACHINE-B":
+            node_a_port, node_b_port = args.peer_port, args.port
+        else:
+            node_a_port, node_b_port = args.port, args.peer_port
         config = make_config(
-            node_a_id="MACHINE-A", node_a_port=args.port,
-            node_b_id="MACHINE-B", node_b_port=args.peer_port,
+            node_a_id="MACHINE-A", node_a_port=node_a_port,
+            node_b_id="MACHINE-B", node_b_port=node_b_port,
             node_b_host=args.peer_host
         )
         success = await run_full_cluster(config, my_id, args.port)

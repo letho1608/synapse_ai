@@ -1,0 +1,10 @@
+# Windows-only node extras — POINTER FILE, installs nothing by itself.
+#
+# The real lines live in backend/requirements.txt with pip markers:
+#   pywin32; sys_platform == 'win32'
+#   torch-directml; sys_platform == 'win32'
+# Install with: pip install -r backend/requirements.txt   (correct on all OS)
+# Or explicitly: pip install -r backend/requirements-windows.txt
+-r requirements-base.txt
+pywin32
+torch-directml

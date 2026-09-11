@@ -3,7 +3,7 @@ import os
 import urllib.request
 import urllib.error
 from pathlib import Path
-from synapse.helpers import DEBUG
+from synapse.helpers import DEBUG, QUANT_BPP
 
 HF_API = "https://huggingface.co/api/models"
 HF_MODELS_JSON_PATH = Path(os.path.dirname(__file__)) / "config" / "hf_models.json"
@@ -16,22 +16,10 @@ MOE_CONFIGS = {
     "llama4": {"num_experts": 16, "active_experts": 1},
 }
 
-QUANT_BPP = {
-    "F32":    4.0,
-    "F16":    2.0,
-    "BF16":   2.0,
-    "Q8_0":   1.0,
-    "Q6_K":   0.75,
-    "Q5_K_M": 0.625,
-    "Q4_K_M": 0.5,
-    "Q4_0":   0.5,
-    "Q3_K_M": 0.4375,
-    "Q2_K":   0.3125,
-    "AWQ-4bit": 0.5,
-    "GPTQ-Int4": 0.5,
-}
-
 RUNTIME_OVERHEAD = 1.2
+
+# NOTE (B4): bytes-per-param lives in synapse.helpers.QUANT_BPP (single
+# source of truth, values include runtime margin). No local copy here.
 
 def _auth_headers() -> dict:
     headers = {"User-Agent": "synapse-discovery/1.0"}

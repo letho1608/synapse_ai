@@ -386,6 +386,7 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/settings", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/settings/save", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/cluster/resources", self.handle_get_cluster_resources), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/download/progress", self.handle_get_download_progress), {"*": cors_options})
     # Static: PHẢI dùng prefix /_static/ (không dùng "/") vì add_static("/") match mọi path và chỉ cho GET/HEAD -> POST sẽ 405
     # Root route + static assets are registered unconditionally so GET / always
     # serves a real page even when the frontend dev server is not running.
@@ -406,6 +407,10 @@ class ChatGPTAPI:
             self.default_model = data["default_model"].strip()
           if "discovery_module" in data and isinstance(data["discovery_module"], str):
             self.discovery_module = data["discovery_module"].strip()
+          # C-W12: system_prompt round-trips too (server knobs like ports
+          # belong to the launcher argv, not this file — documented).
+          if "system_prompt" in data and isinstance(data["system_prompt"], str):
+            self.system_prompt = data["system_prompt"]
     except Exception:
       pass
 
@@ -431,7 +436,8 @@ class ChatGPTAPI:
       self._settings_path.parent.mkdir(parents=True, exist_ok=True)
       data = {
         "default_model": self.default_model,
-        "discovery_module": getattr(self, "discovery_module", "tailscale")
+        "discovery_module": getattr(self, "discovery_module", "tailscale"),
+        "system_prompt": getattr(self, "system_prompt", ""),
       }
       with open(self._settings_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -477,13 +483,13 @@ class ChatGPTAPI:
       if request.method == "GET" and "distributed/status" in raw_path:
         return await self.handle_get_distributed_status(request)
       # CRITICAL: Always log POST requests to /chat/completions for debugging
-      # Hide polling requests (download/progress, topology) to reduce noise
+      # Hide high-frequency polling requests (topology, node lists) to
+      # reduce noise. Download progress is a REAL route now
+      # (handle_get_download_progress), so it stays visible when failing.
       is_polling_request = (
         request.method == "GET" and (
-          "/v1/download/progress" in request.path or
           "/v1/topology" in request.path or
-          "/v1/network/nodes" in request.path or
-          "/modelpool" in request.path
+          "/v1/network/nodes" in request.path
         )
       )
       
@@ -534,6 +540,12 @@ class ChatGPTAPI:
       return False
 
   async def handle_root(self, request):
+    # T2.1 --headless (via SYNAPSE_HEADLESS=1, set by `synapse serve
+    # --headless`): liveness stub only. API + /healthcheck + /v1/* are
+    # unaffected — this narrows GET / alone, never the server.
+    import os as _os
+    if _os.getenv("SYNAPSE_HEADLESS", "0") == "1":
+      return web.Response(status=204)
     # Serve modular production dashboard (no-cache)
     index_path = self.static_dir / "index.html"
     dashboard_path = self.static_dir / "dashboard.html"
@@ -1432,10 +1444,19 @@ class ChatGPTAPI:
   def _get_partitions_count(self) -> int:
     """Số partition (node) trong topology; 1 = chỉ máy này."""
     try:
+      get_auth = getattr(self.node, "_get_authoritative_partitions", None)
+      if callable(get_auth):
+        partitions = get_auth()
+        if partitions:
+          return len(partitions)
       if not self.node.topology or not self.node.topology.nodes:
-        return 1
+        peers = getattr(self.node, "peers", []) or []
+        return max(1, 1 + len(peers))
       partitions = self.node._compute_lacp_partition()
-      return len(partitions) if partitions else 1
+      if partitions:
+        return len(partitions)
+      peers = getattr(self.node, "peers", []) or []
+      return max(1, len(self.node.topology.nodes), 1 + len(peers))
     except Exception:
       return 1
 
@@ -1443,15 +1464,70 @@ class ChatGPTAPI:
     """Trạng thái phân tán: nhiều node cùng xử lý 1 request (inference/training)."""
     try:
       n = self._get_partitions_count()
-      return web.json_response({
+      payload = {
         "partitions_count": n,
         "multi_node_inference": n > 1,
         "multi_node_training": n > 1,
         "message": "Luồng phân tán: nhiều node (partitions_count > 1).",
-      })
+      }
+      # C-W9: surface in-memory health signals (all optional, getattr-guarded
+      # so older nodes simply omit them). Operators can now observe degraded
+      # recovery, route mix, quant state, and version skew via API.
+      try:
+        node = getattr(self, "node", None)
+        if node is not None:
+          degraded = getattr(node, "_last_recovery_degraded", None)
+          if degraded:
+            payload["recovery_degraded"] = degraded
+          standby = getattr(node, "_last_standby", None)
+          if standby is not None:
+            payload["standby_nodes"] = list(standby)
+          hints = getattr(node, "_last_autoscale_hints", None)
+          if hints:
+            payload["autoscale_hints"] = hints
+          counts = getattr(node, "_transport_counts", None)
+          if counts:
+            payload["transport_counts"] = dict(counts)
+          eng = getattr(node, "inference_engine", None)
+          prof = getattr(eng, "_hw_profile", None)
+          if isinstance(prof, dict):
+            payload["quant_active"] = prof.get("quant_active")
+          bridge = getattr(getattr(node, "libp2p_node", None), "_bridge", None)
+          if bridge is not None:
+            try:
+              from synapse.routing.p2p_socket_bridge import BRIDGE_VERSION as _BV
+              payload["bridge_version"] = _BV
+            except Exception:
+              pass
+            payload["peer_versions"] = {
+              pid: {"bridge_version": h.get("bridge_version"),
+                    "synapse_version": h.get("synapse_version")}
+              for pid, h in (getattr(bridge, "_peer_handshakes", {}) or {}).items()
+            }
+      except Exception:
+        pass
+      return web.json_response(payload)
     except Exception as e:
       if DEBUG >= 2: traceback.print_exc()
       return web.json_response({"detail": str(e)}, status=500)
+
+  async def handle_get_download_progress(self, request):
+    """C-W8: download progress was referenced in middleware but had no route
+    (404 for every poller). Reads the live node_download_progress map."""
+    try:
+      raw = getattr(getattr(self, "node", None), "node_download_progress", {}) or {}
+      progress = {}
+      for node_id, event in raw.items():
+        try:
+          progress[node_id] = event.to_dict() if hasattr(event, "to_dict") else dict(event)
+        except Exception:
+          progress[node_id] = {"status": "unknown"}
+      return web.json_response({"ok": True, "progress": progress})
+    except Exception as e:
+      if DEBUG >= 2:
+        traceback.print_exc()
+      return web.json_response({"ok": False, "progress": {}, "degraded": True,
+                                "detail": str(e)[:200]}, status=500)
 
   async def handle_post_training_distributed(self, request):
     """Training phân tán: chạy job trên node nhận request. Chia tải theo layer (nhiều máy) dùng pipeline khi engine hỗ trợ train()."""

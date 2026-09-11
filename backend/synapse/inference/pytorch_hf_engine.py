@@ -6,6 +6,7 @@ Phân tán: load model từ HF. Danh sách model lấy từ synapse.model_list (
 import asyncio
 import numpy as np
 import inspect
+import os
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -66,6 +67,15 @@ class PyTorchHFInferenceEngine(InferenceEngine):
     - Bật Quantization (4-bit / 8-bit) nếu VRAM thấp
     """
 
+    @staticmethod
+    def _choose_quant(total_vram_gb: float, required_vram: float):
+        """Quant rung selection (T3.4-rung2): '4bit' / '8bit' / None."""
+        if required_vram > 0 and total_vram_gb < (required_vram * 1.2):
+            return "4bit" if total_vram_gb < (required_vram * 0.7) else "8bit"
+        if required_vram == 0.0 and total_vram_gb <= 12.0:
+            return "4bit" if total_vram_gb <= 6.0 else "8bit"
+        return None
+
     def __init__(self, shard_downloader: Optional[Any] = None):
         self.shard_downloader = shard_downloader or HFShardDownloader()
         self.shard: Optional[Shard] = None
@@ -79,12 +89,72 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self._content_kv_cache: Dict[str, Dict[int, Any]] = {}
         # Cache kết quả nhận diện phần cứng để không phải phát hiện lại nhiều lần
         self._hw_profile: Optional[Dict[str, Any]] = None
+        # Per-request incremental KV state (T3.1, SYNAPSE_SEQ_KV=1 only):
+        # request_id -> {"ids": 1-D int64 prefix, "length": int, "cache": dict}.
+        # Reused ONLY when the new input extends the stored prefix exactly,
+        # so decode matches full-refeed math by construction (parity-gated).
+        self._seq_kv: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _seq_kv_enabled() -> bool:
+        """Per-request incremental KV fast path (T3.1).
+
+        Default ON (parity proven token-identical on tiny-GPT2 CPU,
+        fallback on any doubt). SYNAPSE_SEQ_KV=0 restores legacy scan.
+        """
+        return os.getenv("SYNAPSE_SEQ_KV", "1") == "1"
+
+    def _seq_kv_try_hit(self, input_data: np.ndarray, request_id: Optional[str]):
+        """Return (best_len, cache) from per-request state, or (0, {}).
+
+        Hit requires: flag on, token-id (non-float) input, a stored prefix
+        for this request, and byte-exact prefix extension. Hidden-state
+        inputs are never eligible (transport-requantized bytes are unstable).
+        """
+        if not self._seq_kv_enabled() or not request_id:
+            return 0, {}
+        try:
+            if np.issubdtype(input_data.dtype, np.floating):
+                return 0, {}
+            ids = np.ascontiguousarray(input_data).reshape(-1)
+            prev = self._seq_kv.get(request_id)
+            if not isinstance(prev, dict):
+                return 0, {}
+            prev_ids = prev.get("ids")
+            if not isinstance(prev_ids, np.ndarray):
+                return 0, {}
+            plen = int(prev.get("length", 0))
+            if plen <= 0 or len(ids) <= plen:
+                return 0, {}
+            if not np.array_equal(ids[:plen], prev_ids):
+                return 0, {}
+            cache = prev.get("cache")
+            return plen, cache if isinstance(cache, dict) else {}
+        except Exception:
+            return 0, {}
+
+    def _seq_kv_commit(self, input_data: np.ndarray, request_id: Optional[str],
+                       cache: dict) -> None:
+        """Record this call's input + cache for the next incremental step."""
+        if not self._seq_kv_enabled() or not request_id:
+            return
+        try:
+            if np.issubdtype(input_data.dtype, np.floating):
+                return
+            ids = np.ascontiguousarray(input_data).reshape(-1)
+            self._seq_kv[request_id] = {"ids": ids.copy(),
+                                        "length": len(ids), "cache": cache}
+        except Exception:
+            pass
 
     def _get_sequence_hash(self, data: np.ndarray, length: int) -> str:
         """Tạo hash cho một đoạn sequence (ids hoặc hidden states)."""
         import hashlib
         # Dùng byteview để hash nhanh
-        chunk = data[:, :length].copy()
+        if data.ndim == 1:
+            chunk = data[:length].copy()
+        else:
+            chunk = data[:, :length].copy()
         return hashlib.blake2b(chunk.tobytes(), digest_size=16).hexdigest()
 
     @staticmethod
@@ -183,25 +253,21 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                     except Exception:
                         pass
                         
-            # Auto-quantization logic replacing simple cut-offs
-            if required_vram > 0 and total_vram_gb < (required_vram * 1.2):
+            # Auto-quantization rung selection is a pure function (tested).
+            quant_needed = PyTorchHFInferenceEngine._choose_quant(
+                total_vram_gb, required_vram)
+            if quant_needed:
                 try:
-                    import bitsandbytes
-                    if total_vram_gb < (required_vram * 0.7):
-                        profile["load_in_4bit"] = True
-                    else:
-                        profile["load_in_8bit"] = True
+                    import bitsandbytes  # noqa: F401
+                    profile["load_in_4bit"] = quant_needed == "4bit"
+                    profile["load_in_8bit"] = quant_needed == "8bit"
                 except ImportError:
-                    pass
-            elif required_vram == 0.0 and total_vram_gb <= 12.0:
-                try:
-                    import bitsandbytes
-                    if total_vram_gb <= 6.0:
-                        profile["load_in_4bit"] = True
-                    else:
-                        profile["load_in_8bit"] = True
-                except ImportError:
-                    pass
+                    print(f"[PyTorchHF][HW] WARNING: {quant_needed} wanted "
+                          f"(VRAM {total_vram_gb:.1f}GB < req {required_vram:.1f}GB) "
+                          f"but bitsandbytes is not installed -> loading UNQUANTIZED")
+            profile["quant_wanted"] = quant_needed
+            profile["quant_active"] = ("4bit" if profile["load_in_4bit"]
+                                       else ("8bit" if profile["load_in_8bit"] else "none"))
 
             if DEBUG >= 1:
                 quant = "4bit" if profile["load_in_4bit"] else ("8bit" if profile["load_in_8bit"] else "none")
@@ -343,21 +409,34 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         full_seq_len = hidden_states_full.shape[1]
         best_hash = None
         best_len = 0
-        granularity = 16 
+        granularity = 16
+
+        # T3.1 fast path: per-request incremental reuse (exact prefix
+        # extension). Falls through to the hash scan on any doubt.
+        seq_hit = False
+        if request_id:
+            _plen, _pcache = self._seq_kv_try_hit(input_data, request_id)
+            if _plen > 0:
+                best_len, cache = _plen, _pcache
+                seq_hit = True
+                if DEBUG >= 2: print(f"[Cache] SeqHit! Reusing prefix length {best_len}")
         
-        # Search for longest cached prefix
-        for l in range(full_seq_len - 1, 0, -1):
-            if l % granularity == 0 or l == full_seq_len - 1:
-                h = self._get_sequence_hash(input_data, l)
-                if h in self._content_kv_cache:
-                    best_hash = h
-                    best_len = l
-                    break
+        # Search for longest cached prefix (skipped on a seq-hit: the
+        # per-request prefix is exact, no granularity-limited rescan).
+        if not seq_hit:
+            for l in range(full_seq_len - 1, 0, -1):
+                if l % granularity == 0 or l == full_seq_len - 1:
+                    h = self._get_sequence_hash(input_data, l)
+                    if h in self._content_kv_cache:
+                        best_hash = h
+                        best_len = l
+                        break
 
         if best_len > 0:
             hidden_states = hidden_states_full[:, best_len:, :]
             past_len = best_len
-            cache = self._content_kv_cache[best_hash]
+            if not seq_hit:
+                cache = self._content_kv_cache[best_hash]
             if DEBUG >= 2: print(f"[Cache] Hit! Reusing prefix length {best_len}")
         else:
             hidden_states = hidden_states_full
@@ -406,6 +485,8 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 if request_id not in self._request_cache_hashes:
                     self._request_cache_hashes[request_id] = []
                 self._request_cache_hashes[request_id].append(new_hash)
+                # T3.1: record this call for the next incremental step.
+                self._seq_kv_commit(input_data, request_id, cache)
 
             if not shard.is_last_layer():
                 return hidden_states.float().cpu().numpy()
@@ -423,9 +504,12 @@ class PyTorchHFInferenceEngine(InferenceEngine):
 
     def clear_cache(self, request_id: Optional[str] = None):
         if request_id:
-            # For content-based caching, we don't necessarily clear on request end.
-            # We could prune if memory is tight.
-            pass
+            # T3.1: per-request incremental state MUST die with the request,
+            # otherwise a later request reusing the id inherits stale KVs.
+            # (The shared content-hash dict is intentionally kept: it is
+            # keyed by content, not by request.)
+            self._seq_kv.pop(request_id, None)
+            self._request_cache_hashes.pop(request_id, None)
         else:
             self._content_kv_cache.clear()
             self._request_cache_hashes.clear()
@@ -580,8 +664,63 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 traceback.print_exc()
             raise RuntimeError(f"PyTorchHF infer_tensor: {e}") from e
 
-    async def load_checkpoint(self, shard: Shard, path: str) -> None:
-        pass
+    async def load_checkpoint(self, shard: Shard, path: str) -> bool:
+        """Restore weights from a directory written by save_checkpoint.
+
+        Returns True only when weights were actually restored. Returns False
+        (loudly, never silently) for metadata-only JSON checkpoints, missing
+        paths, or any load failure — red-team B1: a silent pass let failover
+        report success while resuming from scratch.
+
+        Scope: full-model directory restore. Sharded partial-range restore
+        (loading only [start_layer, end_layer] weights) is NOT implemented;
+        callers serving a partial shard must treat False as degraded resume
+        (see Node.check_fault_tolerance).
+        """
+        try:
+            import os
+            if not path or not os.path.isdir(path):
+                if DEBUG >= 1:
+                    print(f"[PyTorchHF] load_checkpoint: no weights at {path!r} "
+                          f"(metadata-only or missing) -> restore no-op")
+                return False
+            names = set(os.listdir(path))
+            has_config = "config.json" in names
+            has_weights = any(
+                n == "pytorch_model.bin" or n.endswith(".safetensors") or n.endswith(".bin")
+                for n in names
+            )
+            if not (has_config and has_weights):
+                if DEBUG >= 1:
+                    print(f"[PyTorchHF] load_checkpoint: {path!r} is not a weight "
+                          f"dir -> restore no-op")
+                return False
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import asyncio as _aio
+            hw = self._detect_hardware_profile(shard.model_id)
+            kw: Dict[str, Any] = {
+                "trust_remote_code": True,
+                "attn_implementation": hw["attn_implementation"],
+                "torch_dtype": hw["torch_dtype"],
+                "local_files_only": True,
+            }
+            loop = _aio.get_event_loop()
+            self.tokenizer = await loop.run_in_executor(
+                None, lambda: AutoTokenizer.from_pretrained(path, trust_remote_code=True,
+                                                            local_files_only=True))
+            self._model = await loop.run_in_executor(
+                None, lambda: AutoModelForCausalLM.from_pretrained(path, **kw))
+            if hw["device"] == "cuda" and "device_map" not in kw:
+                self._model = self._model.to("cuda")
+            self._model_id = shard.model_id
+            self.shard = shard
+            if DEBUG >= 1:
+                print(f"[PyTorchHF] load_checkpoint: restored weights from {path!r}")
+            return True
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"[PyTorchHF] load_checkpoint failed for {path!r}: {e} -> restore no-op")
+            return False
 
     async def save_checkpoint(self, shard: Shard, path: str) -> None:
         if self._model is not None and self.tokenizer is not None:

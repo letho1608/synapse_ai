@@ -11,7 +11,6 @@ if TYPE_CHECKING:
 
 
 class InferenceEngine(ABC):
-  session = {}
 
   @abstractmethod
   async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
@@ -30,13 +29,25 @@ class InferenceEngine(ABC):
     pass
 
   @abstractmethod
-  async def load_checkpoint(self, shard: Shard, path: str):
-    pass
+  async def load_checkpoint(self, shard: Shard, path: str) -> bool:
+    """Restore weights; True only when weights were really restored (B1)."""
+    return False
 
   async def save_checkpoint(self, shard: Shard, path: str):
     pass
 
+  _train_warned = False
+  _evaluate_warned = False
+
   async def train(self, request_id: str, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray, backgrad: Optional[np.ndarray] = None, loss: str = "forward", sync_gradients: bool = False) -> Tuple[Optional[float], Optional[np.ndarray]]:
+      # Lane B: base default is a silent (None, None). Warn once so a
+      # training caller ignoring the loss can tell "unimplemented" apart
+      # from "zero loss". Subclass overrides are unaffected.
+      if not InferenceEngine._train_warned:
+        InferenceEngine._train_warned = True
+        if DEBUG >= 1:
+          print("[InferenceEngine] train() base default used (no-op) — "
+                "override in subclass for real training")
       return None, None
 
   async def apply_gradient_updates(self, shard: Shard, updates: dict) -> None:
@@ -45,13 +56,11 @@ class InferenceEngine(ABC):
   async def evaluate(self, request_id: str, shard: Shard, example: np.ndarray, target: np.ndarray, length: np.ndarray) -> Optional[float]:
       """Đánh giá (eval) phân tán. Subclass nên override."""
       # Default: chỉ forward, không tính loss
+      if not InferenceEngine._evaluate_warned:
+        InferenceEngine._evaluate_warned = True
+        if DEBUG >= 1:
+          print("[InferenceEngine] evaluate() base default used (no-op)")
       return None
-
-  async def save_session(self, key, value):
-    self.session[key] = value
-
-  async def clear_session(self):
-    self.session.clear()
 
   async def infer_prompt(self, request_id: str, shard: Shard, prompt: str, inference_state: Optional[dict] = None) -> tuple[np.ndarray, Optional[dict]]:
     tokens = await self.encode(shard, prompt)

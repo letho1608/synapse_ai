@@ -27,6 +27,7 @@
     "min_vram_gb": 0.5,
     "quantization": "Q4_K_M",
     "context_length": 512,
+    "num_hidden_layers": 5,
     "use_case": "Lightweight, edge deployment",
     "pipeline_tag": "text-generation",
     "architecture": "gpt2",

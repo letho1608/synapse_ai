@@ -137,56 +137,79 @@ class LatencyProber:
     # and echoes whatever size the prober sends.
     PROBE_SIZE = 65536  # 64 KiB probe packets
     PROBE_COUNT = 5     # number of probes per measurement
+    # EWMA smoothing for bandwidth/latency across probe rounds (P1): a single
+    # slow sample used to swing the mean ~20%. Per-target state lives on the
+    # prober instance; first sample initializes (no warmup bias).
+    EWMA_ALPHA = 0.3
+    EWMA_MAX_DEVIATION = 0.5  # ignore samples >50% away until 3 agree
+
+    def __init__(self):
+        self._ewma: dict = {}  # addr -> {"bw":float,"rtt":float,"rounds":int}
+
+    async def _probe_once(self, address: str, timeout: float):
+        """One 64 KiB echo round-trip. Returns (rtt_ms, bw_mbps) or None."""
+        host, port_str = address.split(":")
+        port = int(port_str)
+        t0 = time.perf_counter()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+        try:
+            probe_data = struct.pack("!dQ", time.time(), random.getrandbits(64))
+            writer.write(probe_data + b"\x00" * (self.PROBE_SIZE - len(probe_data)))
+            await writer.drain()
+            t1 = time.perf_counter()
+            await asyncio.wait_for(
+                reader.readexactly(self.PROBE_SIZE), timeout=timeout
+            )
+            rtt = (time.perf_counter() - t1) * 1000
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        transfer_time_s = rtt / 1000.0
+        bw = (self.PROBE_SIZE * 8 * 2) / (transfer_time_s * 1_000_000) if transfer_time_s > 0 else 0.0
+        return rtt, bw
+
+    def _smooth(self, address: str, rtt_ms: float, bw_mbps: float):
+        """EWMA update with variance gate. Returns (rtt_ms, bw_mbps)."""
+        st = self._ewma.get(address)
+        if st is None:
+            self._ewma[address] = {"bw": bw_mbps, "rtt": rtt_ms, "rounds": 1}
+            return rtt_ms, bw_mbps
+        st["rounds"] += 1
+        if st["bw"] > 0 and abs(bw_mbps - st["bw"]) / st["bw"] > self.EWMA_MAX_DEVIATION \
+                and st["rounds"] < 3:
+            return st["rtt"], st["bw"]
+        a = self.EWMA_ALPHA
+        st["bw"] = a * bw_mbps + (1 - a) * st["bw"]
+        st["rtt"] = a * rtt_ms + (1 - a) * st["rtt"]
+        return st["rtt"], st["bw"]
 
     async def probe(self, node_id: str, address: str, timeout: float = 2.0) -> Optional[LatencyEntry]:
-        """Probe a single target node. Returns LatencyEntry or None on failure."""
-        latencies = []
-        bandwidths = []
+        """Probe a single target node. Returns LatencyEntry or None on failure.
 
-        for _ in range(self.PROBE_COUNT):
-            try:
-                host, port_str = address.split(":")
-                port = int(port_str)
-
-                t0 = time.perf_counter()
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=timeout
-                )
-                connect_time = (time.perf_counter() - t0) * 1000
-
-                # Send probe with timestamp
-                probe_data = struct.pack("!dQ", time.time(), random.getrandbits(64))
-                writer.write(probe_data + b"\x00" * (self.PROBE_SIZE - len(probe_data)))
-                await writer.drain()
-
-                # Read echo
-                t1 = time.perf_counter()
-                echo = await asyncio.wait_for(
-                    reader.readexactly(self.PROBE_SIZE), timeout=timeout
-                )
-                rtt = (time.perf_counter() - t1) * 1000
-
-                writer.close()
-                await writer.wait_closed()
-
-                latencies.append(rtt)
-
-                # Bandwidth estimate: payload bytes moved in both directions
-                # (request + echo) over the measured round-trip window —
-                # a transfer-time-based figure, not a latency-only proxy.
-                transfer_time_s = rtt / 1000.0
-                if transfer_time_s > 0:
-                    bw = (self.PROBE_SIZE * 8 * 2) / (transfer_time_s * 1_000_000)
-                    bandwidths.append(bw)
-
-            except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-                continue
-
-        if not latencies:
+        The 5 samples run CONCURRENTLY (was: sequential, ~5x wall time and
+        connect-serialization bias). Size/count/protocol unchanged, so the
+        bridge echo path is untouched. Returned latency/bandwidth are
+        EWMA-smoothed across rounds; loss/jitter computed from this round.
+        """
+        try:
+            results = await asyncio.gather(
+                *(self._probe_once(address, timeout) for _ in range(self.PROBE_COUNT)),
+                return_exceptions=True)
+        except Exception:
             return None
-
+        samples = [r for r in results if isinstance(r, tuple)]
+        if not samples:
+            return None
+        latencies = [r[0] for r in samples]
         avg_lat = sum(latencies) / len(latencies)
-        avg_bw = sum(bandwidths) / len(bandwidths) if bandwidths else 0.0
+        raw_bw_samples = [r[1] for r in samples]
+        raw_bw = sum(raw_bw_samples) / len(raw_bw_samples) if raw_bw_samples else 0.0
+        sm_lat, sm_bw = self._smooth(address, avg_lat, raw_bw)
 
         # Jitter = stddev of latency
         if len(latencies) > 1:
@@ -201,9 +224,9 @@ class LatencyProber:
         return LatencyEntry(
             from_node=node_id,
             to_node=address,
-            latency_ms=avg_lat,
+            latency_ms=sm_lat,
             jitter_ms=jitter,
-            bandwidth_mbps=avg_bw,
+            bandwidth_mbps=sm_bw,
             packet_loss_pct=loss * 100,
         )
 

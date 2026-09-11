@@ -1,0 +1,33 @@
+# Lane 2 — Transport + Checkpoint (synapse_ai)
+
+Scope: PLAN.md C4 (JSON bridge, 256MiB cap, no chunking/TLS) + C2 (shared-FS checkpoint). No code changed.
+
+## 1. Transport audit (file:line)
+Three transports, one hot path:
+- **P2P bridge** `routing/p2p_socket_bridge.py`: `[4B BE len][1B type]+JSON UTF-8` (types 0x01-0x05, `:11-15`), 256MiB cap configurable (`:22,52-59`), explicit `frame_too_large` error (`:505-514`, `_send_error :524-545`, surfaced in `_last_errors`). **Live hot path** — `forward_tensor` (`orchestration/node.py:1317-1361`) wraps SYNP binary as `{"bin":...}` over event_router → bridge re-hex-encodes (~2x overhead: `.hex()` in `_json_serialize :409-427`, reversed `:472-486`). Gradients same path (`pipeline/node_extension.py:470-489`).
+- **Binary TCP** `transport/tcp_transport.py` + `codec.py` (SYNP `!4sHHII` 16B header `:130-137`, dtype table `:39-48` — no bf16/f64, lz4/zlib opt-in >64KiB, `AsyncTensorForwarder` buffers per request `:236-381` but stalls on loss with no NACK): started+registered yet **never called by forward_tensor**. Cap 100MiB silent-drop (`:84-87`).
+- **SHM** `transport/shm_transport.py`: 512MiB refuse-False (`:196-200`), same-machine-only, in-process notify (`:69,98-104`) — `send_tensor→False` fallback has no caller since nothing routes through it. Same-node short-circuit in-process (`node.py:1332-1333`) is the only zero-copy that fires.
+- Routing decision as coded: TCP registers all peers, SHM same-machine (`node.py:1443-1469`, `shm_transport.py:50-62`), but send side ignores both. Bridge `_broadcast_packet` (`:391-407`) sequential `drain()` = head-of-line blocking. Oversize frame kills that stream's read loop (`:436-438`).
+- Nagle: TCP transport sets NODELAY everywhere (`:55-58,75-79,143-148`, tested); **bridge never sets it** → live traffic Nagle-enabled. README "Nagle disabled" true only of idle fast path.
+- No TLS anywhere (grep ssl/TLS empty on all three transports; bare `start_server`/`open_connection`). README:162 admits trusted-LAN-only.
+
+## 2. Checkpoint audit (file:line)
+Three writers: (1) per-step JSON metadata when multi-node (`pipeline/node_extension.py:134-177`, hooks `:447-448,:693-695`, per-model step counter `:159-160`); (2) manual safetensors weights (`orchestration/node.py:1099-1121`, via `engine.save_checkpoint`); (3) LoRA outputs (unrelated). `CHECKPOINT_INTERVAL=30.0` (`fault_tolerance.py:99`) **dead** — monitor loop only does liveness (`:356-371`); inference-only clusters write nothing.
+A1 seam: monitor flags `_pending_rebalance` → `check_fault_tolerance` (`node.py:500-510`) → `rebalance_after_failure` (`fault_tolerance.py:278-347`, stages into `_recovery_checkpoints[target] :334-339`) → `node.py:543-575` consumes + `engine.load_checkpoint` — but stager/loader/survivor assumed same node (no identity check), and `PyTorchHF.load_checkpoint` is `pass` (`pytorch_hf_engine.py:586-587`) while save persists `save_pretrained` (`:589-596`). Recovery restores metadata, not weights.
+Shared-dir gap: `save` writes `{node}_{model}_L{s}-{e}_step{n}.ckpt` (`:152-185`); `load_latest_checkpoint` scans local dir (`:215-245`); cross-machine = `None` → cold start, only missing log line. README:164 concedes. No manifest/hash/lock; key-filtered load (`:241,272`) drops skewed fields silently.
+
+## 3. Proposal — 3 increments (bridge framing untouched, new types only)
+- **Inc 1 — chunked TCP**: `CHUNK_HEADER !IIBI` (transfer_id/chunk_idx/flags/len, 13B) + 1MiB chunks of SYNP bytes; offer/accept (`tensor_offer/accept/reject`) on bridge topic; `ChunkReassembler` beside `AsyncTensorForwarder`; 30s missing-chunk discard + reject; cap policy → no per-frame cap, admission default refuse >4GiB; **bridge NODELAY one-liner**. Touch: `tcp_transport.py`, `codec.py`, `node.py:forward_tensor`, new `test_tcp_chunked_transfer.py` (300MiB round-trip), README:121,166. Accept: 300MiB delivers, no `frame_too_large`, <1MiB fast path ≤5% regression.
+- **Inc 2 — auto-route**: `transport/router.py::choose_transport` (self→in-process; SHM if local+small; chunked TCP if peer mapped; else bridge fallback) wired into activation+gradient sends; unregister departed peers; idle-TTL close ~60s. Cross-process SHM notify deferred (same layout). Touch: new router, `node.py:forward_tensor+_register_transport_peers`, `node_extension.py` grad path, `test_transport_autoroute.py`, README:119-121. Accept: same-machine `shm_sends=1`, cross-machine TCP chunks, dead peer evicted within heartbeat timeout.
+- **Inc 3 — P2P checkpoint pull + manifest**: sidecar `{node}_{model}.manifest.json` (tmp+rename, step/files/sha256); bridge types 0x06-0x08 (REQUEST/META/CHUNK over TCP); `prefer_local_then_pull` wrapper (local→pull→shared-dir fallback); weight-pull lands file, logs `restore no-op` until engine implements; `tls_wrap.py` pass-through + `--tls off` default + fp pinning field (flag flip later). Touch: `fault_tolerance.py`, new `checkpoint_pull.py`, bridge types + handshake fp, `test_ckpt_p2p_pull.py` (separate tmpdirs, sha match), README:162,164. Accept: cross-dir recovery passes, bad sha rejected, `--tls off` byte-identical.
+
+## 4. Borrow (transport+checkpoint only)
+DO: protobuf framing per-stream + 1-byte stream multiplex/additive types + B2B direct worker paths + demand-gossip pattern for ckpt-holder announce + FTW hashed manifest + quarantine admission (mesh-llm DESIGN.md; FreeToken checkpoint/). NOT: QUIC wholesale, one-model-router, console/mobile/MoA/plugins, CUDA kernels, pickle (RCE — JSON+safetensors only, negative test).
+
+## 5. Risks
+Critical: pull-path RCE (mitigate: no pickle, sha-verify-before-apply); reassembly OOM (admission cap 4GiB, per-transfer bound, 30s discard). High: INT8-forced quality misattributed to transport (carry quantize flag in offer; exact-dtype default for TCP); SHM view lifetime vs 256-LRU eviction; bridge HOL blocking offers. Medium: bf16/f64 reject (explicit, not silent); interval-save disk growth (metadata-only, retention 3); TLS flag-flip breaks mixed mesh (ALPN-style version now). Low: probe-echo heuristic collision with 0x06-0x08; `is_same_machine` NAT false-positives.
+
+## Summary
+Three transports, one live (bridge JSON+hex ~2x); caps inconsistent (256 explicit-loss / 100 silent / 512 refuse); Nagle off on idle path only; no TLS. Checkpoints: 3 writers, dead 30s constant, stage+apply same-node, engine restore no-op, shared-dir assumption. Fix: chunked TCP + real auto-route + manifest P2P pull, TLS staged off. Borrow framing/stream/direct/manifest patterns; refuse QUIC/router/dashboards/CUDA.
+
+**Confidence: 7/10. Ground-truth tally: 26 of 29 load-bearing claims verified against shipped source.**

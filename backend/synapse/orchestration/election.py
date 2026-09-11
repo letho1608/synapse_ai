@@ -89,6 +89,7 @@ class ElectionManager:
 
         self.active_nodes[node_id] = {
             "weight": data.get("weight", 0.0),
+            "current_master_id": data.get("current_master_id"),
             "last_seen": event.timestamp,
         }
 
@@ -108,7 +109,8 @@ class ElectionManager:
 
                 await self.event_router.publish("synapse/cluster/election", {
                     "node_id": self.node_id,
-                    "weight": self.compute_weight
+                    "weight": self.compute_weight,
+                    "current_master_id": self.current_master_id,
                 })
 
                 now = asyncio.get_event_loop().time()
@@ -132,8 +134,18 @@ class ElectionManager:
                         logger.info(f"Node {self.node_id} recognizes {self.current_master_id} as Master")
                 elif self.current_master_id == self.node_id:
                     if new_master_id != self.node_id:
-                        logger.info(f"Node {self.node_id} is still Master (stickiness active)")
-                    self.current_master_id = self.node_id
+                        peer_claim = all_candidates[new_master_id].get("current_master_id")
+                        if peer_claim == new_master_id:
+                            logger.info(
+                                f"Node {self.node_id} recognizes {new_master_id} as Master "
+                                "after confirmed higher-weight claim"
+                            )
+                            self.current_master_id = new_master_id
+                        else:
+                            logger.info(f"Node {self.node_id} is still Master (stickiness active)")
+                            self.current_master_id = self.node_id
+                    else:
+                        self.current_master_id = self.node_id
                 elif self.current_master_id in self.active_nodes:
                     # Current master is still alive: stickiness prevents
                     # flapping. Never reassign the master while it is online —

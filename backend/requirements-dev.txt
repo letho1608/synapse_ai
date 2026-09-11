@@ -1,0 +1,4 @@
+# Packaging / dev extras. NOT needed to serve shards.
+nuitka
+scapy
+pytest>=6.0

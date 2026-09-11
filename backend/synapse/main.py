@@ -4,6 +4,7 @@ import atexit
 import signal
 import json
 import os
+import sys
 import time
 import traceback
 import uuid
@@ -16,7 +17,7 @@ from synapse.routing.libp2p_node import Libp2pNode
 
 from synapse.api import ChatGPTAPI
 # REFACTORED IMPORTS
-from synapse.loading import ShardDownloader, RepoProgressEvent, create_local_model_loader, get_models_dir
+from synapse.loading import ShardDownloader, RepoProgressEvent, get_models_dir
 from synapse.helpers import find_available_port, DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, terminal_link, shutdown, check_model_hardware_fit
 from synapse.inference.shard import Shard
 from synapse.inference.inference_engine import get_inference_engine
@@ -54,15 +55,11 @@ parser.add_argument("--iters", type=int, default=100, help="Training iterations"
 parser.add_argument("--save-every", type=int, default=5, help="Save the model every N iterations.")
 parser.add_argument("--data", type=str, default="synapse/train/data/lora", help="Directory where training data lives")
 parser.add_argument("--batch-size", type=int, default=1, help="Minibatch size.")
-parser.add_argument("--resume-checkpoint", type=str, default=None, help="Path to a custom checkpoint to load")
 parser.add_argument("--save-checkpoint-dir", type=str, default="checkpoints", help="Path to a folder where checkpoints are stored")
 parser.add_argument("--node-id", type=str, default=None, help="Node ID")
 parser.add_argument("--node-host", type=str, default="0.0.0.0", help="Node host")
 parser.add_argument("--node-port", type=int, default=50051, help="Node port")
-parser.add_argument("--models-seed-dir", type=str, default=None, help="Model seed directory")
 parser.add_argument("--listen-port", type=int, default=5678, help="Listening port for discovery")
-parser.add_argument("--download-quick-check", action="store_true", help="Quick check local path for model shards download")
-parser.add_argument("--max-parallel-downloads", type=int, default=8, help="Max parallel downloads for model shards download")
 parser.add_argument("--broadcast-port", type=int, default=5678, help="Broadcast port for discovery")
 parser.add_argument("--discovery-module", type=str, choices=["udp", "tailscale", "manual"], default="tailscale", help="Discovery module to use")
 parser.add_argument("--discovery-timeout", type=int, default=30, help="Discovery timeout in seconds")
@@ -86,17 +83,36 @@ except ImportError:
     pass
 
 # Tailscale API key: Provide your API key here (loaded from .env)
-# Can be overridden with --tailscale-api-key
-TAILSCALE_API_KEY_DEFAULT = os.getenv("TAILSCALE_API_KEY", "")
+# Can be overridden with --tailscale-api-key. Canonical names (see
+# helpers.get_tailscale_env, also used by Node): TAILSCALE_API_KEY.
+TAILSCALE_API_KEY_DEFAULT = os.getenv("TAILSCALE_API_KEY", "") or os.getenv("TS_API_KEY", "")
 parser.add_argument("--tailscale-api-key", type=str, default=TAILSCALE_API_KEY_DEFAULT, help="Tailscale API key (from .env or passed as arg)")
 # Tailnet name: Provide your tailnet name here (loaded from .env)
-# Can be overridden with --tailnet-name
-TAILNET_NAME_DEFAULT = os.getenv("TAILNET_NAME", "")
+# Can be overridden with --tailnet-name. Canonical: TAILSCALE_TAILNET
+# (aliases TS_TAILNET, legacy TAILNET_NAME).
+TAILNET_NAME_DEFAULT = (os.getenv("TAILSCALE_TAILNET", "") or os.getenv("TS_TAILNET", "")
+                        or os.getenv("TAILNET_NAME", ""))
 parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (from .env or passed as arg)")
 parser.add_argument("--node-id-filter", type=str, default=None, help="Comma separated list of allowed node IDs (only for UDP and Tailscale discovery)")
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
 parser.add_argument("--system-prompt", type=str, default="Bạn là trợ lý Synapse AI. Hãy luôn trả lời bằng tiếng Việt một cách hữu ích và chính xác.", help="System prompt for the ChatGPT API")
+parser.add_argument("--log-format", type=str, choices=["text", "json"], default=None,
+                    help="Log encoding: text (default) or json (one JSON object per stdout line, for scripts/CI). "
+                         "Falls back to SYNAPSE_LOG_FORMAT env.")
+parser.add_argument("--headless", action="store_true",
+                    help="Disable the TUI and narrow GET / to a liveness stub (sets SYNAPSE_HEADLESS=1). "
+                         "API/logs/healthcheck/API+/v1/* are unaffected.")
 args = parser.parse_args()
+
+# C-W7/M4 stdout discipline: JSONL on stdout when requested via flag or env.
+# Human-readable output stays on stderr. Installed before any other print.
+import os as _os
+_log_format = args.log_format or _os.getenv("SYNAPSE_LOG_FORMAT", "text")
+if _log_format == "json":
+    from synapse.logging_json import install_stdout_json_redirect
+    install_stdout_json_redirect()
+if args.headless:
+    _os.environ["SYNAPSE_HEADLESS"] = "1"
 
 system_info = get_system_info()
 
@@ -118,7 +134,28 @@ allowed_interface_types = args.interface_type_filter.split(',') if args.interfac
 
 # Initialize P2P Infrastructure
 event_router = EventRouter()
-libp2p_node = Libp2pNode(args.node_id, args.node_port or 5678, event_router)
+# Item 5: TLS activation (default OFF = plaintext, byte-identical).
+# SYNAPSE_TLS=require|selfsigned + SYNAPSE_TLS_CERT/KEY(/CA): contexts are
+# built here and fail LOUD on missing files (never silent plaintext).
+_tls_mode = os.getenv("SYNAPSE_TLS", "off").strip().lower()
+_tls_server_ctx = _tls_client_ctx = _tls_fp = None
+if _tls_mode in ("selfsigned", "require"):
+    from synapse.transport.tls_wrap import (
+        build_client_context, build_server_context, fingerprint_bytes)
+    _tls_cert = os.getenv("SYNAPSE_TLS_CERT", "")
+    _tls_key = os.getenv("SYNAPSE_TLS_KEY", "")
+    _tls_ca = os.getenv("SYNAPSE_TLS_CA", "")
+    _tls_server_ctx = build_server_context(_tls_cert, _tls_key)
+    _tls_client_ctx = build_client_context(cafile=_tls_ca or None)
+    with open(_tls_cert, "rb") as _f:
+        _tls_fp = fingerprint_bytes(_f.read())
+    if DEBUG >= 1:
+        print(f"[TLS] mode={_tls_mode} fp={(_tls_fp or '')[:16]}...")
+# C-W3: --node-host actually binds the P2P listener now (was parsed, ignored).
+libp2p_node = Libp2pNode(args.node_id, args.node_port or 5678, event_router,
+                         host=args.node_host or "0.0.0.0",
+                         ssl_server_ctx=_tls_server_ctx,
+                         ssl_client_ctx=_tls_client_ctx, tls_fp=_tls_fp)
 
 topology_viz = TopologyViz(chatgpt_api_endpoints=chatgpt_api_endpoints, web_chat_urls=web_chat_urls) if not args.disable_tui else None
 # LACP multi-resource partitioning is built into Node via compute_partition()
@@ -133,7 +170,9 @@ try:
     if os.path.isfile(settings_path):
         with open(settings_path, "r", encoding="utf-8") as f:
             settings_data = json.load(f)
-            if "discovery_module" in settings_data and settings_data["discovery_module"]:
+            if ("--discovery-module" not in sys.argv
+                and "discovery_module" in settings_data
+                and settings_data["discovery_module"]):
                 args.discovery_module = settings_data["discovery_module"]
 except Exception as e:
     if DEBUG >= 1: print(f"Failed to read settings.json for discovery_module: {e}")
@@ -148,7 +187,8 @@ if args.discovery_module == "udp":
         args.broadcast_port,
         create_peer_handle,
         allowed_node_ids=allowed_node_ids,
-        allowed_interface_types=allowed_interface_types
+        allowed_interface_types=allowed_interface_types,
+        discovery_timeout=args.discovery_timeout,
     )
 elif args.discovery_module == "tailscale":
     discovery = TailscaleDiscovery(
@@ -157,7 +197,8 @@ elif args.discovery_module == "tailscale":
         create_peer_handle,
         tailscale_api_key=args.tailscale_api_key,
         tailnet=args.tailnet_name,
-        allowed_node_ids=allowed_node_ids
+        allowed_node_ids=allowed_node_ids,
+        discovery_timeout=args.discovery_timeout,
     )
 elif args.discovery_module == "manual":
     discovery = ManualDiscovery(
@@ -429,11 +470,34 @@ async def main():
         return
       else:
         if DEBUG >= 1: print(f"[INFO] Model '{model_name}' ready. Waiting for API requests...")
-      
+
       try:
         await asyncio.Event().wait()
       except (asyncio.CancelledError, KeyboardInterrupt):
         await node.stop()
+    elif args.command == "eval":
+      # C-W2: eval was parsed but fell through to idle serve. Wire it.
+      model_name = args.model_name or args.default_model
+      if not model_name:
+        print("[ERROR] Model name is required")
+        return
+      await eval_model_cli(node, model_name,
+                           lambda _encode: load_dataset(args.data),
+                           args.batch_size)
+      await node.stop()
+      return
+    elif args.command == "train":
+      # C-W2: train was parsed but fell through to idle serve. Wire it.
+      model_name = args.model_name or args.default_model
+      if not model_name:
+        print("[ERROR] Model name is required")
+        return
+      await train_model_cli(node, model_name,
+                            lambda _encode: load_dataset(args.data),
+                            args.batch_size, args.iters,
+                            args.save_every, args.save_checkpoint_dir)
+      await node.stop()
+      return
     else:
       try:
         if DEBUG >= 1: print("[SERVER] System running. Listening for requests...")

@@ -57,6 +57,32 @@ def _check_gpu_environment() -> None:
         print("  => CONCLUSION: System will run on CPU.\n")
 
 def run():
+    # C-W11: --no-frontend was a documented no-op; it now maps to headless
+    # (TUI off + GET / stub) with a one-release deprecation warning.
+    if "--no-frontend" in sys.argv:
+        print("[DEPRECATION] --no-frontend is renamed to the headless mode "
+              "(CLI: serve --headless, backend: --headless / SYNAPSE_HEADLESS=1).",
+              file=sys.stderr)
+        os.environ["SYNAPSE_HEADLESS"] = "1"
+    # T2.1 CLI-first: subcommands route to synapse.cli; everything else keeps
+    # the legacy passthrough below (incl. --no-frontend no-op).
+    # Global flags may precede the subcommand (either order works).
+    _cli_cmds = ("serve", "join", "client", "status", "topology", "models",
+                 "benchmark")
+    _goes_to_cli = (len(sys.argv) > 1 and sys.argv[1] in _cli_cmds
+                    or len(sys.argv) > 2 and sys.argv[1] in (
+                        "--port", "--log-format", "--headless")
+                    and any(a in _cli_cmds for a in sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "--version":
+        from synapse.helpers import VERSION
+        print("synapse %s" % VERSION)
+        return
+    if _goes_to_cli:
+        from synapse.cli import main as cli_main
+        # Normalize global-first order onto the canonical subcommand-first
+        # form argparse understands (parents accept both, this is just for
+        # the legacy argv[1] check above on re-entry — no-op otherwise).
+        sys.exit(cli_main(sys.argv[1:]))
     parser = argparse.ArgumentParser(description="Universal Synapse Launcher")
     # Retained for CLI compatibility: the web UI is a backend-served static
     # dashboard (no Node.js dev server), so this flag is a no-op.

@@ -18,6 +18,7 @@ import json
 import socket
 import struct
 import time
+import uuid
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 from collections import deque
 
@@ -26,12 +27,21 @@ from synapse.transport.codec import (
     TensorMessage,
     encode_tensor,
     decode_tensor,
+    CHUNK_MAGIC,
+    CHUNK_TIMEOUT_S,
+    MAX_BLOB_BYTES,
+    ChunkReassembler,
+    ChunkRefused,
+    parse_chunk_frame,
+    split_blob,
 )
 from synapse.helpers import DEBUG
 
 
 # Frame format: 4-byte length prefix + binary payload
 FRAME_HEADER = struct.Struct("!I")
+# Single (unchunked) frames stay bounded: bigger blobs must use send_blob_chunked.
+MAX_SINGLE_FRAME_BYTES = 100 * 1024 * 1024
 
 
 class TCPServer:
@@ -42,6 +52,9 @@ class TCPServer:
         self.port = port
         self._server: Optional[asyncio.AbstractServer] = None
         self._on_frame: Optional[Callable[[bytes], None]] = None
+        self._reassembler = ChunkReassembler()
+        self.chunks_completed = 0
+        self.chunks_refused = 0
 
     def set_frame_handler(self, handler: Callable[[bytes], None]):
         self._on_frame = handler
@@ -81,17 +94,57 @@ class TCPServer:
             while True:
                 header = await reader.readexactly(FRAME_HEADER.size)
                 length = FRAME_HEADER.unpack(header)[0]
-                if length > 100 * 1024 * 1024:
+                if length > MAX_BLOB_BYTES:
+                    # Admission: never buffer unboundedly; drop the connection
+                    # loudly instead of hanging on a hostile length prefix.
                     if DEBUG >= 1:
-                        print(f"[TCP] Frame too large ({length} bytes), dropping")
+                        print(f"[TCP] Frame length {length} exceeds admission "
+                              f"{MAX_BLOB_BYTES}, dropping connection")
                     break
                 data = await reader.readexactly(length)
-                if self._on_frame:
-                    self._on_frame(data)
+                self._dispatch_frame(data)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
-            writer.close()
+            try:
+                writer.close()
+            except RuntimeError:
+                pass  # event loop already closed during teardown
+
+    def _dispatch_frame(self, data: bytes):
+        """Route one frame: chunk frames reassemble, SYNP frames pass through.
+
+        Oversize single frames are skipped (explicit) instead of killing the
+        read loop — only the transfer is lost, never the connection.
+        """
+        if data[:4] == CHUNK_MAGIC:
+            try:
+                tid, idx, total, _final, payload = parse_chunk_frame(data)
+            except ChunkRefused:
+                self.chunks_refused += 1
+                if DEBUG >= 1:
+                    print("[TCP] Chunk transfer refused (admission)")
+                return
+            except ValueError as e:
+                if DEBUG >= 1:
+                    print(f"[TCP] Bad chunk frame, skipping: {e}")
+                return
+            try:
+                complete = self._reassembler.add(tid, idx, total, _final, payload)
+            except ChunkRefused:
+                self.chunks_refused += 1
+                return
+            if complete is None:
+                return
+            self.chunks_completed += 1
+            data = complete
+        elif len(data) > MAX_SINGLE_FRAME_BYTES:
+            if DEBUG >= 1:
+                print(f"[TCP] Single frame {len(data)} bytes exceeds "
+                      f"{MAX_SINGLE_FRAME_BYTES}, skipping (use chunked send)")
+            return
+        if self._on_frame:
+            self._on_frame(data)
 
 
 class TCPClientPool:
@@ -247,3 +300,28 @@ class TensorTCPTransport:
             )
 
         return await self.forwarder.send(msg)
+
+    async def send_blob_chunked(
+        self,
+        target_addr: str,
+        blob: bytes,
+        transfer_id: Optional[bytes] = None,
+    ) -> bool:
+        """Send an arbitrarily large SYNP blob as 1 MiB chunks (T1.2).
+
+        Small blobs go as ONE chunk frame (same code path, no special case).
+        Returns False when the peer is unreachable or the blob is refused;
+        the caller must fall back to the event-mesh path (never silent loss:
+        the fallback still logs transport_selected).
+        """
+        try:
+            tid = transfer_id if transfer_id is not None else uuid.uuid4().bytes
+            frames = split_blob(blob, tid)
+        except (ValueError, ChunkRefused) as e:
+            if DEBUG >= 1:
+                print(f"[TCP] Chunked send refused: {e}")
+            return False
+        for frame in frames:
+            if not await self.client_pool.send(target_addr, frame):
+                return False
+        return True

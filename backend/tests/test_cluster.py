@@ -153,12 +153,14 @@ def run_p2p_cluster_test(model_name: str, prompt: str):
         log(f"Starting NODE-A (Master Candidate - STRONG) on P2P {NODE_A_PORT}...", "START")
         proc_a, log_a_fh = _start_node(NODE_A_ID, NODE_A_PORT, NODE_A_API_PORT, model_name,
                                        os.path.join(temp_dir, "node_a.log"), config_path,
-                                       env={"SYNAPSE_MOCK_CAPABILITIES": json.dumps(MOCK_STRONG)})
+                                       env={"SYNAPSE_MOCK_CAPABILITIES": json.dumps(MOCK_STRONG),
+                                            "SYNAPSE_TEST_MODE": "1"})
 
         log(f"Starting NODE-B (Worker - WEAK) on P2P {NODE_B_PORT}...", "START")
         proc_b, log_b_fh = _start_node(NODE_B_ID, NODE_B_PORT, NODE_B_API_PORT, model_name,
                                        os.path.join(temp_dir, "node_b.log"), config_path,
-                                       env={"SYNAPSE_MOCK_CAPABILITIES": json.dumps(MOCK_WEAK)})
+                                       env={"SYNAPSE_MOCK_CAPABILITIES": json.dumps(MOCK_WEAK),
+                                            "SYNAPSE_TEST_MODE": "1"})
 
         log("Waiting for nodes to initialize API services...", "WAIT")
         if not _wait_for_api(f"http://127.0.0.1:{NODE_A_API_PORT}") or \

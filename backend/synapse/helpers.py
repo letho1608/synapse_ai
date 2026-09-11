@@ -16,7 +16,7 @@ import traceback
 
 DEBUG = int(os.getenv("DEBUG", default="0"))
 DEBUG_DISCOVERY = int(os.getenv("DEBUG_DISCOVERY", default="0"))
-VERSION = "0.0.1"
+VERSION = "0.1.0"
 
 
 def _get_mac_address() -> str:
@@ -78,13 +78,18 @@ def get_system_info():
 # Model Weight Analysis (ported from llmit/llmfit_core)
 # ---------------------------------------------------------------------------
 
-# Quantization bytes-per-parameter table
-_QUANT_BPP = {
+# Quantization bytes-per-parameter table — SINGLE SOURCE OF TRUTH (B4).
+# model_discovery imports this (no local copy); values include a runtime
+# margin, so fit advice stays conservative. Do not fork this table.
+QUANT_BPP = {
     "F32": 4.0, "F16": 2.0, "BF16": 2.0,
     "Q8_0": 1.05, "Q6_K": 0.80, "Q5_K_M": 0.68,
     "Q4_K_M": 0.58, "Q4_0": 0.58, "Q3_K_M": 0.48, "Q2_K": 0.37,
+    "AWQ-4bit": 0.55, "GPTQ-Int4": 0.55,
     "mlx-4bit": 0.55, "mlx-8bit": 1.0,
 }
+# Legacy private alias (same object, do not diverge).
+_QUANT_BPP = QUANT_BPP
 _QUANT_HIERARCHY = ["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "Q2_K"]
 _QUANT_SPEED = {
     "F16": 0.6, "BF16": 0.6, "Q8_0": 0.8, "Q6_K": 0.95,
@@ -139,6 +144,48 @@ def _score_fit(mem_required: float, mem_available: float) -> str:
 
 def _fit_emoji(fit: str) -> str:
     return {"Perfect": "🟢", "Good": "🟡", "Marginal": "🟠", "Too Tight": "🔴"}.get(fit, "⚪")
+
+
+def get_tailscale_env():
+    """Canonical Tailscale credentials (C-W10).
+
+    Reads TAILSCALE_API_KEY (alias TS_API_KEY) and TAILSCALE_TAILNET
+    (aliases TS_TAILNET, then legacy TAILNET_NAME). Both backend/main.py
+    and Node.get_tailscale_nodes() must use this — never divergent names.
+    Returns (api_key, tailnet), empty strings when unset.
+    """
+    api_key = (os.getenv("TAILSCALE_API_KEY", "")
+               or os.getenv("TS_API_KEY", ""))
+    tailnet = (os.getenv("TAILSCALE_TAILNET", "")
+               or os.getenv("TS_TAILNET", "")
+               or os.getenv("TAILNET_NAME", ""))
+    return api_key, tailnet
+
+
+def get_all_local_ips() -> set:
+    """All local IPv4 addresses, incl. loopback (B1: single copy).
+
+    Canonical home of the former _get_all_local_ips() triple in
+    udp_discovery / tailscale_discovery / p2p_socket_bridge.
+    """
+    ips = set()
+    try:
+        for _nic, addrs in psutil.net_if_addrs().items():
+            for a in addrs:
+                if getattr(socket, "AF_INET", None) and a.family == socket.AF_INET and a.address:
+                    ips.add(a.address.strip())
+    except Exception:
+        pass
+    if not ips:
+        try:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+        except Exception:
+            pass
+    ips.add("127.0.0.1")
+    return ips
 
 
 def _load_model_db() -> list:

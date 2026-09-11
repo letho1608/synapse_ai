@@ -57,8 +57,9 @@ class ResourceManagerRegistry:
             
             self.managers["cpu_ram_kv"] = CPURAMKVCacheManager()
             self.managers["disk_cache"] = DiskEmbeddingsCacheManager()
-            # Multi-GPU và Preload cần config, để None làm placeholder
-            self.managers["multi_gpu"] = None
+            # Multi-GPU needs config: registered lazily by setup_multi_gpu()
+            # only (a None placeholder here would advertise a manager that
+            # get_multi_gpu() can never return). Preload needs none.
             self.managers["preload"] = PreloadManager()
         except ImportError as e:
             # Dependencies chưa được cài đặt

@@ -1,5 +1,7 @@
 import pytest
 from synapse.api.chatgpt_api import ChatGPTAPI
+from synapse.topology.partitioning_strategy import Partition
+from typing import Optional, List
 from unittest.mock import MagicMock
 from aiohttp.test_utils import make_mocked_request, TestClient, TestServer
 import json
@@ -9,6 +11,10 @@ from pathlib import Path
 class MockNode:
     def __init__(self):
         self.id = "mock_node_1"
+        self.topology = MagicMock()
+        self.topology.nodes = {}
+        self.peers = []
+        self.authoritative_partitions: Optional[List[Partition]] = None
         self._current_metrics = MagicMock()
         self._current_metrics.cpu_util_pct = 10.0
         self._current_metrics.ram_util_pct = 20.0
@@ -18,6 +24,12 @@ class MockNode:
         self._current_metrics.gpu_power_w = 50.0
         self._current_metrics.gpu_temp_c = 45.0
         self.on_token = MagicMock()
+
+    def _compute_lacp_partition(self):
+        return []
+
+    def _get_authoritative_partitions(self, base_shard=None):
+        return self.authoritative_partitions
 
 @pytest.mark.asyncio
 async def test_get_system_info():
@@ -72,3 +84,34 @@ async def test_root_falls_back_to_bundled_page_when_frontend_missing():
     assert resp.status == 200
     assert '<html' in resp.text.lower()
     assert 'Synapse' in resp.text
+
+
+@pytest.mark.asyncio
+async def test_distributed_status_uses_authoritative_partition():
+    node = MockNode()
+    node.authoritative_partitions = [
+        Partition("mock_node_1", 0.0, 0.5),
+        Partition("peer", 0.5, 1.0),
+    ]
+    api = ChatGPTAPI(node=node, inference_engine_classname="PyTorchEngine")
+
+    resp = await api.handle_get_distributed_status(make_mocked_request('GET', '/v1/distributed/status'))
+    data = json.loads(resp.text or "{}")
+
+    assert resp.status == 200
+    assert data["partitions_count"] == 2
+    assert data["multi_node_inference"] is True
+
+
+@pytest.mark.asyncio
+async def test_distributed_status_falls_back_to_peer_count_before_topology_converges():
+    node = MockNode()
+    node.peers = [MagicMock()]
+    api = ChatGPTAPI(node=node, inference_engine_classname="PyTorchEngine")
+
+    resp = await api.handle_get_distributed_status(make_mocked_request('GET', '/v1/distributed/status'))
+    data = json.loads(resp.text or "{}")
+
+    assert resp.status == 200
+    assert data["partitions_count"] == 2
+    assert data["multi_node_inference"] is True

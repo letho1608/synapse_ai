@@ -1,53 +1,7 @@
-aiofiles
-aiohttp
-aiohttp-cors
-beautifulsoup4
-yfinance
-feedparser
-pytz
-duckduckgo-search
-google-api-python-client
-google-auth
-google-generativeai
-grpcio
-jinja2
-numpy
-nuitka
-nvidia-ml-py
-opencv-python
-opentelemetry-api
-pandas
-pillow
-plotly
-prometheus-client
-protobuf
-psutil
-pydantic
-pygame
-pywin32
-requests==2.33.1
-urllib3==2.0.7
-charset-normalizer==3.4.7
-
-rich
-rich
-scapy
-setuptools
-tqdm
-transformers
-torch
-peft
-datasets
-accelerate
-anyio
-# py-libp2p removed - not available on PyPI, project uses custom P2PSocketBridge instead
-torch-directml
-loguru
-
-bitsandbytes
-
-# LACP Dependencies
-pulp>=2.7.0
-scipy>=1.10.0
-scikit-learn>=1.3.0
-diskcache>=5.6.0
+# Default node install = base + Windows-only lines (pip markers).
+# Slim extras (opt-in):
+#   Assistant/viz tools : backend/requirements-tools.txt
+#   Packaging/dev       : backend/requirements-dev.txt
+-r requirements-base.txt
+pywin32; sys_platform == 'win32'
+torch-directml; sys_platform == 'win32'  # DirectML GPU path is Windows-only

@@ -140,3 +140,40 @@ async def test_stickiness_prevents_split_brain():
     finally:
         await a.stop()
         await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_late_stronger_master_claim_converges_startup_split_brain():
+    """A weaker node can self-elect before it hears the stronger node during
+    startup; once the stronger peer confirms its own master claim, both nodes
+    must converge instead of sticking to split-brain forever."""
+    from synapse.orchestration.election import ElectionManager
+    from synapse.routing import EventRouter
+
+    router = EventRouter()
+    weak = ElectionManager("node-b", router, compute_weight=6.0, dynamic_weight=False)
+    strong = ElectionManager("node-a", router, compute_weight=60.0, dynamic_weight=False)
+    weak.TICK_INTERVAL = 0.1
+    strong.TICK_INTERVAL = 0.1
+
+    await router.start()
+    await weak.start()
+    try:
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if weak.current_master_id == "node-b":
+                break
+        assert weak.current_master_id == "node-b"
+
+        await strong.start()
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if weak.current_master_id == strong.current_master_id == "node-a":
+                break
+
+        assert weak.current_master_id == "node-a"
+        assert strong.current_master_id == "node-a"
+    finally:
+        await weak.stop()
+        await strong.stop()
+        await router.stop()

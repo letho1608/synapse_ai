@@ -90,6 +90,30 @@ class DistributedInferenceSession:
         self.total_tokens_generated = 0
         self.is_finished = False
         self.error: Optional[Exception] = None
+        # T3.1 (foundation, engine integration pending GPU): per-stage
+        # cached context length. Stages never exchange KV bytes — only these
+        # lengths plus delta tokens. commit_stage_lengths() advances after a
+        # verified step; truncate_stages() rewinds every stage past a
+        # speculation divergence point (rollback protocol).
+        self.kv_cached_len: Dict[int, int] = {}
+
+    def commit_stage_lengths(self, lengths: Dict[int, int]) -> None:
+        """Record verified per-stage cached lengths (monotonic)."""
+        for stage, length in lengths.items():
+            if length is None:
+                continue
+            prev = self.kv_cached_len.get(stage, 0)
+            if length > prev:
+                self.kv_cached_len[stage] = length
+
+    def truncate_stages(self, to_len: int) -> Dict[int, int]:
+        """Rewind every tracked stage to to_len. Returns {stage: dropped}."""
+        dropped: Dict[int, int] = {}
+        for stage, cached in list(self.kv_cached_len.items()):
+            if cached > to_len:
+                dropped[stage] = cached - to_len
+                self.kv_cached_len[stage] = to_len
+        return dropped
 
 
 class DistributedPipelineController:
@@ -386,10 +410,10 @@ class DistributedPipelineController:
         microbatch_id: int = 0,
     ) -> None:
         topic = f"synapse/inference/tensor/{target_node_id}"
-        
-        # Use INT8 quantization for hidden states to slash bandwidth on slow links
-        is_hidden_states = np.issubdtype(input_data.dtype, np.floating)
-        quantize = is_hidden_states 
+
+        # B4: exact-dtype default; INT8 only with explicit opt-in.
+        from synapse.transport.router import should_quantize
+        quantize = should_quantize(str(input_data.dtype))
         
         encoded_payload = encode_tensor(
             input_data,
@@ -529,10 +553,10 @@ class DistributedPipelineController:
                     if next_stage_idx < len(partition_assignments):
                         next_node_id, next_shard = partition_assignments[next_stage_idx]
                         topic = f"synapse/inference/tensor/{next_node_id}"
-                        
-                        # Use INT8 for hidden states
-                        is_hidden_states = np.issubdtype(result.data.dtype, np.floating)
-                        quantize = is_hidden_states
+
+                        # B4: exact-dtype default; INT8 only with explicit opt-in.
+                        from synapse.transport.router import should_quantize as _should_q2
+                        quantize = _should_q2(str(result.data.dtype))
                         
                         encoded_payload = encode_tensor(
                             result.data,

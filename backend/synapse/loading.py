@@ -85,32 +85,3 @@ def get_checkpoints_dir(model_id: str = ""):
     if model_id:
         return base / ("models--" + model_id.replace("/", "--")) / "checkpoints"
     return base
-
-
-class LocalModelLoader(ShardDownloader):
-
-    def __init__(self):
-        self._on_progress = AsyncCallbackSystem[str, tuple[Shard, RepoProgressEvent]]()
-        self.models_dir = get_models_dir()
-        if DEBUG >= 1:
-            print(f"LocalModelLoader initialized. Models dir: {self.models_dir}")
-
-    @property
-    def on_progress(self) -> AsyncCallbackSystem[str, tuple[Shard, RepoProgressEvent]]:
-        return self._on_progress
-
-    async def ensure_shard(self, shard: Shard, inference_engine_name: str) -> Path:
-        model_id = shard.model_id
-        models_path = self.models_dir / ("models--" + model_id.replace("/", "--"))
-        if models_path.exists():
-            snapshots = list(models_path.glob("snapshots/*"))
-            if snapshots:
-                return snapshots[0]
-        return models_path
-
-    async def get_shard_download_status(self, inference_engine_name: str):
-        yield None
-
-
-def create_local_model_loader() -> ShardDownloader:
-    return LocalModelLoader()

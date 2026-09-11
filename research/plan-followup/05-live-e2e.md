@@ -1,0 +1,40 @@
+# Lane 5 — Live E2E + Observability (synapse_ai, gate C1)
+
+Scope: C1 production gate. No code changed. Date 2026-09-11.
+
+## 1. Test reality (file:line)
+Taxonomy: A pure in-process · B real-socket loopback same-host · C manual 2-machine script · D timing-model/simulation. NOTHING is measured automated cross-machine inference/training E2E (PLAN C1, README:168).
+- `test_multinode_lacp_flow.py:1-190` = A: `_DummyEngine`, direct `_build_latency_matrix`/`_compute_lacp_partition`, `_FakePeer 127.0.0.1` SHM loopback. Type-safety only.
+- `test_cluster_inprocess.py:1-244` = B: "Full in-process" (`:1-5`), `127.0.0.1:5878/79`, temp ManualDiscovery, fixed weights, 10× loopback health. Wiring only.
+- `test_multimachine_distributed.py:1-404` = C: only 2-physical-host file; direct mode hello/reply dicts (no model/tensor/tokens); full-cluster adds election/RPC/topology asserts, never prompt/forward/kill/timing; `make_config` defaults `127.0.0.1` (loopback can masquerade); no --model/prompt/artifact; 30-60s manual windows. Connectivity smoke, not gate.
+- `run_ralph_distributed_verify.py:1-229` = B: two subprocesses same host (`5990/91`, `+100`), pass = "PASS" in output; Phase 3 runs simultaneous+inprocess scripts. Process-boundary only.
+- `measure_real_tcp_tiny_cluster.py:1-163` = B closest-to-real: TINY-A/B loopback `:6370/71`, tiny-random-GPT2 both engines, shards 0-1/2-4 of 5, warmup, 3 full vs 3 sharded forwards → JSON (tok/s, overhead, max_abs_diff, argmax_match). Same-process, random weights, n=3, single forward (no TTFT/decode), no partitioner/election/failover/CLI/API.
+- `measure_real_hf_sharding.py` = single-process no-net (numeric sanity only).
+- `benchmark_cluster_speedup.py:1-105` = D: closed-form `compute_speedup` (stage/net/serial scalars, hardcoded 2.0/0.5/0.1ms) → 9-row table = README:144-154. Tests pin arithmetic, not perf. Honest label "simulated timing model" (README:156); quoting 1.21x-3.44x as measured = false.
+- `benchmark_distributed_3node.py` = B+D: real 3-node loopback mesh (`5981-83`), fake compute `sleep(delays)`, synthetic tps. Overlap logic only.
+- `benchmark_real_3node.py:1-222` = B CPU random-weights: 4-layer Qwen2.5 config random-init, layers (0-1),(2),(3), CPU fp32, GEN_TOKENS=3, hidden states via `.tolist()` JSON (not SYNP) — serialization overstated vs prod, understated vs GPU. Single-host.
+- `benchmark_adaptive_quant.py` = D: `SimulatedNetwork` sleep(150ms/2Mbps fictional). Hypothetical only.
+API truth (`api/chatgpt_api.py:341-395`): `/v1/cluster/resources :388` EXISTS; `/v1/topology`+`/topology :352-353` EXISTS; `/v1/distributed/status :354` EXISTS but fragile (middleware shim `:475-478`; peer-count fallback `:1432-1449` can claim multi-node pre-convergence — gate requires identical shard ranges, not flag); `/v1/cluster/status` = P2P topic (`main.py:237,250,261`, `node.py:141,700`), NOT HTTP (README no longer claims it); `/v1/cluster/latency` DOES NOT EXIST (matrix only inside topology payload); serve/join/status/topology/benchmark + `--log-format json` + `--headless` DO NOT EXIST (launchers: `main.py:59-96`, `backend/synapse/main.py:50-100`; `--no-frontend` no-op `:63`; `--disable-tui` default True `:76`).
+Observability today: `monitoring/realtime.py:31-78` 3s in-memory sensor (no history/correlation/export); `viz/topology_viz.py` rich TUI (default off, unparseable); `frontend/index.html` static liveness (out of scope per Part E); `handle_get_system_stats :1477-1620` single-node only, no peer/request timings.
+
+## 2. Live runbook (2-3 physical hosts, LAN/Tailscale)
+Prereqs: 2-3 physical hosts (record GPU/VRAM/driver), same Python/commit/requirements/HF env; ONE small released ckpt pre-pulled everywhere (record repo+rev; never measure cold-download); open TCP 5678/50051/52415; NTP sync (<100ms skew); SHARED-NOTHING (local `checkpoints/` each — exposes real behavior); ports free. Trusted network only (plaintext per README:162; Tailscale preferred).
+Config: identical `cluster_config.json` (manual discovery = deterministic). Launch per host: `python main.py --discovery-module manual --discovery-config-path ./cluster_config.json --node-id node-gpu-01 --node-port 5678 --chatgpt-api-port 52415 --partition-method lrm` (Tailscale IPs or `--discovery-module tailscale` + key; key never logged).
+Convergence: poll `/v1/topology` + `/v1/distributed/status` + `/v1/cluster/resources` until same peer set + same master + `partitions_count==N` + identical shard ranges 3× stable.
+Metrics (fixed prompts 32/128/512 tok, max_tokens 64, temp 0, stream, 5 reps + 1 warmup): M1 mesh formation ≤60s LAN/≤120s Tailscale (disagreement = fail); M2 TTFT distributed ≤2× single-node (report both; pipeline rarely helps TTFT); M3 sustained tok/s ≥ single-node (parity passes; regression fails); M4 failover ≤30s kill-non-master→survivor-first-token + `partitions_count` N−1 new ranges (repeat killing master; any manual copy/restart = fail); M5 training tiny-LoRA no-hang/no-divergence (report, not speed gate); M6 temp-0 text identity 5/5 single-vs-distributed (any silent wrong token = hard fail).
+Artifacts/host: rev, freeze, nvidia-smi, addrs, Tailscale status, full logs, config copy, curl snapshots pre/post phase, request JSONL (prompt hash, TTFT, tok/s, per-token ts, shard map, failover ts), bench per-stage timings, PASS/FAIL per M1-M6 with numbers.
+
+## 3. Observability (CLI-first, additive, curl-able today)
+Commands (proposed): `serve/join/client/status/topology/models/benchmark` — read-only = thin GET wrappers, no new logic. `--log-format json` JSONL: `{ts RFC3339ms, level, node_id, event(request.start|token.first|token.batch|request.done|peer.connected|peer.lost|rebalance.start|rebalance.done|checkpoint.write|checkpoint.load|partition.computed), request_id(join key), peer_id, prompt/completion_tokens, ttft_ms, tokens_per_s, stage_ms, net_rtt_ms, payload_bytes, partitions_count, master, shard, msg}`; TUI→stderr; `rebalance.start/done` delta = failover seconds; no tensor prints.
+Metrics: keep 3 endpoints + add `latency_ms` N×N + `probed_at`, `master/partitions[]/topology_age_s`, `checkpoint_step/last_rebalance_ts`; add `GET /v1/benchmark/last` when cheap. NOT: Prometheus/Grafana, React, mobile, MoA.
+Benchmark contract `benchmark_live_cluster.py`/`synapse benchmark --api-urls --model --prompts --max-tokens 64 --reps 5 --out results.jsonl [--kill-test]`: warmup discarded; per rep streaming chunk times → TTFT+tok/s + serving partition map attached; per-rep + summary (mean/p50/p95 × prompt-len, single-vs-dist columns, kill gap); nonzero exit on temp-0 mismatch or partition disagreement; projections require `measured:true` + raw table.
+
+## 4. Blockers
+P0 gate-invalidating: shared-FS checkpoint (M4 detector — hand-copy = C1 fail); plaintext transport (label trusted-only, prefer Tailscale-WG); no automated cross-machine harness (loopback-default script + loopback ralph; C1 needs §3.4); optimistic status (shim+fallback — require shard-range identity).
+P1 distorters: JSON+hex+256MiB (record payload_bytes/cap errors; oversize invalidates tok/s compare); SHM same-host only (never compare SHM-loopback vs LAN-TCP); full-context refeed (short fixed prompts, label "without KV reuse"); 64KiB×5 lower-bound probe (record matrix, treat imbalance as noise); in-repo benchmarks are NOT baselines (formula/sleep/random-weights/.tolist — live gate starts at zero).
+P2 friction: hand-assembled flags + print-scrape + 3-endpoint polling (tee logs); manual per-node model pull (stage downloads first); discovery/firewall exactness (mismatch = silent non-formation); frontend liveness-only.
+
+## Summary
+All distributed evidence = in-process/loopback; only multi-machine script = hello-dicts, no model/timings; nearest measurement = tiny-random loopback n=3 single-forward; speedups = formula; 3/4 benchmarks sleep/random; HTTP `/v1/cluster/status|latency` don't exist; no E-CLI. Runbook + CLI-first observability + benchmark contract above make C1 reproducible; P0s must clear/waive before any production claim.
+
+**Confidence: 8/10. Ground-truth tally: 22 files, ~35 line ranges inspected; multi-host run not executed (no 2nd host).**

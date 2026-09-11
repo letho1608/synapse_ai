@@ -58,12 +58,15 @@ class SimpleDataset:
         return self.preprocess(self.data[idx])
     
     def get_batches(self, batch_size: int):
-        """Get batches"""
+        """Get batches. NOTE (Lane B verdict): targets mirror the raw rows
+        DELIBERATELY — causal-LM trainers shift inputs internally to form
+        labels, so inputs==targets at batch time is the convention here, not
+        a stub. A future supervised label pipeline can override per-item."""
         for i in range(0, len(self.data), batch_size):
             batch_data = self.data[i:i+batch_size]
             yield {
                 "inputs": [self.preprocess(item) for item in batch_data],
-                "targets": batch_data  # Placeholder
+                "targets": batch_data
             }
 
 

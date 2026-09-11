@@ -12,13 +12,18 @@ class Libp2pNode:
     for cross-process event relay.
     """
     def __init__(self, node_id: str, port: int, event_router: Any,
-                 max_frame_size: int = None):
+                 max_frame_size: int = None,
+                 ssl_server_ctx=None, ssl_client_ctx=None, tls_fp=None,
+                 host: str = "0.0.0.0"):
         self.node_id = node_id
         self.port = port
         self.event_router = event_router
         if max_frame_size is None:
             max_frame_size = DEFAULT_MAX_FRAME_SIZE
-        self._bridge = P2PSocketBridge(node_id, port, event_router, max_frame_size=max_frame_size)
+        self._bridge = P2PSocketBridge(node_id, port, event_router, max_frame_size=max_frame_size,
+                                       ssl_server_ctx=ssl_server_ctx,
+                                       ssl_client_ctx=ssl_client_ctx, tls_fp=tls_fp,
+                                       bind_host=host or "0.0.0.0")
         self._running = False
 
     async def start(self, bootstrap_peers: List[str] = None):

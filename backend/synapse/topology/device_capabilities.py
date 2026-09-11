@@ -213,14 +213,21 @@ async def device_capabilities() -> DeviceCapabilities:
     Detect hardware capabilities. This replaces the old windows_device_capabilities().
     Uses the full cross-platform detection logic ported from llmit.
     """
-    # Mocking for testing (LACP heterogeneous cluster tests)
+    # Mocking for testing (LACP heterogeneous cluster tests).
+    # GATED (Lane B): honored only with SYNAPSE_TEST_MODE=1, and loudly —
+    # an env leak in production must never silently fake all hardware.
     mock_caps_env = os.getenv("SYNAPSE_MOCK_CAPABILITIES")
     if mock_caps_env:
-        try:
-            import json
-            return DeviceCapabilities.from_dict(json.loads(mock_caps_env))
-        except Exception:
-            pass
+        if os.getenv("SYNAPSE_TEST_MODE", "0") != "1":
+            print("[device_capabilities] WARNING: SYNAPSE_MOCK_CAPABILITIES "
+                  "ignored (SYNAPSE_TEST_MODE != 1)")
+        else:
+            try:
+                import json
+                print("[device_capabilities] TEST MODE: using mocked capabilities")
+                return DeviceCapabilities.from_dict(json.loads(mock_caps_env))
+            except Exception:
+                pass
 
     import psutil
 

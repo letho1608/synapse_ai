@@ -158,20 +158,6 @@ async def get_device_attributes(device_id: str, api_key: str) -> Tuple[str, int,
   return "", 0, DeviceCapabilities(model="", chip="", memory=0, flops=DeviceFlops(fp16=0, fp32=0, int8=0), cpu_cores=0, disk_gb=0, system_ram_mb=0)
 
 
-def parse_device_attributes(data: Dict[str, str]) -> Dict[str, Any]:
-  result = {}
-  prefix = "custom:synapse_"
-  for key, value in data.items():
-    if key.startswith(prefix):
-      attr_name = key.replace(prefix, "")
-      if attr_name in ["node_id", "node_port", "device_capability_chip", "device_capability_model"]:
-        # Đảm bảo value không phải None trước khi gọi replace
-        result[attr_name] = (value or "").replace('_', ' ')
-      elif attr_name in ["device_capability_memory", "device_capability_flops_fp16", "device_capability_flops_fp32", "device_capability_flops_int8"]:
-        result[attr_name] = float(value)
-  return result
-
-
 def sanitize_attribute(value: str) -> str:
   # Replace invalid characters with underscores
   if value is None:

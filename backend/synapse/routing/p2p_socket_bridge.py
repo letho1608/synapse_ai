@@ -6,13 +6,40 @@ import time
 from typing import Dict, List, Set, Any, Optional, Tuple
 from loguru import logger
 from synapse.routing.event_router import EventRouter, Event
-from synapse.helpers import DEBUG
+from synapse.helpers import DEBUG, get_all_local_ips as _get_all_local_ips
 
 PACKET_TYPE_EVENT = 0x01
 PACKET_TYPE_HANDSHAKE = 0x02
 PACKET_TYPE_PING = 0x03
 PACKET_TYPE_PONG = 0x04
 PACKET_TYPE_ERROR = 0x05
+# Checkpoint-pull control plane (T1.1). Registered here so old peers can
+# identify (and ignore) them; handlers live in transport/checkpoint_pull.py.
+PACKET_TYPE_CKPT_REQUEST = 0x06
+PACKET_TYPE_CKPT_META = 0x07
+PACKET_TYPE_CKPT_CHUNK = 0x08
+
+# Wire-protocol versioning (T0.3, additive-only policy):
+# - BRIDGE_VERSION bumps ONLY on breaking framing changes. A peer whose major
+#   version differs must NOT form a distributed pipeline with us (fail closed
+#   at the node layer via is_compatible(); the bridge itself stays tolerant).
+# - features are capability flags; receivers ignore unknown flags.
+# - New packet types register here with the minimum bridge version that
+#   understands them; older peers reply error/unsupported, never silent-drop.
+BRIDGE_VERSION = 1
+FEATURE_SNP1 = "snp1"            # SYNP binary tensor payloads (codec.py)
+FEATURE_CKPT_JSON1 = "ckpt-json1"  # JSON checkpoint P2P pull (fault_tolerance.py)
+DEFAULT_FEATURES = (FEATURE_SNP1, FEATURE_CKPT_JSON1)
+PACKET_MIN_VERSION = {
+    PACKET_TYPE_EVENT: 1,
+    PACKET_TYPE_HANDSHAKE: 1,
+    PACKET_TYPE_PING: 1,
+    PACKET_TYPE_PONG: 1,
+    PACKET_TYPE_ERROR: 1,
+    PACKET_TYPE_CKPT_REQUEST: 1,
+    PACKET_TYPE_CKPT_META: 1,
+    PACKET_TYPE_CKPT_CHUNK: 1,
+}
 
 # Default ceiling for a single framed JSON packet on the event bridge.
 # Raised from 10 MiB (which silently dropped frames for ~5 MB tensors after
@@ -22,28 +49,6 @@ PACKET_TYPE_ERROR = 0x05
 DEFAULT_MAX_FRAME_SIZE = 256 * 1024 * 1024
 
 
-def _get_all_local_ips() -> Set[str]:
-    """Get all IPv4 addresses of this machine to detect self-connections."""
-    ips = set()
-    try:
-        import psutil
-        for _nic, addrs in psutil.net_if_addrs().items():
-            for a in addrs:
-                if getattr(socket, "AF_INET", None) and a.family == socket.AF_INET and a.address:
-                    ips.add(a.address.strip())
-    except Exception:
-        pass
-    if not ips:
-        try:
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
-            if ip and not ip.startswith("127."):
-                ips.add(ip)
-        except Exception:
-            pass
-    ips.add("127.0.0.1")
-    return ips
-
 class P2PSocketBridge:
     """
     P2PSocketBridge provides a real TCP transport for the EventRouter.
@@ -52,12 +57,33 @@ class P2PSocketBridge:
     def __init__(
         self, node_id: str, port: int, event_router: EventRouter,
         max_frame_size: int = DEFAULT_MAX_FRAME_SIZE,
+        caps_hash: Optional[str] = None,
+        features: Optional[List[str]] = None,
+        ssl_server_ctx=None,
+        ssl_client_ctx=None,
+        tls_fp: Optional[str] = None,
+        bind_host: str = "0.0.0.0",
     ):
         self.node_id = node_id
         self.port = port
         self.event_router = event_router
         self.max_frame_size = max_frame_size
+        # Version/capability advertisement (T0.3). caps_hash is the sha256 of
+        # the canonical DeviceCapabilities subset used by partitioning; it is
+        # wired by the node layer (None until then) and never required.
+        self.caps_hash = caps_hash
+        self.features = list(features) if features is not None else list(DEFAULT_FEATURES)
+        # TLS staging (Item 5): None = plaintext, byte-identical to before.
+        # tls_fp carries the server-cert pin once TLS is on (else None).
+        self._ssl_server_ctx = ssl_server_ctx
+        self._ssl_client_ctx = ssl_client_ctx
+        self.tls_fp = tls_fp
+        # C-W3: bind address for the P2P listener (default all interfaces).
+        self.bind_host = bind_host or "0.0.0.0"
         self._last_errors: Dict[str, Dict] = {}  # peer_id -> last error packet received
+        # peer_id -> decoded handshake dict (versions/features/caps). Basis for
+        # mixed-version fail-closed decisions at the node layer.
+        self._peer_handshakes: Dict[str, Dict[str, Any]] = {}
         self._running = False
         self._server: Optional[asyncio.AbstractServer] = None
         self._connections: Dict[str, Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
@@ -79,7 +105,8 @@ class P2PSocketBridge:
         """Start the TCP server and join the mesh."""
         self._running = True
         self._server = await asyncio.start_server(
-            self._handle_incoming_connection, "0.0.0.0", self.port
+            self._handle_incoming_connection, self.bind_host, self.port,
+            ssl=self._ssl_server_ctx,
         )
 
         # Subscribe to local events that need to be broadcasted
@@ -143,9 +170,11 @@ class P2PSocketBridge:
         try:
             host, port_str = address.split(":")
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, int(port_str)),
+                asyncio.open_connection(host, int(port_str),
+                                        ssl=self._ssl_client_ctx),
                 timeout=timeout
             )
+            self._enable_nodelay(writer)
 
             await self._send_handshake(writer, PACKET_TYPE_HANDSHAKE)
 
@@ -164,6 +193,9 @@ class P2PSocketBridge:
                 logger.error(f"Error during handshake with {peer_id} at {address}: {e}")
                 self._close_writer(writer)
                 return False
+
+            if actual_peer_id:
+                self.record_peer_handshake(actual_peer_id, handshake_packet or {})
 
             if actual_peer_id == self.node_id:
                 logger.debug(f"Handshake resolved to self ({self.node_id}), closing self-connection to {address}")
@@ -291,10 +323,25 @@ class P2PSocketBridge:
             backoff = min(backoff * 2, self._max_backoff)
             self._reconnect_backoff[peer_id] = backoff
 
+    def _enable_nodelay(self, writer) -> None:
+        """Disable Nagle on a bridge socket (T1.2).
+
+        The binary TCP transport sets TCP_NODELAY everywhere, but the live
+        bridge never did — small control frames could stall ~40ms behind
+        ACKs. One-liner, best-effort, never raises.
+        """
+        try:
+            sock = writer.get_extra_info("socket") if writer else None
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
     async def _handle_incoming_connection(self, reader, writer):
         """Handle a new incoming peer connection."""
         addr = writer.get_extra_info('peername')
         logger.debug(f"Incoming connection from {addr}")
+        self._enable_nodelay(writer)
 
         try:
             # Peek the frame header ourselves so raw latency probes (which do
@@ -334,6 +381,9 @@ class P2PSocketBridge:
             if not peer_id:
                 self._close_writer(writer)
                 return
+
+            # T0.3: record versions/features (old peers simply lack the keys).
+            self.record_peer_handshake(peer_id, peer_info)
 
             for temp_id, future in list(self._pending_handshake_futures.items()):
                 if not future.done() and (self._temp_id_map.get(temp_id) == peer_id
@@ -545,12 +595,81 @@ class P2PSocketBridge:
             logger.debug(f"Failed to send error packet: {e}")
 
     async def _send_handshake(self, writer: asyncio.StreamWriter, pkt_type: int = PACKET_TYPE_HANDSHAKE):
-        """Send identification handshake to a peer."""
+        """Send identification handshake to a peer.
+
+        Additive-only (T0.3): old peers read node_id/port via .get() and
+        ignore the rest; new peers record versions/features/caps for
+        mixed-version fail-closed decisions. Never remove a key.
+        """
+        from synapse.helpers import VERSION as _SYNAPSE_VERSION
         handshake = {
             "type": "handshake",
             "node_id": self.node_id,
-            "port": self.port
+            "port": self.port,
+            "synapse_version": _SYNAPSE_VERSION,
+            "bridge_version": BRIDGE_VERSION,
+            "caps_hash": self.caps_hash,
+            "features": list(self.features),
+            # Reserved for TLS pinning (transport/tls_wrap.py). Advertised
+            # from the bridge's configured pin; unenforced while --tls off.
+            "tls_fp": self.tls_fp,
         }
         data = json.dumps(handshake).encode('utf-8')
         writer.write(struct.pack("!IB", len(data), pkt_type) + data)
         await writer.drain()
+
+    def record_peer_handshake(self, peer_id: str, info: Dict[str, Any]) -> None:
+        """Store a peer's decoded handshake; returns nothing.
+
+        Unknown keys are kept (forward-compat); missing version keys mean a
+        pre-versioning peer, which stays compatible (legacy fallback).
+        """
+        if not isinstance(info, dict):
+            return
+        self._peer_handshakes[peer_id] = {
+            "node_id": info.get("node_id", peer_id),
+            "port": info.get("port"),
+            "synapse_version": info.get("synapse_version"),
+            "bridge_version": info.get("bridge_version"),
+            "caps_hash": info.get("caps_hash"),
+            "features": list(info.get("features") or []),
+            "tls_fp": info.get("tls_fp"),
+        }
+        try:
+            bv = self._peer_handshakes[peer_id]["bridge_version"]
+            if bv is not None and int(bv) != BRIDGE_VERSION:
+                logger.warning(
+                    f"Peer {peer_id} bridge_version={bv} != ours={BRIDGE_VERSION}: "
+                    "distributed pipeline with this peer must refuse (fail closed)"
+                )
+        except Exception:
+            pass
+
+    def get_peer_handshake(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """Return the recorded handshake for a peer, or None if unknown."""
+        info = self._peer_handshakes.get(peer_id)
+        return dict(info) if info is not None else None
+
+    def is_compatible(self, peer_id: str) -> bool:
+        """Fail-closed compatibility: False only on bridge major mismatch.
+
+        Unknown peers and pre-versioning peers (bridge_version None) are
+        treated as compatible (legacy fallback); the node layer decides the
+        pipeline from this plus feature intersection.
+        """
+        info = self._peer_handshakes.get(peer_id)
+        if not info:
+            return True
+        bv = info.get("bridge_version")
+        if bv is None:
+            return True
+        try:
+            return int(bv) == BRIDGE_VERSION
+        except Exception:
+            return False
+
+    def negotiated_features(self, peer_id: str) -> List[str]:
+        """Feature intersection with a peer (empty when unknown)."""
+        info = self._peer_handshakes.get(peer_id) or {}
+        theirs = set(info.get("features") or [])
+        return sorted(set(self.features) & theirs)
