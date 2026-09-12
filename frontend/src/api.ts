@@ -15,7 +15,7 @@ export async function fetchSystemInfo(): Promise<SystemInfo> {
       distributed_status: 'multi-node (LACP Active)',
       node_id: 'node-master-01',
       is_master: true,
-      active_model: 'qwen2.5:1.5b',
+      active_model: 'HuggingFaceTB/SmolLM2-135M-Instruct',
       device: 'NVIDIA RTX 4090 (24.0 GB VRAM)'
     };
   }
@@ -56,7 +56,7 @@ export async function fetchTopology(): Promise<ClusterTopology> {
       cluster_id: 'synapse-lacp-cluster-0',
       master_node: 'NODE-A (Master)',
       partition_method: 'ilp',
-      active_model: 'qwen2.5:1.5b',
+      active_model: 'HuggingFaceTB/SmolLM2-135M-Instruct',
       total_layers: 28,
       pipeline_stages: 3,
       nodes: [
@@ -146,7 +146,7 @@ export async function fetchModelsList(): Promise<ModelItem[]> {
     return data.models || data;
   } catch (err) {
     return [
-      { name: 'qwen2.5:1.5b', size: '3.1 GB', layers: 28, context_length: 32768, status: 'loaded', vram_required_gb: 4.5, recommended_cluster_nodes: 2 },
+      { name: 'HuggingFaceTB/SmolLM2-135M-Instruct', size: '0.3 GB', layers: 30, context_length: 8192, status: 'loaded', vram_required_gb: 1.0, recommended_cluster_nodes: 1 },
       { name: 'llama3:8b', size: '16.0 GB', layers: 32, context_length: 8192, status: 'downloaded', vram_required_gb: 18.0, recommended_cluster_nodes: 3 },
       { name: 'deepseek-coder:6.7b', size: '13.5 GB', layers: 32, context_length: 16384, status: 'available', vram_required_gb: 15.2, recommended_cluster_nodes: 3 },
       { name: 'mistral:7b-instruct', size: '14.2 GB', layers: 32, context_length: 8192, status: 'downloaded', vram_required_gb: 16.0, recommended_cluster_nodes: 2 },
@@ -178,7 +178,7 @@ export async function fetchTrainingStatus(): Promise<TrainingJob> {
   } catch (err) {
     return {
       job_id: 'train-job-9402',
-      model_name: 'qwen2.5:1.5b-instruct',
+      model_name: 'SmolLM2-135M-Instruct',
       dataset_name: 'instruct_alpaca_clean_vi.jsonl',
       status: 'running',
       current_step: 1420,
@@ -210,7 +210,7 @@ export async function fetchActivityLogs(): Promise<ActivityLog[]> {
   }
 }
 
-export async function sendChatPrompt(prompt: string, model: string = 'qwen2.5:1.5b'): Promise<{ content: string; tps: number; latency: number }> {
+export async function sendChatPrompt(prompt: string, model: string = 'HuggingFaceTB/SmolLM2-135M-Instruct'): Promise<{ content: string; tps: number; latency: number }> {
   const start = performance.now();
   try {
     const res = await fetch(`${API_BASE}/v1/chat/completions`, {

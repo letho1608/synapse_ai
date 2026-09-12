@@ -68,7 +68,7 @@ def run():
     # the legacy passthrough below (incl. --no-frontend no-op).
     # Global flags may precede the subcommand (either order works).
     _cli_cmds = ("serve", "join", "client", "status", "topology", "models",
-                 "benchmark")
+                 "benchmark", "console")
     _goes_to_cli = (len(sys.argv) > 1 and sys.argv[1] in _cli_cmds
                     or len(sys.argv) > 2 and sys.argv[1] in (
                         "--port", "--log-format", "--headless")

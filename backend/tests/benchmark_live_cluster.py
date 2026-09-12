@@ -11,7 +11,7 @@ Measures a RUNNING synapse cluster, never simulates:
 
 Usage (run from ANY machine that reaches all APIs):
   python benchmark_live_cluster.py --api-urls http://192.168.1.10:52415,http://192.168.1.11:52415 \
-      --model qwen2.5:1.5b --max-tokens 64 --reps 5 --out results.jsonl
+      --model HuggingFaceTB/SmolLM2-135M-Instruct --max-tokens 64 --reps 5 --out results.jsonl
 
 Exit codes: 0 pass, 2 usage error, 3 unreachable / loopback-masquerade,
 4 server error / metric mismatch / partition disagreement.

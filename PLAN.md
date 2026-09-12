@@ -82,6 +82,8 @@ Quyết định: synapse xây theo kiểu **CLI terminal**, giữ web UI hiện 
 - **Giữ nguyên:** `GET /` trang tĩnh do backend serve (`README:169`, không npm) — chỉ để check sống/chết, không đầu tư thêm.
 - **CLI chuẩn (học mesh-llm `serve/client/status`, FreeToken `ft`):**
   - `synapse serve [--model ...] [--port ...] [--join <token|config>]` — chạy node foreground, TUI text tối thiểu.
+  - `synapse console [serve-flags]` — VỎ TƯƠNG TÁC kiểu Claude Code (KHÔNG agent): boot node nền + stream log `[node]` + REPL `/slash` (`/status /topology /models /benchmark /client /help /quit`); chữ lạ không slash thì không làm gì; Ctrl+C dừng node exit 0; lịch sử phím lên/xuống. Mọi dòng in ra đều là kết quả lệnh thật hoặc log thật (`backend/synapse/console.py`, `test_console.py` 7 passed).
+  - Zero-flag boot + đổi sau trong console: cờ nào cũng có mặc định (`~/.synapse/cli-defaults.json`, đổi qua `SYNAPSE_DEFAULTS_PATH`); `python main.py console` trần boot model mặc định; trong console gõ `/set <key> <value>` (validate + lưu), `/config` (xem giá trị + nguồn cli/file/builtin), `/unset <key>`; đổi chỉ áp dụng lần boot sau, node đang chạy giữ nguyên (`backend/synapse/cli_defaults.py`, test 7 passed).
   - `synapse join <token|config>` / `synapse client --auto` — vào mesh có sẵn, không serve model.
   - `synapse status [--json]` — node, peers, partition, shard range, checkpoint step.
   - `synapse topology [--json]` — latency matrix, resource scores, partition hiện tại.
@@ -112,7 +114,8 @@ Quyết định: synapse xây theo kiểu **CLI terminal**, giữ web UI hiện 
 
 ## Audit lanes A/B/C đợt 2 (2026-09-11, commit 445d4fb, suite 334 passed)
 
-**Đã nối (có test `test_p2p_wiring` 5 passed):** ACK cho `send_prompt`/`send_tensor` (hết timeout oan 5s); subscribers `example`/`status` + handler RPC `example` (hết black-hole, loss thật thay 0.0 giả); eval/train chạy hàm thật.
+**Đã nối (có test `test_p2p_wiring` 5 passed):** ACK cho `send_prompt`/`send_tensor` (hết timeout oan 5s); subscribers `example`/`status` + handler RPC `example` (hết black-hole, loss thật thay 0.0 giả); eval/train chạy hàm thật; `--node-host` bind thật + **preflight cổng fail-nhanh** (kẹt cổng in đúng PID + cách gỡ netstat/taskkill, exit 2 — hết traceback 10048 mù; test `test_port_preflight`, đã chứng minh end-to-end với cổng chiếm thật).
 **Đã sửa:** mock capabilities phải có `SYNAPSE_TEST_MODE=1` (+ test_cluster script đã cập nhật); autoscale crash thì log (không còn `[]` câm); train/evaluate base warn 1 lần; power heuristic gắn cờ `power_estimated`; multi_gpu không đăng ký key None; QUANT + IP 1 nguồn (đã liệt kê); settings thêm system_prompt; route download progress; status phơi observability.
 **Đã xóa:** liệt kê ở trên (verify zero-importer trước khi xóa).
 **Hoãn có lý do:** gộp test/partitioner/dataset/frontend (đụng việc bạn); autoscale actuating + INT8 default + TLS on (cần C1/GPU/certs); đo multi-size probe (cần mạng thật).
+**Tailscale không CLI (log spam):** `start()` probe 1 lần, thiếu CLI thì bỏ hẳn vòng posture + in 1 dòng hướng sang udp/manual; `stop()` chịu None (`test_tailscale_nocli` 2 passed).

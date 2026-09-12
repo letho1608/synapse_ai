@@ -104,10 +104,21 @@ class P2PSocketBridge:
     async def start(self):
         """Start the TCP server and join the mesh."""
         self._running = True
-        self._server = await asyncio.start_server(
-            self._handle_incoming_connection, self.bind_host, self.port,
-            ssl=self._ssl_server_ctx,
-        )
+        try:
+            self._server = await asyncio.start_server(
+                self._handle_incoming_connection, self.bind_host, self.port,
+                ssl=self._ssl_server_ctx,
+            )
+        except OSError as e:
+            # Port busy (usually a stale backend). One clear line + an
+            # actionable error instead of a bare traceback downstream.
+            from synapse.helpers import check_ports_free, format_port_conflicts
+            conflicts = check_ports_free({"p2p": self.port})
+            msg = format_port_conflicts(conflicts) if conflicts else (
+                "Cannot bind P2P port %s on %s: %s" % (self.port, self.bind_host, e))
+            logger.error(msg)
+            self._running = False
+            raise RuntimeError(msg) from e
 
         # Subscribe to local events that need to be broadcasted
         self.event_router.subscribe("synapse/#", self._on_local_event)

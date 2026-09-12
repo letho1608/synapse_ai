@@ -162,6 +162,86 @@ def get_tailscale_env():
     return api_key, tailnet
 
 
+def check_ports_free(wanted) -> list:
+    """Preflight: try binding each {name: port} (TCP). Returns a list of
+    conflict dicts {name, port, holder} — empty when all are free.
+
+    holder names the owning process (e.g. "pid 5020 (python.exe)") via
+    psutil, or "" when it cannot be determined. Never raises; a bind
+    failure for any other reason reports holder="unbindable: <err>".
+    Sockets are closed immediately, no lingering.
+
+    No SO_REUSEADDR on the probe (deliberate): with it, Windows lets a
+    second bind succeed and the conflict would go undetected. A TIME_WAIT
+    leftover is NOT reported — only a live LISTEN socket counts, verified
+    via psutil so a just-closed backend never blocks an immediate restart.
+    """
+    conflicts = []
+    try:
+        items = list(wanted.items())
+    except Exception:
+        return conflicts
+    for name, port in items:
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            continue
+        probe = None
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.bind(("0.0.0.0", port))
+        except OSError:
+            holder = _listening_holder(port)
+            if holder is None:
+                continue  # transient (TIME_WAIT) — port is effectively free
+            conflicts.append({"name": name, "port": port, "holder": holder})
+        except Exception as e:
+            conflicts.append({"name": name, "port": port,
+                              "holder": "unbindable: %s" % (e,)})
+        finally:
+            try:
+                if probe is not None:
+                    probe.close()
+            except Exception:
+                pass
+    return conflicts
+
+
+def _listening_holder(port: int):
+    """Return 'pid N (name)' if something is LISTENing on port, else None."""
+    try:
+        import psutil as _psutil
+        for conn in _psutil.net_connections(kind="tcp"):
+            try:
+                if conn.laddr and conn.laddr.port == port and \
+                        conn.status == _psutil.CONN_LISTEN:
+                    pid = conn.pid or 0
+                    pname = ""
+                    try:
+                        pname = _psutil.Process(pid).name() if pid else ""
+                    except Exception:
+                        pass
+                    return "pid %d (%s)" % (pid, pname or "?")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def format_port_conflicts(conflicts) -> str:
+    """Human-readable fix-it message for check_ports_free() output."""
+    lines = ["Port conflict: another process holds ports this node needs."]
+    for c in conflicts:
+        lines.append("  - %s port %s held by %s" % (
+            c.get("name", "?"), c.get("port", "?"), c.get("holder", "?") or "?"))
+    lines.append("Fix (Windows): netstat -ano | findstr :<port>  ->  taskkill /PID <pid> /F")
+    lines.append("Or run with free ports: --node-port <free> --chat-port <free>")
+    lines.append("(A previous `serve`/`console` that was closed without Ctrl+C "
+                 "often leaves its backend holding the ports.)")
+    return "\n".join(lines)
+
+
 def get_all_local_ips() -> set:
     """All local IPv4 addresses, incl. loopback (B1: single copy).
 

@@ -1,4 +1,5 @@
 {
   "default_model": "qwen2.5:1.5b",
-  "discovery_module": "tailscale"
+  "discovery_module": "tailscale",
+  "system_prompt": "Bạn là trợ lý Synapse AI. Hãy luôn trả lời bằng tiếng Việt một cách hữu ích và chính xác."
 }

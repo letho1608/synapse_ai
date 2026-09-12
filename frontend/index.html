@@ -247,13 +247,13 @@
           cluster_id: 'synapse-lacp-cluster-0',
           master_node: 'NODE-A (Master)',
           partition_method: 'ilp',
-          active_model: 'qwen2.5:1.5b',
-          total_layers: 28,
+          active_model: 'HuggingFaceTB/SmolLM2-135M-Instruct',
+          total_layers: 30,
           pipeline_stages: 3,
           nodes: [
             { id: 'NODE-A', host: '192.168.1.10', port: 50051, role: 'master', status: 'healthy', device_name: 'NVIDIA RTX 4090 (24GB)', vram_used_gb: 12.8, vram_total_gb: 24.0, tflops: 82.5, cpu_percent: 24.5, ram_percent: 38.0, latency_ms: 0.28, bandwidth_mbps: 2500, assigned_shards: 'Layers 0 - 11', layers: '0-11', step_time_ms: 2.1 },
             { id: 'NODE-B', host: '192.168.1.11', port: 50051, role: 'worker', status: 'healthy', device_name: 'NVIDIA RTX 3090 (24GB)', vram_used_gb: 9.4, vram_total_gb: 24.0, tflops: 35.6, cpu_percent: 34.2, ram_percent: 45.1, latency_ms: 0.45, bandwidth_mbps: 1800, assigned_shards: 'Layers 12 - 21', layers: '12-21', step_time_ms: 2.8 },
-            { id: 'NODE-C', host: '192.168.1.12', port: 50051, role: 'worker', status: 'healthy', device_name: 'NVIDIA RTX 3060 (12GB)', vram_used_gb: 6.2, vram_total_gb: 12.0, tflops: 13.0, cpu_percent: 18.9, ram_percent: 29.5, latency_ms: 0.62, bandwidth_mbps: 1200, assigned_shards: 'Layers 22 - 27', layers: '22-27', step_time_ms: 3.1 }
+            { id: 'NODE-C', host: '192.168.1.12', port: 50051, role: 'worker', status: 'healthy', device_name: 'NVIDIA RTX 3060 (12GB)', vram_used_gb: 6.2, vram_total_gb: 12.0, tflops: 13.0, cpu_percent: 18.9, ram_percent: 29.5, latency_ms: 0.62, bandwidth_mbps: 1200, assigned_shards: 'Layers 22 - 27', layers: '22-29', step_time_ms: 3.1 }
           ]
         };
       }
@@ -267,7 +267,7 @@
         return data.models || data;
       } catch (err) {
         return [
-          { name: 'qwen2.5:1.5b', size: '3.1 GB', layers: 28, context_length: 32768, status: 'loaded', vram_required_gb: 4.5, recommended_cluster_nodes: 2 },
+          { name: 'HuggingFaceTB/SmolLM2-135M-Instruct', size: '0.3 GB', layers: 30, context_length: 8192, status: 'loaded', vram_required_gb: 1.0, recommended_cluster_nodes: 1 },
           { name: 'llama3:8b', size: '16.0 GB', layers: 32, context_length: 8192, status: 'downloaded', vram_required_gb: 18.0, recommended_cluster_nodes: 3 },
           { name: 'deepseek-coder:6.7b', size: '13.5 GB', layers: 32, context_length: 16384, status: 'available', vram_required_gb: 15.2, recommended_cluster_nodes: 3 },
           { name: 'mistral:7b-instruct', size: '14.2 GB', layers: 32, context_length: 8192, status: 'downloaded', vram_required_gb: 16.0, recommended_cluster_nodes: 2 }
@@ -307,7 +307,7 @@
       }
     }
 
-    async function sendChatPrompt(prompt, model = 'qwen2.5:1.5b') {
+    async function sendChatPrompt(prompt, model = 'HuggingFaceTB/SmolLM2-135M-Instruct') {
       const start = performance.now();
       try {
         const res = await fetch(`${API_BASE}/v1/chat/completions`, {
@@ -506,7 +506,7 @@
               <div class="glass-panel kpi-card kpi-green">
                 <div class="kpi-header"><span class="kpi-title">VRAM Toàn Cụm (Pooled)</span><span style="color:var(--accent-green)">💾</span></div>
                 <div class="kpi-value">${(s.gpu_memory_used_gb || 28.4).toFixed(1)} <span style="font-size:14px;color:var(--text-sub)">/ 60.0 GB</span></div>
-                <div class="kpi-meta">Mô hình qwen2.5:1.5b (28 Layers)</div>
+                <div class="kpi-meta">Mô hình HuggingFaceTB/SmolLM2-135M-Instruct (30 Layers)</div>
                 <div class="progress-bar-container"><div class="progress-fill" style="width: 47%; background: var(--accent-green);"></div></div>
               </div>
               <div class="glass-panel kpi-card kpi-purple">
@@ -549,7 +549,7 @@
                       <div class="node-box-header"><span class="node-name">NODE-C</span><span class="node-role-badge">Worker 2</span></div>
                       <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted)"><span>Phần cứng:</span><b>RTX 3060</b></div>
                       <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted)"><span>Stage time:</span><b style="color:var(--accent-amber)">3.1 ms</b></div>
-                      <div class="node-shard-badge">Layers 22 - 27 (6L)</div>
+                      <div class="node-shard-badge">Layers 22 - 29 (8L)</div>
                     </div>
                   </div>
                   <div style="margin-top:18px;display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted)">
@@ -737,7 +737,7 @@
               </div>
               <div class="card-body">
                 <div class="grid-3col" style="margin-bottom:20px;">
-                  <div class="glass-panel" style="padding:16px;"><div style="font-size:12px;color:var(--text-sub);">MODEL & DATASET</div><div style="font-size:15px;font-weight:600;margin-top:4px;">qwen2.5:1.5b-instruct</div><div style="font-size:12px;color:var(--text-muted);">instruct_alpaca_clean_vi.jsonl</div></div>
+                  <div class="glass-panel" style="padding:16px;"><div style="font-size:12px;color:var(--text-sub);">MODEL & DATASET</div><div style="font-size:15px;font-weight:600;margin-top:4px;">SmolLM2-135M-Instruct</div><div style="font-size:12px;color:var(--text-muted);">instruct_alpaca_clean_vi.jsonl</div></div>
                   <div class="glass-panel" style="padding:16px;"><div style="font-size:12px;color:var(--text-sub);">CURRENT LOSS & LR</div><div style="font-size:20px;font-weight:bold;color:var(--accent-green);margin-top:4px;">0.3841</div><div style="font-size:12px;color:var(--text-muted);">LR: 2e-5 · 1F1B autograd</div></div>
                   <div class="glass-panel" style="padding:16px;"><div style="font-size:12px;color:var(--text-sub);">TIẾN ĐỘ & THỜI GIAN</div><div style="font-size:20px;font-weight:bold;color:var(--primary);margin-top:4px;">28%</div><div style="font-size:12px;color:var(--text-muted);">Bước 1420 / 5000 (ETA: 57 phút)</div></div>
                 </div>

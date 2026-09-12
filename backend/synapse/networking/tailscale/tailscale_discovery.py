@@ -49,7 +49,25 @@ class TailscaleDiscovery(Discovery):
         if DEBUG_DISCOVERY >= 1: print("TailscaleDiscovery: Starting discovery tasks...")
         self.discovery_task = asyncio.create_task(self.task_discover_peers())
         self.cleanup_task = asyncio.create_task(self.task_cleanup_peers())
-        self.update_task = asyncio.create_task(self.task_update_device_posture_attributes())
+        # Probe once: posture updates need a local Tailscale device identity.
+        # Without the CLI they can never succeed — skip the task instead of
+        # erroring every update_interval forever.
+        self._tailscale_cli = False
+        try:
+            from synapse.networking.tailscale.tailscale_helpers import get_self_tailscale_info
+            _device_id, _ = await get_self_tailscale_info()
+            self._tailscale_cli = bool(_device_id)
+        except Exception:
+            self._tailscale_cli = False
+        if self._tailscale_cli:
+            self.update_task = asyncio.create_task(self.task_update_device_posture_attributes())
+        else:
+            self.update_task = None
+            print("TailscaleDiscovery: no Tailscale CLI/device identity — posture updates OFF "
+                  "(logged once, not every interval). On LAN without Tailscale, prefer "
+                  "--discovery-module udp (same subnet, zero config) or manual (cluster_config.json).")
+        if not self.tailscale_api_key and DEBUG_DISCOVERY >= 1:
+            print("TailscaleDiscovery: no API key — peer discovery via API is inert; same advice as above.")
         if DEBUG_DISCOVERY >= 1: print("TailscaleDiscovery: All tasks started")
 
     async def task_update_device_posture_attributes(self):
@@ -149,14 +167,15 @@ class TailscaleDiscovery(Discovery):
                 await asyncio.sleep(self.discovery_interval)
 
     async def stop(self):
-        if self.discovery_task:
-            self.discovery_task.cancel()
-        if self.cleanup_task:
-            self.cleanup_task.cancel()
-        if self.update_task:
-            self.update_task.cancel()
-        if self.discovery_task or self.cleanup_task or self.update_task:
-            await asyncio.gather(self.discovery_task, self.cleanup_task, self.update_task, return_exceptions=True)
+        tasks = [t for t in (self.discovery_task, self.cleanup_task,
+                             self.update_task) if t is not None]
+        for t in tasks:
+            t.cancel()
+        self.discovery_task = None
+        self.cleanup_task = None
+        self.update_task = None
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def discover_peers(self, wait_for_peers: int = 0) -> List[PeerHandle]:
         if wait_for_peers > 0:

@@ -11,7 +11,7 @@ from typing import Dict
 HF_MODELS: Dict[str, str] = {}
 HF_MODEL_PARAMS: Dict[str, str] = {}
 HF_MODEL_LAYERS: Dict[str, int] = {}
-DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
 def _load_dynamic_config():
     db_path = Path(os.path.dirname(__file__)) / "config" / "hf_models.json"

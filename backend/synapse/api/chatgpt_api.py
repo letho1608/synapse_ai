@@ -292,7 +292,7 @@ class ChatGPTAPI:
     self.prompts: PrefixDict[str, PromptSession] = PrefixDict()
     self.prev_token_lens: Dict[str, int] = {}
     self.stream_tasks: Dict[str, asyncio.Task] = {}
-    self.default_model = default_model or "qwen2.5:1.5b"
+    self.default_model = default_model or "HuggingFaceTB/SmolLM2-135M-Instruct"
     self.discovery_module = "tailscale" # Default
     self.token_queues = defaultdict(asyncio.Queue)
     self.activity_logs = [] # In-memory activity logs
@@ -3108,7 +3108,19 @@ class ChatGPTAPI:
       runner = web.AppRunner(self.app)
       await runner.setup()
       site = web.TCPSite(runner, host, port)
-      await site.start()
+      try:
+        await site.start()
+      except OSError as e:
+        from synapse.helpers import check_ports_free, format_port_conflicts
+        conflicts = check_ports_free({"api": port})
+        msg = format_port_conflicts(conflicts) if conflicts else (
+          "Cannot bind API port %s: %s" % (port, e))
+        print(msg)
+        try:
+          await runner.cleanup()
+        except Exception:
+          pass
+        raise RuntimeError(msg) from e
       display_host = "127.0.0.1" if host == "0.0.0.0" else host
 
       print(f"[INFO] Available endpoints:")

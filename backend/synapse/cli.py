@@ -17,11 +17,14 @@ files, tracked as pending — a warning is printed, never silent).
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -43,6 +46,96 @@ class CliHttpError(Exception):
         self.code = code
 
 
+class Cancelled(Exception):
+    """A console job was cancelled (Ctrl+C). Never a real failure."""
+
+
+# -- cancellable transport ------------------------------------------------------
+# Every HTTP connection the CLI opens is tracked here so a console Ctrl+C
+# can close it from another thread (unblocks a stuck read at once).
+# Safe because the console runs at most one command at a time.
+_INFLIGHT = set()
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _track(conn):
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.add(conn)
+    return conn
+
+
+def _untrack(conn):
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.discard(conn)
+
+
+def abort_inflight():
+    """Close every in-flight HTTP connection. Thread-safe, never raises."""
+    with _INFLIGHT_LOCK:
+        conns = list(_INFLIGHT)
+        _INFLIGHT.clear()
+    for c in conns:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+def _split(base, path):
+    u = urllib.parse.urlsplit(base.rstrip("/") + path)
+    return u
+
+
+def _conn_for(u, timeout):
+    if u.scheme == "https":
+        return http.client.HTTPSConnection(u.hostname, u.port or 443,
+                                           timeout=timeout)
+    return http.client.HTTPConnection(u.hostname, u.port or 80,
+                                      timeout=timeout)
+
+
+def wait_interruptible(proc, cancel_event=None, timeout=None, poll=0.05):
+    """Wait for proc; kill it when cancel_event fires or timeout hits.
+
+    Returns ("done", rc) | ("cancelled", rc) | ("timeout", rc).
+    Never raises on the happy path; KeyboardInterrupt propagates.
+    """
+    import time as _t
+    deadline = None if timeout is None else _t.monotonic() + timeout
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            return "done", rc
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                rc = proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    rc = proc.wait(timeout=5)
+                except Exception:
+                    rc = None
+            return "cancelled", rc
+        if deadline is not None and _t.monotonic() >= deadline:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                rc = proc.wait(timeout=5)
+            except Exception:
+                rc = None
+            return "timeout", rc
+        _t.sleep(poll)
+
+
 def _err(msg):
     print("synapse: %s" % msg, file=sys.stderr)
 
@@ -60,39 +153,59 @@ def api_base(port):
     return "http://127.0.0.1:%d" % port
 
 
-def http_get_json(base, path, timeout=15):
+def http_get_json(base, path, timeout=15, cancel_event=None):
+    # NOTE: plain http.client (no redirect/proxy handling like urllib).
+    # Our API is local HTTP with no redirects, so this is equivalent here.
+    u = _split(base, path)
     url = base.rstrip("/") + path
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    conn = _track(_conn_for(u, timeout))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        raise CliHttpError(EXIT_SERVER, "HTTP %s on %s" % (e.code, url))
+        conn.request("GET", u.path or "/", headers={"Accept": "application/json"})
+        r = conn.getresponse()
+        status = r.status
+        raw = r.read().decode("utf-8", "replace")
     except Exception as e:
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled("cancelled")
         raise CliHttpError(EXIT_UNREACHABLE, "cannot reach %s (%s)" % (url, e))
+    finally:
+        _untrack(conn)
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if status >= 400:
+        raise CliHttpError(EXIT_SERVER, "HTTP %s on %s" % (status, url))
+    return json.loads(raw)
 
 
-def http_post_json(base, path, payload, timeout=600):
+def http_post_json(base, path, payload, timeout=600, cancel_event=None):
+    u = _split(base, path)
     url = base.rstrip("/") + path
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body,
-                                 headers={"Content-Type": "application/json"},
-                                 method="POST")
+    conn = _track(_conn_for(u, timeout))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read().decode("utf-8", "replace")
-            try:
-                return json.loads(raw)
-            except Exception:
-                return {"ok": True, "raw": raw}
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read().decode("utf-8", "replace")[:500]
-        except Exception:
-            detail = ""
-        raise CliHttpError(EXIT_SERVER, "HTTP %s on %s %s" % (e.code, url, detail))
+        conn.request("POST", u.path or "/",
+                     body=body, headers={"Content-Type": "application/json"})
+        r = conn.getresponse()
+        status = r.status
+        raw = r.read().decode("utf-8", "replace")
     except Exception as e:
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled("cancelled")
         raise CliHttpError(EXIT_UNREACHABLE, "cannot reach %s (%s)" % (url, e))
+    finally:
+        _untrack(conn)
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if status >= 400:
+        raise CliHttpError(EXIT_SERVER, "HTTP %s on %s %s" % (status, url, raw[:500]))
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
 
 
 from synapse.logging_json import emit as _emit_log
@@ -264,51 +377,72 @@ def cmd_join(args):
     return cmd_serve(ns)
 
 
-def _stream_chat(base, model, prompt, temperature, timeout):
+def _stream_chat(base, model, prompt, temperature, timeout, cancel_event=None):
     """Streaming chat; returns (text, ttft_s, elapsed_s). Tolerant parser."""
     body = json.dumps({"model": model,
                        "messages": [{"role": "user", "content": prompt}],
                        "temperature": 0.0 if temperature is None else temperature,
                        "stream": True}).encode("utf-8")
-    req = urllib.request.Request(base.rstrip("/") + "/v1/chat/completions", data=body,
-                                 headers={"Content-Type": "application/json"}, method="POST")
+    url = base.rstrip("/") + "/v1/chat/completions"
+    u = _split(base, "/v1/chat/completions")
     t0 = time.time()
     first = None
     parts = []
+    conn = _track(_conn_for(u, timeout))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            for raw in r:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(payload)
-                except Exception:
-                    continue
-                text = ""
-                try:
-                    ch = obj["choices"][0]
-                    d = ch.get("delta", {}) or {}
-                    text = d.get("content") or ch.get("text") or ""
-                    if not text and isinstance(ch.get("message"), dict):
-                        text = ch["message"].get("content") or ""
-                except Exception:
-                    text = obj.get("text") or ""
-                if text and first is None:
-                    first = time.time()
-                parts.append(text)
-    except urllib.error.HTTPError as e:
-        raise CliHttpError(EXIT_SERVER, "HTTP %s on chat completions" % e.code)
+        conn.request("POST", u.path or "/",
+                     body=body, headers={"Content-Type": "application/json"})
+        r = conn.getresponse()
+        if r.status >= 400:
+            raise CliHttpError(EXIT_SERVER, "HTTP %s on chat completions" % r.status)
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled("cancelled")
+            raw = r.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                continue
+            text = ""
+            try:
+                ch = obj["choices"][0]
+                d = ch.get("delta", {}) or {}
+                text = d.get("content") or ch.get("text") or ""
+                if not text and isinstance(ch.get("message"), dict):
+                    text = ch["message"].get("content") or ""
+            except Exception:
+                text = obj.get("text") or ""
+            if text and first is None:
+                first = time.time()
+            parts.append(text)
+    except Cancelled:
+        raise
+    except CliHttpError:
+        raise
     except Exception as e:
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled("cancelled")
         raise CliHttpError(EXIT_UNREACHABLE, "chat request failed (%s)" % e)
+    finally:
+        _untrack(conn)
+        try:
+            conn.close()
+        except Exception:
+            pass
     return "".join(parts), ((first - t0) if first else None), time.time() - t0
 
 
 def cmd_client(args):
     base = api_base(args.port)
+    cancel = getattr(args, "cancel_event", None)
     if args.interactive:
         print("synapse interactive (empty line quits). model=%s" % (args.model or "server default"))
         while True:
@@ -319,8 +453,11 @@ def cmd_client(args):
             if not prompt:
                 break
             try:
-                text, _, _ = _stream_chat(base, args.model, prompt, args.temperature, args.timeout)
+                text, _, _ = _stream_chat(base, args.model, prompt, args.temperature,
+                                          args.timeout, cancel_event=cancel)
                 print(text)
+            except Cancelled:
+                print("(ngắt — phiên còn)")
             except CliHttpError as e:
                 _err(str(e))
                 return e.code
@@ -329,7 +466,11 @@ def cmd_client(args):
         _err("client needs --prompt TEXT or --interactive")
         return EXIT_USAGE
     try:
-        text, ttft, elapsed = _stream_chat(base, args.model, args.prompt, args.temperature, args.timeout)
+        text, ttft, elapsed = _stream_chat(base, args.model, args.prompt, args.temperature,
+                                           args.timeout, cancel_event=cancel)
+    except Cancelled:
+        print("(ngắt — phiên còn)")
+        return EXIT_OK
     except CliHttpError as e:
         if args.json:
             _fail_json(str(e), e.code)
@@ -346,11 +487,15 @@ def cmd_client(args):
 
 def cmd_status(args):
     base = api_base(args.port)
+    cancel = getattr(args, "cancel_event", None)
     try:
-        health = http_get_json(base, "/healthcheck")
-        dist = http_get_json(base, "/v1/distributed/status")
-        info = http_get_json(base, "/v1/system/info")
-        resources = http_get_json(base, "/v1/cluster/resources")
+        health = http_get_json(base, "/healthcheck", cancel_event=cancel)
+        dist = http_get_json(base, "/v1/distributed/status", cancel_event=cancel)
+        info = http_get_json(base, "/v1/system/info", cancel_event=cancel)
+        resources = http_get_json(base, "/v1/cluster/resources", cancel_event=cancel)
+    except Cancelled:
+        print("(ngắt — phiên còn)")
+        return EXIT_OK
     except CliHttpError as e:
         if args.json:
             _fail_json(str(e), e.code)
@@ -370,8 +515,12 @@ def cmd_status(args):
 
 def cmd_topology(args):
     base = api_base(args.port)
+    cancel = getattr(args, "cancel_event", None)
     try:
-        topo = http_get_json(base, "/v1/topology")
+        topo = http_get_json(base, "/v1/topology", cancel_event=cancel)
+    except Cancelled:
+        print("(ngắt — phiên còn)")
+        return EXIT_OK
     except CliHttpError as e:
         if args.json:
             _fail_json(str(e), e.code)
@@ -390,13 +539,19 @@ def cmd_topology(args):
 
 def cmd_models(args):
     base = api_base(args.port)
+    cancel = getattr(args, "cancel_event", None)
     action = args.action
     if action == "pull":
         if not args.model_id:
             _err("models pull needs MODEL_ID")
             return EXIT_USAGE
         try:
-            res = http_post_json(base, "/v1/models/pull", {"model_id": args.model_id})
+            res = http_post_json(base, "/v1/models/pull", {"model_id": args.model_id},
+                                 cancel_event=cancel)
+        except Cancelled:
+            # client-side stop only; the server may still finish the pull.
+            print("(ngắt — server có thể vẫn pull nốt phía sau)")
+            return EXIT_OK
         except CliHttpError as e:
             _err(str(e))
             return e.code
@@ -407,14 +562,21 @@ def cmd_models(args):
             _err("models rm needs MODEL_ID")
             return EXIT_USAGE
         try:
-            res = http_post_json(base, "/v1/models/delete", {"model_id": args.model_id})
+            res = http_post_json(base, "/v1/models/delete", {"model_id": args.model_id},
+                                 cancel_event=cancel)
+        except Cancelled:
+            print("(ngắt — phiên còn)")
+            return EXIT_OK
         except CliHttpError as e:
             _err(str(e))
             return e.code
         print(json.dumps(res)[:500])
         return EXIT_OK
     try:
-        models = http_get_json(base, "/v1/models")
+        models = http_get_json(base, "/v1/models", cancel_event=cancel)
+    except Cancelled:
+        print("(ngắt — phiên còn)")
+        return EXIT_OK
     except CliHttpError as e:
         if args.json:
             _fail_json(str(e), e.code)
@@ -446,9 +608,39 @@ def cmd_benchmark(args):
         cmd += ["--model", args.model or "default"]
     if args.failover:
         cmd += ["--failover"]
+    # Console TUI: a child inheriting the terminal would paint over the
+    # full-screen app. Pipe it and print at the end instead (goes through
+    # the Tee into the transcript card). Line mode keeps live streaming.
+    pipe = bool(getattr(args, "pipe_output", False))
+    popen_kw = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
+                "text": True} if pipe else {}
     try:
-        rc = subprocess.call(cmd)
+        proc = subprocess.Popen(cmd, **popen_kw)
     except KeyboardInterrupt:
+        print("(ngắt benchmark — phiên còn)")
+        return EXIT_OK
+    except Exception as e:
+        _err("cannot start benchmark harness (%s)" % e)
+        return EXIT_FAIL
+    try:
+        outcome, rc = wait_interruptible(
+            proc, getattr(args, "cancel_event", None))
+        if pipe:
+            try:
+                out, _ = proc.communicate(timeout=5)
+            except Exception:
+                out = ""
+            if out.strip():
+                print(out.rstrip("\n"))
+    except KeyboardInterrupt:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        print("(ngắt benchmark — phiên còn)")
+        return EXIT_OK
+    if outcome == "cancelled":
+        print("(ngắt benchmark — phiên còn)")
         return EXIT_OK
     if args.json:
         try:
@@ -463,10 +655,20 @@ def cmd_benchmark(args):
 
 
 def main(argv=None):
+    # Console is a separate entry (serve flags + REPL); route before argparse
+    # so `synapse console ...` never collides with subcommand parsing.
+    if argv is not None and argv[:1] == ["console"]:
+        from synapse.console import main as console_main
+        return console_main(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "port", None) is None:
         args.port = DEFAULT_PORT
+    if args.command in ("serve", "join"):
+        # Zero-flag boot: per-machine defaults file fills the gaps
+        # (explicit flags always win). See synapse/cli_defaults.py.
+        from synapse.cli_defaults import apply_to_namespace
+        apply_to_namespace(args)
     if args.command == "serve":
         return cmd_serve(args)
     if args.command == "join":

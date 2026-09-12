@@ -104,6 +104,18 @@ parser.add_argument("--headless", action="store_true",
                          "API/logs/healthcheck/API+/v1/* are unaffected.")
 args = parser.parse_args()
 
+# Preflight: fail fast with a fix-it message when our ports are held
+# (typically a stale backend from a console closed without Ctrl+C).
+# Cheaper and clearer than crashing mid-boot with a bare OSError.
+from synapse.helpers import check_ports_free, format_port_conflicts
+_preflight = check_ports_free({
+    "p2p": args.node_port or 5678,
+    "api": args.chatgpt_api_port,
+})
+if _preflight:
+    print(format_port_conflicts(_preflight))
+    sys.exit(2)
+
 # C-W7/M4 stdout discipline: JSONL on stdout when requested via flag or env.
 # Human-readable output stays on stderr. Installed before any other print.
 import os as _os
@@ -222,7 +234,7 @@ node = Node(
 )
 node.discovery = discovery
 # No redundant GRPCServer anymore
-default_model = args.default_model or "qwen2.5:1.5b"
+default_model = args.default_model or "HuggingFaceTB/SmolLM2-135M-Instruct"
 api = ChatGPTAPI(
   node,
   node.inference_engine.__class__.__name__,

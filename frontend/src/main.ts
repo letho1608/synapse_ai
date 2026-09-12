@@ -293,7 +293,7 @@ class DashboardApp {
             <span style="color: var(--accent-green); font-size: 16px;">💾</span>
           </div>
           <div class="kpi-value">${(s.gpu_memory_used_gb || 28.4).toFixed(1)} <span style="font-size: 14px; font-weight: normal; color: var(--text-sub);">/ 60.0 GB</span></div>
-          <div class="kpi-meta">Mô hình qwen2.5:1.5b (28 Layers)</div>
+          <div class="kpi-meta">Mô hình HuggingFaceTB/SmolLM2-135M-Instruct (30 Layers)</div>
           <div class="progress-bar-container"><div class="progress-fill" style="width: 47%; background: var(--accent-green);"></div></div>
         </div>
 
@@ -701,7 +701,7 @@ class DashboardApp {
   private renderTraining(): string {
     const job = this.trainingJob || {
       job_id: 'train-9402',
-      model_name: 'qwen2.5:1.5b',
+      model_name: 'HuggingFaceTB/SmolLM2-135M-Instruct',
       dataset_name: 'instruct_alpaca_clean_vi.jsonl',
       status: 'running',
       current_step: 1420,
