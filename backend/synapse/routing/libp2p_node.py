@@ -1,7 +1,6 @@
 import asyncio
-from typing import List, Callable, Optional, Any
+from typing import List, Any
 from loguru import logger
-import json
 
 from synapse.routing.p2p_socket_bridge import P2PSocketBridge, DEFAULT_MAX_FRAME_SIZE
 

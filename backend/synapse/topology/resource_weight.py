@@ -17,12 +17,12 @@ configurable weighted sum to produce a final "compute capacity" score.
 
 from __future__ import annotations
 
-import os
-import platform
-import subprocess
-import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotation only; avoids an import cycle
+    from synapse.topology.latency_matrix import LatencyMatrix
 from typing import Dict, Optional, Tuple
 
 try:

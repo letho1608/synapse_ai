@@ -14,7 +14,7 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Any, Callable
 
 
 @dataclass
@@ -127,36 +127,6 @@ class ResultRouter:
     def _finish_request(self, request_id: str) -> None:
         self._buffers.pop(request_id, None)
 
-    async def route_to_orchestrator(
-        self,
-        result: RoutedResult,
-        publish_fn: Callable,
-    ) -> None:
-        if result.orchestrator_id != self.node_id:
-            topic = f"synapse/inference/result/{result.orchestrator_id}"
-            payload = {
-                "request_id": result.request_id,
-                "tokens": result.tokens,
-                "is_finished": result.is_finished,
-                "micro_batch_id": result.micro_batch_id,
-                "source_stage_id": result.source_stage_id,
-            }
-            await publish_fn(topic, payload)
-
-    def get_buffer_state(self, request_id: str) -> Tuple[int, bool]:
-        buf = self._buffers.get(request_id)
-        if buf is None:
-            return (0, False)
-        return (buf._next_expected, buf._finished)
-
-    def get_all_tokens(self, request_id: str) -> List[int]:
-        buf = self._buffers.get(request_id)
-        if buf is None:
-            return []
-        tokens: List[int] = []
-        for i in sorted(buf._pending.keys()):
-            tokens.extend(buf._pending[i].tokens)
-        return tokens
 
     async def _gc_loop(self) -> None:
         while self._running:

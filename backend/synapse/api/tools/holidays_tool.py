@@ -1,6 +1,6 @@
 """Ngày lễ (VN). Dữ liệu tĩnh."""
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 # Một số ngày lễ VN (có thể bổ sung)
 VN_HOLIDAYS = [

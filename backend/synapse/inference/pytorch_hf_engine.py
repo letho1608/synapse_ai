@@ -206,16 +206,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         except Exception:
             pass
 
-    def _get_sequence_hash(self, data: np.ndarray, length: int) -> str:
-        """Tạo hash cho một đoạn sequence (ids hoặc hidden states)."""
-        import hashlib
-        # Dùng byteview để hash nhanh
-        if data.ndim == 1:
-            chunk = data[:length].copy()
-        else:
-            chunk = data[:, :length].copy()
-        return hashlib.blake2b(chunk.tobytes(), digest_size=16).hexdigest()
-
     @staticmethod
     def _has_cuda() -> bool:
         try:
@@ -263,7 +253,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         if self._has_cuda():
             profile["device"] = "cuda"
         elif self._has_directml():
-            import torch_directml
             profile["device"] = "dml"
             profile["torch_dtype"] = torch.float16
             import psutil
@@ -277,7 +266,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             # run slowly and which drifts from reference numerics.
             profile["torch_dtype"] = torch.float32
             profile["attn_implementation"] = "eager"
-            if DEBUG >= 1: print(f"[PyTorchHF][HW] CPU-only node → Dtype: float32 | Attn: eager")
+            if DEBUG >= 1: print("[PyTorchHF][HW] CPU-only node → Dtype: float32 | Attn: eager")
             self._hw_profile = profile
             return profile
 
@@ -293,8 +282,12 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             profile["supports_bf16"] = supports_bf16
             profile["torch_dtype"] = torch.bfloat16 if supports_bf16 else torch.float16
 
-            if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
-                profile["attn_implementation"] = "sdpa"
+            # Best attention kernel that really exists here (probe: fa2 needs
+            # the flash_attn package + CUDA; triton has no HF equivalent).
+            from synapse.inference.attn_backend import probe_attn_backend
+            best = probe_attn_backend(prefer=("fa2", "sdpa", "eager"))["name"]
+            profile["attn_implementation"] = {
+                "fa2": "flash_attention_2", "sdpa": "sdpa"}.get(best, "eager")
 
             required_vram = 0.0
             if model_id:
@@ -853,17 +846,10 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                                                 WQ.requested_mode())
                 return pm_
 
-            def _tok():
-                from transformers import AutoTokenizer
-                try:
-                    return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True,
-                                                         local_files_only=True)
-                except (OSError, ValueError):
-                    return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
 
             with self._forward_lock:
                 self._seq_kv.clear()
-            self.tokenizer = await loop.run_in_executor(None, _tok)
+            self.tokenizer = await loop.run_in_executor(None, self._load_tokenizer, hf_id)
             pm = await loop.run_in_executor(None, _build)
             self._pm = pm
             self._model_id = shard.model_id
@@ -966,7 +952,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             except (OSError, ValueError):
                 # --- [P2P LAN Cache Sync] ---
                 try:
-                    import aiohttp
                     node_ref = getattr(self, "node", None)
                     if node_ref:
                         nodes = await node_ref.get_tailscale_nodes()
@@ -996,6 +981,16 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 traceback.print_exc()
             raise RuntimeError(f"PyTorchHF load {hf_id}: {e}") from e
 
+    @staticmethod
+    def _load_tokenizer(hf_id: str):
+        """Local cache first, then the Hub (unless offline)."""
+        from transformers import AutoTokenizer
+        try:
+            return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True,
+                                                 local_files_only=True)
+        except (OSError, ValueError):
+            return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+
     async def _ensure_tokenizer(self, shard: Shard) -> None:
         """Tokenizer only: encoding must not pull every layer into memory
         (the orchestrator encodes with the full-model base shard)."""
@@ -1005,14 +1000,8 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             return
         hf_id = self._get_hf_id(shard.model_id)
 
-        def _tok():
-            from transformers import AutoTokenizer
-            try:
-                return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True,
-                                                     local_files_only=True)
-            except (OSError, ValueError):
-                return AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
-        self.tokenizer = await asyncio.get_running_loop().run_in_executor(None, _tok)
+        self.tokenizer = await asyncio.get_running_loop().run_in_executor(
+            None, self._load_tokenizer, hf_id)
         self._tok_model_id = shard.model_id
 
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
@@ -1422,7 +1411,6 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         try:
             import torch
             import torch.nn.functional as F
-            from torch import nn
 
             if self._model is None:
                 return None, None
@@ -1518,7 +1506,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 shift_labels = labels[..., 1:].contiguous().view(-1)
                 loss_val = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
             return float(loss_val.item())
-        except Exception as e:
+        except Exception:
             if DEBUG >= 1:
                 import traceback
                 traceback.print_exc()

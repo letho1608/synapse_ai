@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import atexit
-import signal
 import json
 import os
 import sys
@@ -23,7 +22,7 @@ from synapse.routing.libp2p_node import Libp2pNode
 from synapse.api import ChatGPTAPI
 # REFACTORED IMPORTS
 from synapse.loading import ShardDownloader, RepoProgressEvent, get_models_dir
-from synapse.helpers import find_available_port, DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, terminal_link, shutdown, check_model_hardware_fit
+from synapse.helpers import DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, check_model_hardware_fit
 from synapse.inference.shard import Shard
 from synapse.inference.inference_engine import get_inference_engine
 from synapse.inference.tokenizers import resolve_tokenizer
@@ -33,9 +32,8 @@ from synapse.networking.udp.udp_discovery import UDPDiscovery
 from synapse.networking.tailscale.tailscale_discovery import TailscaleDiscovery
 from synapse.networking.manual.manual_discovery import ManualDiscovery
 from synapse.networking.p2p_peer_handle import P2PPeerHandle
-from synapse.topology.device_capabilities import DeviceCapabilities, device_capabilities
+from synapse.topology.device_capabilities import DeviceCapabilities
 import concurrent.futures
-import psutil
 
 os.environ["GRPC_VERBOSITY"] = "error"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -310,7 +308,6 @@ event_router.subscribe("synapse/cluster/status", lambda ev: preemptively_load_sh
 
 last_events: dict[str, tuple[float, RepoProgressEvent]] = {}
 def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
-  global last_events
   current_time = time.time()
   if event.status == "not_started": return
   last_event = last_events.get(shard.model_id)
@@ -374,11 +371,6 @@ async def run_model_cli(node: Node, model_name: str, prompt: str):
   finally:
     node.on_token.deregister(callback_id)
 
-def clean_path(path):
-    """Clean and resolve path"""
-    if path.startswith("Optional("):
-        path = path.strip('Optional("').rstrip('")')
-    return os.path.expanduser(path)
 
 async def hold_outstanding(node: Node):
   while node.outstanding_requests:
@@ -435,13 +427,13 @@ api_task_global = None
 
 async def main():
   global api_task_global
-  loop = asyncio.get_running_loop()
+  asyncio.get_running_loop()
 
   # Print models directory info
   models_dir = get_models_dir()
   if DEBUG >= 1:
     print(f"📁 Models directory: {models_dir}")
-    print(f"   Place your model files in subdirectories here")
+    print("   Place your model files in subdirectories here")
 
 
   def restore_cursor():
@@ -451,9 +443,6 @@ async def main():
   atexit.register(restore_cursor)
 
   # Use a more direct approach to handle signals
-  def handle_exit():
-    # Stop the node and all components
-    asyncio.ensure_future(node.stop())
 
   await node.start(wait_for_peers=args.wait_for_peers)
 
@@ -549,7 +538,6 @@ def run():
         if loop:
             try:
                 # Cancel api_task first if it exists
-                global api_task_global
                 if api_task_global and not api_task_global.done():
                     if DEBUG >= 2: print("[INFO] Cancelling API server task...")
                     api_task_global.cancel()

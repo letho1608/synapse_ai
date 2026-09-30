@@ -31,12 +31,9 @@ from .resource_weight import (
     ResourceWeights,
     ResourceScorer,
     NormalizedScores,
-    normalize,
 )
 from .latency_matrix import (
     LatencyMatrix,
-    LatencyEntry,
-    LatencyProber,
     Cluster,
     HierarchicalClusterer,
 )
@@ -53,8 +50,6 @@ class ShardAssignment:
     composite_score: float = 0.0
     normalized_scores: Optional[NormalizedScores] = None
 
-    def is_first(self) -> bool:
-        return self.start_layer == 0
 
     def is_last(self, total_layers: int) -> bool:
         return self.end_layer >= total_layers - 1

@@ -23,7 +23,7 @@ import os
 import glob
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 
 
@@ -374,7 +374,7 @@ class FaultToleranceManager:
             result.downtime_ms = (time.time() - start_time) * 1000
             result.success = True
 
-        except Exception as e:
+        except Exception:
             result.success = False
 
         return result
@@ -399,14 +399,6 @@ class FaultToleranceManager:
             raise ValueError("checkpoint path escapes checkpoint_dir: %r" % filename)
         return target
 
-    @staticmethod
-    def _sha256_file(path: str) -> str:
-        import hashlib
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
 
     @staticmethod
     def _sha256_text(text: str) -> str:
@@ -462,88 +454,6 @@ class FaultToleranceManager:
             return None
         steps = [e.get("step") for e in manifest.get("files", []) if isinstance(e.get("step"), int)]
         return max(steps) if steps else None
-
-    def latest_model_step(self, model_id: str) -> Optional[int]:
-        """Newest step WE know for a model (memory + own manifest).
-
-        Training steps are global per model, not per node: a survivor that
-        already trained past step N must refuse a pulled step < N (G5).
-        """
-        best: Optional[int] = None
-        for c in self._checkpoints.get(self.node_id, []):
-            if c.model_id == model_id and (best is None or c.step > best):
-                best = c.step
-        own = self.latest_manifest_step(self.node_id, model_id)
-        if own is not None and (best is None or own > best):
-            best = own
-        return best
-
-    async def prefer_local_then_pull(
-        self,
-        node_id: str,
-        model_id: Optional[str] = None,
-        step: Optional[int] = None,
-        fetch_fn: Optional[callable] = None,
-    ) -> Optional[ShardCheckpoint]:
-        """Dual-read order (T1.1/C2): memory -> shared-dir scan -> P2P pull.
-
-        fetch_fn, when given, is an async callable
-        (node_id, model_id, step) -> Optional[(manifest_entry, file_text)]
-        supplied by the transport layer (transport/checkpoint_pull.py). It is
-        injected — never imported — so this module stays transport-agnostic.
-        Pulled content is sha-verified and step-checked before acceptance.
-        """
-        ckpts = [c for c in self._checkpoints.get(node_id, [])
-                 if (model_id is None or c.model_id == model_id)
-                 and (step is None or c.step == step)]
-        if ckpts:
-            return max(ckpts, key=lambda c: (c.step, c.timestamp))
-        on_disk = self.load_latest_checkpoint(node_id)
-        if on_disk and (model_id is None or on_disk.model_id == model_id) \
-                and (step is None or on_disk.step == step):
-            return on_disk
-        if fetch_fn is None:
-            return None
-        try:
-            fetched = await fetch_fn(node_id, model_id, step)
-        except Exception:
-            return None
-        if not fetched:
-            return None
-        entry, text = fetched[0], fetched[1]
-        try:
-            data = json.loads(text)
-            ckpt = ShardCheckpoint(**{k: v for k, v in data.items()
-                                      if k in ShardCheckpoint.__dataclass_fields__})
-        except (ValueError, TypeError):
-            return None
-        # sha-verify before acceptance (H5): recompute over canonical dump.
-        import hashlib as _hl
-        if entry.get("sha256") and entry["sha256"] != _hl.sha256(
-                text.encode("utf-8")).hexdigest():
-            return None
-        if ckpt.node_id != node_id:
-            return None
-        if step is not None and ckpt.step != step:
-            return None
-        # Step monotonicity (G5): training steps are global per model — never
-        # accept a pulled step older than the newest step WE know for it.
-        local_latest = self.latest_model_step(ckpt.model_id)
-        if local_latest is not None and ckpt.step < local_latest:
-            return None
-        # Persist into OUR dir (shared-nothing) so the next lookup is local.
-        filename = "%s_%s_L%s-%s_step%s.ckpt" % (
-            self._safe_name(ckpt.node_id), self._safe_name(ckpt.model_id),
-            ckpt.start_layer, ckpt.end_layer, ckpt.step)
-        try:
-            dest = self._confine(filename)
-            with open(dest, "w", encoding="utf-8") as f:
-                f.write(text)
-            ckpt.checkpoint_path = dest
-        except (OSError, ValueError):
-            return None
-        self._checkpoints[node_id].append(ckpt)
-        return ckpt
 
     def get_recovery_checkpoint(self, node_id: str) -> Optional[ShardCheckpoint]:
         """Return the cross-node checkpoint staged for a node during the last

@@ -3,7 +3,7 @@ import json
 import struct
 import socket
 import time
-from typing import Dict, List, Set, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 from loguru import logger
 from synapse.routing.event_router import EventRouter, Event
 from synapse.helpers import DEBUG, get_all_local_ips as _get_all_local_ips
@@ -13,8 +13,8 @@ PACKET_TYPE_HANDSHAKE = 0x02
 PACKET_TYPE_PING = 0x03
 PACKET_TYPE_PONG = 0x04
 PACKET_TYPE_ERROR = 0x05
-# Checkpoint-pull control plane (T1.1). Registered here so old peers can
-# identify (and ignore) them; handlers live in transport/checkpoint_pull.py.
+# Reserved packet types (checkpoint control plane, never implemented on
+# the wire). Kept registered so the handshake caps stay stable across peers.
 PACKET_TYPE_CKPT_REQUEST = 0x06
 PACKET_TYPE_CKPT_META = 0x07
 PACKET_TYPE_CKPT_CHUNK = 0x08
@@ -169,7 +169,7 @@ class P2PSocketBridge:
                 self._connections.pop(peer_id, None)
 
         if peer_id in self._temp_id_map:
-            real_id = self._temp_id_map.pop(peer_id)
+            self._temp_id_map.pop(peer_id)
             self._connections.pop(peer_id, None)
 
         try:

@@ -18,9 +18,8 @@ from typing import Dict, List, Optional, Tuple, Any, Callable
 
 from synapse.inference.shard import Shard
 from synapse.inference.inference_engine import InferenceEngine
-from synapse.pipeline.scheduler import MicroBatch, PipelineSchedule, PipelineScheduler
-from synapse.pipeline.stage import PipelineStage, PipelineExecutor, StageResult
-from synapse.transport.codec import encode_tensor, decode_tensor, TensorMessage, AsyncTensorForwarder
+from synapse.pipeline.stage import StageResult
+from synapse.transport.codec import encode_tensor, AsyncTensorForwarder
 from synapse.transport.result_router import ResultRouter, RoutedResult
 from synapse.helpers import DEBUG
 
@@ -141,30 +140,6 @@ class DistributedInferenceSession:
         self.total_tokens_generated = 0
         self.is_finished = False
         self.error: Optional[Exception] = None
-        # T3.1 (foundation, engine integration pending GPU): per-stage
-        # cached context length. Stages never exchange KV bytes — only these
-        # lengths plus delta tokens. commit_stage_lengths() advances after a
-        # verified step; truncate_stages() rewinds every stage past a
-        # speculation divergence point (rollback protocol).
-        self.kv_cached_len: Dict[int, int] = {}
-
-    def commit_stage_lengths(self, lengths: Dict[int, int]) -> None:
-        """Record verified per-stage cached lengths (monotonic)."""
-        for stage, length in lengths.items():
-            if length is None:
-                continue
-            prev = self.kv_cached_len.get(stage, 0)
-            if length > prev:
-                self.kv_cached_len[stage] = length
-
-    def truncate_stages(self, to_len: int) -> Dict[int, int]:
-        """Rewind every tracked stage to to_len. Returns {stage: dropped}."""
-        dropped: Dict[int, int] = {}
-        for stage, cached in list(self.kv_cached_len.items()):
-            if cached > to_len:
-                dropped[stage] = cached - to_len
-                self.kv_cached_len[stage] = to_len
-        return dropped
 
 
 class DistributedPipelineController:
@@ -382,12 +357,8 @@ class DistributedPipelineController:
         return all_generated_tokens
 
     def _stop_ids(self) -> set:
-        ids = {151643, 151644, 151645}  # Qwen chat stop tokens
-        tok = getattr(self.inference_engine, "tokenizer", None)
-        eos = getattr(tok, "eos_token_id", None) if tok is not None else None
-        if isinstance(eos, int):
-            ids.add(eos)
-        return ids
+        from synapse.inference.inference_engine import stop_token_ids
+        return stop_token_ids(getattr(self.inference_engine, "tokenizer", None))
 
     @staticmethod
     def _ngram_draft(history: List[int], k: int, n: int = 3) -> List[int]:
@@ -497,173 +468,8 @@ class DistributedPipelineController:
         )
         await self.event_router.publish(topic, {"bin": encoded_payload})
 
-    async def _collect_result(
-        self,
-        request_id: str,
-        last_stage_node_id: str,
-        last_stage_shard: Shard,
-        timeout: float = 30.0,
-        expected_micro_batch_id: Optional[int] = None,
-        expected_source_stage_id: Optional[int] = None,
-    ) -> Optional[RoutedResult]:
-        result_event = asyncio.Event()
-        collected_result: List[RoutedResult] = []
-
-        # Listen on P2P result topic. The last node in the chain publishes
-        # to "synapse/inference/result/{request_id}" via process_inference_result,
-        # which the orchestrator's on_p2p_result handler receives. Results are
-        # filtered by batch identity (micro_batch_id and, when present, the
-        # publishing stage) so an out-of-order or foreign result is never
-        # misattributed to this collection.
-        result_topic = f"synapse/inference/result/{request_id}"
-
-        def on_p2p_result(event: Any):
-            data = event.data if hasattr(event, 'data') else event
-            tokens = data.get("tokens", [])
-            is_finished = data.get("is_finished", False)
-            micro_batch_id = data.get("micro_batch_id", 0)
-            source_stage_id = data.get("source_stage_id", None)
-            if expected_micro_batch_id is not None and micro_batch_id != expected_micro_batch_id:
-                if DEBUG >= 1:
-                    print(f"[{request_id}] [DISTRIBUTED] Ignoring result for micro_batch {micro_batch_id} (expected {expected_micro_batch_id})")
-                return
-            if (
-                expected_source_stage_id is not None
-                and source_stage_id is not None
-                and source_stage_id != expected_source_stage_id
-            ):
-                if DEBUG >= 1:
-                    print(f"[{request_id}] [DISTRIBUTED] Ignoring result from stage {source_stage_id} (expected {expected_source_stage_id})")
-                return
-            if DEBUG >= 1:
-                print(f"[{request_id}] [DISTRIBUTED] P2P result received: tokens={tokens}, finished={is_finished}")
-            collected_result.append(
-                RoutedResult(
-                    request_id=request_id,
-                    orchestrator_id=self.node_id,
-                    micro_batch_id=micro_batch_id,
-                    source_stage_id=last_stage_shard.start_layer,
-                    tokens=list(tokens),
-                    is_finished=is_finished,
-                )
-            )
-            result_event.set()
-
-        self.event_router.subscribe(result_topic, on_p2p_result)
-
-        try:
-            await asyncio.wait_for(result_event.wait(), timeout=timeout)
-            return collected_result[0] if collected_result else None
-        except asyncio.TimeoutError:
-            if DEBUG >= 1:
-                print(f"[{request_id}] [DISTRIBUTED] Timeout waiting for result from stage on {last_stage_node_id}")
-            return None
-        finally:
-            self.event_router.unsubscribe(result_topic, on_p2p_result)
-
     def _result_waiter(self, request_id: str, micro_batch_id: int, last_stage_start: int):
         """Subscribe to the request's result topic now; wait() later."""
         return _ResultWaiter(self.event_router, request_id, self.node_id,
                              micro_batch_id, last_stage_start)
 
-    def get_session(self, request_id: str) -> Optional[DistributedInferenceSession]:
-        return self._sessions.get(request_id)
-
-    async def run_inference_pipeline(
-        self,
-        base_shard: Shard,
-        input_data: np.ndarray,
-        request_id: str,
-        partition_assignments: List[Tuple[str, Shard]],
-        num_micro_batches: int = 1,
-        is_prompt: bool = False,
-    ) -> List[np.ndarray]:
-        """
-        Execute a full pipeline inference schedule across all stages.
-
-        Uses PipelineExecutor to run a staggered forward-only pipeline.
-        All stages process micro-batches concurrently. First stage gets
-        the input, intermediate stages chain via send/recv, last stage
-        produces final results.
-
-        Returns:
-            List of result tensors, one per micro-batch
-        """
-        num_stages = len(partition_assignments)
-        if num_stages == 0:
-            return [input_data]
-
-        scheduler = PipelineScheduler(num_micro_batches=num_micro_batches)
-        node_ids = [pid for pid, _ in partition_assignments]
-        schedule = scheduler.generate_inference_schedule(
-            num_stages, num_micro_batches, node_ids=node_ids
-        )
-
-        stages: List[PipelineStage] = []
-        for stage_idx in range(num_stages):
-            _, shard = partition_assignments[stage_idx]
-            is_last = stage_idx == num_stages - 1
-
-            async def make_forward_fn(s: Shard, rid: str):
-                async def forward(mb: MicroBatch) -> np.ndarray:
-                    result, _ = await self.inference_engine.infer_tensor(
-                        rid, s, mb.data,
-                        {"is_prompt": mb.metadata.get("is_prompt", is_prompt)}
-                    )
-                    return result
-                return forward
-
-            forward_fn = await make_forward_fn(shard, request_id)
-
-            if is_last:
-                final_results: List[np.ndarray] = []
-                async def last_stage_send(result: StageResult) -> None:
-                    final_results.append(result.data)
-                send_fn = last_stage_send
-            else:
-                async def relay_send(result: StageResult) -> None:
-                    next_stage_idx = stage_idx + 1
-                    if next_stage_idx < len(partition_assignments):
-                        next_node_id, next_shard = partition_assignments[next_stage_idx]
-                        topic = f"synapse/inference/tensor/{next_node_id}"
-
-                        # Per-row INT8 by default, only toward peers that negotiated it.
-                        from synapse.transport.router import should_quantize as _should_q2
-                        quantize = _should_q2(str(result.data.dtype), target_id=next_node_id,
-                                              self_id=self.node_id)
-                        
-                        encoded_payload = encode_tensor(
-                            result.data,
-                            metadata={
-                                "request_id": request_id,
-                                "shard": next_shard.to_dict(),
-                                "inference_state": {"is_prompt": True},
-                                "_orchestrator_id": self.node_id,
-                                "_sent_at": time.time(),
-                            },
-                            quantize_int8=quantize
-                        )
-                        await self.event_router.publish(topic, {"bin": encoded_payload})
-                send_fn = relay_send
-
-            stage = PipelineStage(
-                stage_id=stage_idx,
-                node_id=node_ids[stage_idx],
-                num_stages=num_stages,
-                forward_fn=forward_fn,
-                send_tensor_fn=send_fn,
-            )
-            stages.append(stage)
-
-        executor = PipelineExecutor(
-            stages=stages,
-            scheduler=scheduler,
-            timeout_per_step=30.0,
-        )
-
-        results = await executor.run_inference(
-            input_data=input_data,
-            num_micro_batches=num_micro_batches,
-        )
-
-        return results

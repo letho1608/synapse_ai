@@ -173,7 +173,7 @@ def format_translate_vi(data: Dict[str, Any]) -> str:
     """Chuyển kết quả translate sang tiếng Việt (nhãn + tên ngôn ngữ)."""
     if not data.get("success"):
         return f"Không dịch được: {data.get('error', 'Lỗi')}."
-    orig = data.get("original", "")
+    data.get("original", "")
     trans = data.get("translated", "")
     fl = _lang_vi(data.get("from_lang", ""))
     tl = _lang_vi(data.get("to_lang", ""))

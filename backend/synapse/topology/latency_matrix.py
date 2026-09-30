@@ -20,7 +20,7 @@ import time
 import struct
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 # ──────────────────────────────────────────────────────────
 # Data structures
@@ -150,7 +150,7 @@ class LatencyProber:
         """One 64 KiB echo round-trip. Returns (rtt_ms, bw_mbps) or None."""
         host, port_str = address.split(":")
         port = int(port_str)
-        t0 = time.perf_counter()
+        time.perf_counter()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=timeout
         )

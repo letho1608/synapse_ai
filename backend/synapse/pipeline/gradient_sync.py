@@ -8,14 +8,13 @@ Each node has a full model copy (DDP style).
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Awaitable, Any
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Callable, Awaitable
 import numpy as np
 
 from synapse.pipeline.scheduler import (
     MicroBatch,
     MicroBatchOp,
-    PipelineSchedule,
     PipelineScheduler,
 )
 from synapse.pipeline.stage import PipelineStage

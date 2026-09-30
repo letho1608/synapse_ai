@@ -3,8 +3,7 @@ Tool Registry: định nghĩa tất cả tools (OpenAI-style) và thực thi.
 Model sẽ được gửi tool definitions; khi model trả về tool call, executor gọi hàm tương ứng.
 """
 import asyncio
-import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from synapse.api.tools import time_tool, weather_tool, calculator_tool, stock_tool
 from synapse.api.tools import currency_tool, news_tool, search_tool, gold_tool, crypto_tool, translate_tool, holidays_tool

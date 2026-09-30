@@ -13,14 +13,11 @@ from __future__ import annotations
 import asyncio
 import time
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Any
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Callable
 
 from synapse.pipeline.scheduler import (
-    MicroBatchOp,
     MicroBatch,
-    PipelineSlot,
-    PipelineSchedule,
     PipelineScheduler,
 )
 
@@ -268,24 +265,3 @@ class PipelineExecutor:
             await asyncio.gather(*loop_tasks, return_exceptions=True)
 
         return [r for r in results if r is not None]
-
-    @staticmethod
-    async def run_pipeline_on_node(
-        stage: PipelineStage,
-        input_data: np.ndarray,
-        num_micro_batches: int = 1,
-        timeout: float = 300.0,
-    ) -> List[StageResult]:
-        results: List[StageResult] = []
-        for mb_id in range(num_micro_batches):
-            mb = MicroBatch(
-                batch_id=mb_id,
-                data=input_data.copy() if mb_id > 0 else input_data,
-                metadata={"step": mb_id},
-                step=mb_id,
-            )
-            result = await asyncio.wait_for(
-                stage.run_forward(mb), timeout=timeout / num_micro_batches
-            )
-            results.append(result)
-        return results

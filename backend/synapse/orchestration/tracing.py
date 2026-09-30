@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, Optional, Any
 from opentelemetry import trace, context
-from opentelemetry.trace import Status, StatusCode, SpanContext
+from opentelemetry.trace import Status, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from contextlib import contextmanager
 import time
@@ -25,20 +25,7 @@ class Tracer:
     self._lock = Lock()
     self.propagator = TraceContextTextMapPropagator()
     
-  def get_context(self, request_id: str) -> Optional[TraceContext]:
-    with self._lock:
-      return self.contexts.get(request_id)
 
-  def set_context(self, request_id: str, context: TraceContext):
-    with self._lock:
-      self.contexts[request_id] = context
-
-  def inject_context(self, span: trace.Span) -> str:
-    """Inject current span context into carrier for propagation"""
-    carrier = {}
-    ctx = trace.set_span_in_context(span)
-    self.propagator.inject(carrier, context=ctx)
-    return carrier.get("traceparent", "")
 
   def extract_context(self, trace_parent: str) -> Optional[context.Context]:
     """Extract span context from carrier"""
@@ -47,60 +34,6 @@ class Tracer:
     carrier = {"traceparent": trace_parent}
     return self.propagator.extract(carrier)
 
-  def create_context_from_parent(self, request_id: str, trace_parent: str, sequence_number: int = 0) -> TraceContext:
-    """Create a new context with the given trace parent"""
-    parent_ctx = self.extract_context(trace_parent)
-    if parent_ctx:
-      # Create a new request span that links to the parent context
-      request_span = self.tracer.start_span(
-        "request",
-        context=parent_ctx,
-        attributes={
-          "request_id": request_id,
-          "sequence_number": sequence_number
-        }
-      )
-      return TraceContext(
-        request_id=request_id,
-        sequence_number=sequence_number,
-        request_span=request_span,
-        current_span=request_span,
-        trace_parent=trace_parent
-      )
-    return TraceContext(request_id=request_id, sequence_number=sequence_number)
-
-  def handle_token(self, context: TraceContext, token: int, is_finished: bool = False):
-    """Handle token generation and manage token group spans"""
-    context.token_count += 1
-    
-    # Start a new token group span if needed
-    if not context.token_group_span and context.request_span:
-      group_number = (context.token_count - 1) // context.token_group_size + 1
-      
-      # Create token group span as child of request span
-      parent_ctx = trace.set_span_in_context(context.request_span)
-      context.token_group_span = self.tracer.start_span(
-        f"token_group_{group_number}",
-        context=parent_ctx,
-        attributes={
-          "request_id": context.request_id,
-          "group.number": group_number,
-          "group.start_token": context.token_count,
-          "group.max_tokens": context.token_group_size
-        }
-      )
-    
-    # Add token to current group span
-    if context.token_group_span:
-      relative_pos = ((context.token_count - 1) % context.token_group_size) + 1
-      context.token_group_span.set_attribute(f"token.{relative_pos}", token)
-      context.token_group_span.set_attribute("token.count", relative_pos)
-      
-      # End current group span if we've reached the group size or if generation is finished
-      if context.token_count % context.token_group_size == 0 or is_finished:
-        context.token_group_span.set_attribute("token.final_count", relative_pos)
-        context.token_group_span.end()
-        context.token_group_span = None
 
   @contextmanager
   def start_span(self, name: str, context: TraceContext, extra_attributes: Optional[Dict[str, Any]] = None):

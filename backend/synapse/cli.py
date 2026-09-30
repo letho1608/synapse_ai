@@ -392,7 +392,7 @@ def _stream_chat(base, model, prompt, temperature, timeout, cancel_event=None):
                        "messages": [{"role": "user", "content": prompt}],
                        "temperature": 0.0 if temperature is None else temperature,
                        "stream": True}).encode("utf-8")
-    url = base.rstrip("/") + "/v1/chat/completions"
+    base.rstrip("/") + "/v1/chat/completions"
     u = _split(base, "/v1/chat/completions")
     t0 = time.time()
     first = None

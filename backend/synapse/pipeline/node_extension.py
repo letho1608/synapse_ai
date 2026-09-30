@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import time
 import uuid
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -20,24 +19,13 @@ import numpy as np
 
 from synapse.inference.inference_engine import SHARD_WEIGHTS_SUFFIX
 from synapse.inference.shard import Shard
-from synapse.transport.result_router import ResultRouter, RoutedResult
-from synapse.topology.partitioner import compute_partition
-from synapse.topology.resource_weight import NodeResources
-from synapse.topology.partitioning_strategy import Partition, map_partitions_to_shards
-from synapse.pipeline.gradient_sync import DistributedTrainer, GradientShard
-from synapse.pipeline.scheduler import MicroBatch, MicroBatchOp
+from synapse.topology.partitioning_strategy import map_partitions_to_shards
+from synapse.pipeline.gradient_sync import DistributedTrainer
+from synapse.pipeline.scheduler import MicroBatch
 from synapse.pipeline.stage import PipelineStage, StageResult
 from synapse.helpers import DEBUG
 
 _log = logging.getLogger(__name__)
-
-
-def _maybe_span(tracer, name: str, ctx, attrs: dict):
-    """Start a tracing span if tracer is available, else no-op context manager."""
-    if tracer is None:
-        import contextlib
-        return contextlib.nullcontext()
-    return tracer.start_span(name, ctx, attrs)
 
 
 class _GradientHandoff:
@@ -378,7 +366,7 @@ class DistributedPipelineExtension:
                         base_shard, result, request_id, inference_state
                     )
 
-        except Exception as e:
+        except Exception:
             if DEBUG >= 1:
                 import traceback
                 traceback.print_exc()
@@ -394,38 +382,6 @@ class DistributedPipelineExtension:
 
         return all_tokens
 
-    async def process_shard_on_worker(
-        self,
-        shard: Shard,
-        tensor: np.ndarray,
-        request_id: str,
-        inference_state: Optional[dict] = None,
-    ) -> Optional[np.ndarray]:
-        try:
-            self._node.outstanding_requests[request_id] = "processing"
-
-            result, new_inference_state = await self._node.inference_engine.infer_tensor(
-                request_id, shard, tensor, inference_state
-            )
-
-            orchestrator_id = self._node._orchestrator_id_for_request(request_id)
-
-            result_routed = await self._node.process_inference_result(
-                shard,
-                result,
-                request_id,
-                new_inference_state,
-                orchestrator_id=orchestrator_id,
-            )
-
-            return result_routed
-
-        except Exception as e:
-            self._node.outstanding_requests.pop(request_id, None)
-            if DEBUG >= 1:
-                import traceback
-                traceback.print_exc()
-            raise
 
     async def train_step_distributed(
         self,
@@ -511,7 +467,7 @@ class DistributedPipelineExtension:
                     _train_span.set_attribute("loss", local_loss)
                     _train_span.set_attribute("num_grads", len(grad) if grad else 0)
 
-        except Exception as e:
+        except Exception:
             if DEBUG >= 1:
                 import traceback
                 traceback.print_exc()

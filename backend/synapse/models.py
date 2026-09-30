@@ -184,21 +184,6 @@ def build_full_shard(model_id: str, inference_engine_classname: str) -> Optional
     return Shard(base_shard.model_id, 0, base_shard.n_layers - 1, base_shard.n_layers)
 
 
-def get_supported_models(supported_inference_engine_lists: Optional[List[List[str]]] = None) -> List[str]:
-    """
-    Lấy danh sách mô hình được hỗ trợ
-    
-    Args:
-        supported_inference_engine_lists: Danh sách inference engines
-        
-    Returns:
-        List model IDs
-    """
-    models = set(_MODEL_REGISTRY.keys())
-    models.update(HF_MODELS.values())
-    return sorted(list(models))
-
-
 def list_models() -> List[str]:
     """Liệt kê tất cả mô hình"""
     models = set(_MODEL_REGISTRY.keys())

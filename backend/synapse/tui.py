@@ -617,7 +617,6 @@ def _build_ui(args, ctx, proc, log_q, loop=None, app_input=None, app_output=None
     headless tests drive real keystrokes through the app (pipe input +
     DummyOutput) without a backend or a terminal.
     """
-    from types import SimpleNamespace
     from prompt_toolkit.application import Application
     from prompt_toolkit.buffer import Buffer
     from prompt_toolkit.document import Document
@@ -631,8 +630,6 @@ def _build_ui(args, ctx, proc, log_q, loop=None, app_input=None, app_output=None
     from prompt_toolkit.layout.processors import (BeforeInput,
                                                   HighlightMatchingBracketProcessor)
     from prompt_toolkit.styles import Style
-    from prompt_toolkit.formatted_text import FormattedText
-    from prompt_toolkit.widgets import Frame
 
     state = TuiState()
     state.proc = proc

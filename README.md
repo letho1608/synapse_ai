@@ -173,7 +173,7 @@ Speedup is measured against the same workload on 1 node (pipeline-parallel infer
 
 - **TLS between nodes is opt-in.** `SYNAPSE_TLS=selfsigned|require` with `SYNAPSE_TLS_CERT`/`SYNAPSE_TLS_KEY` (optional `SYNAPSE_TLS_CA`) wraps both the event bridge and the chunked TCP tensor path (verified on loopback by `test_tls_interop.py` and `test_tcp_tls.py`; a plaintext client cannot inject into a TLS node); missing cert files fail loudly instead of downgrading. Default is plaintext, so run default clusters on trusted networks (LAN/Tailscale). TLS on real multi-host clusters has not been exercised yet.
 - **RDMA/InfiniBand transport is not implemented** — zero-copy shared memory currently covers same-machine nodes only (see Async Tensor Forwarding above).
-- **Checkpoint recovery is wired into distributed training and rebalancing.** Every distributed training step persists a JSON metadata checkpoint (model id, shard layer range, step) plus a sidecar manifest (`{node}_{model}.manifest.json`, sha256, last 10); every `SYNAPSE_CKPT_WEIGHTS_EVERY` steps (default 10, 0 = off) the node also writes its shard's layer weights (`*.weights.pt`, only its own layers) and the JSON records `weights_path`/`weights_step`. On failover the survivor restores exactly the dead node's layer range from that file into its loaded model (verified by `test_shard_weights_restore.py`: layer hashes match, other layers untouched, partial coverage refused). Weights can be up to N-1 steps older than the metadata step. Survivors can P2P-pull the JSON metadata without a shared directory (`transport/checkpoint_pull.py`, `test_ckpt_p2p_pull.py`), but the weights file stays on the machine that wrote it — once that node is dead it is unreachable, so cross-machine weight restore needs a shared checkpoint directory or proactive replication to a peer (not implemented). Without either, the restore returns False and the rebalance is flagged degraded (`_last_recovery_degraded`) instead of silently resuming from scratch.
+- **Checkpoint recovery is wired into distributed training and rebalancing.** Every distributed training step persists a JSON metadata checkpoint (model id, shard layer range, step) plus a sidecar manifest (`{node}_{model}.manifest.json`, sha256, last 10); every `SYNAPSE_CKPT_WEIGHTS_EVERY` steps (default 10, 0 = off) the node also writes its shard's layer weights (`*.weights.pt`, only its own layers) and the JSON records `weights_path`/`weights_step`. On failover the survivor restores exactly the dead node's layer range from that file into its loaded model (verified by `test_shard_weights_restore.py`: layer hashes match, other layers untouched, partial coverage refused). Weights can be up to N-1 steps older than the metadata step. Checkpoints (JSON metadata and weights) stay on the machine that wrote them, in `~/.synapse/checkpoints` or `SYNAPSE_CHECKPOINT_DIR`. Once that node is dead they are unreachable, so cross-machine restore needs `SYNAPSE_CHECKPOINT_DIR` on shared storage. Proactive replication to a peer is not implemented; the earlier "pull from the dead node" path could never work and was removed. Inference does not depend on this: any node reloads layers from the model checkpoint (see failover). Without either, the restore returns False and the rebalance is flagged degraded (`_last_recovery_degraded`) instead of silently resuming from scratch.
 - **Wire transport is tiered.** The chunked binary TCP path (1 MiB frames, any blob size, 4 GiB admission, 30 s reassembly timeout) and the TCP/SHM auto-router are on by default and fall back to the JSON event bridge (256 MiB cap, explicit `frame_too_large`) on any failure; `SYNAPSE_CHUNKED_TCP=0` restores bridge-only (verified by `test_tcp_chunked_transfer.py`, incl. a 130 MiB blob). Bridge sockets set TCP_NODELAY both directions. Inter-stage hidden states travel as INT8 by default: one scale per row plus the 8 largest-magnitude values per row carried exactly, sent only to peers whose handshake advertises `q8row1` (older peers get exact dtype); `SYNAPSE_TRANSPORT_INT8=0` restores exact transport. Quality gate on the default model (SmolLM2-135M-Instruct, 2- and 3-stage splits, 6 prompts, teacher-forced): top-1 next-token agreement 100%, KL ≈ 5e-5 (`test_int8_quality.py`); payload ≈ 3.6× smaller than fp32 at hidden size 576.
 - **Handshakes are versioned.** Bridges exchange `synapse_version`/`bridge_version`/`caps_hash`/`features`; major mismatch fails closed via `is_compatible()` (verified by `test_handshake_compat.py` both directions). Mixed-version pipeline refusal at the node layer and the `--version` CLI are wired; capability/demand gossip publishes advisory-only docs every ~5th heartbeat (tri-state fit, unknown rates excluded, never actuating).
 - **CLI-first terminal surface exists.** `python main.py console|serve|join|client|status|topology|models|benchmark [--json] [--port N]` (verified by `test_cli.py`, `test_console.py`); `console` is the interactive TUI shell (see `UI.md`). `--log-format json` emits JSONL backend logs and `--headless` turns `GET /` into a 204 liveness stub. Launchers pass `SYNAPSE_PARENT_PID`, so the backend exits if its launcher is killed (no orphan holding ports).
@@ -315,9 +315,12 @@ synapse_ai/
 │       ├── cli.py                   # CLI subcommands (serve/status/...)
 │       ├── console.py / tui.py      # Interactive console + full-screen TUI
 │       ├── inference/               # Model execution
-│       │   ├── distributed_engine.py  # Distributed pipeline controller + decode overlap
+│       │   ├── distributed_engine.py  # Orchestrator: one-pass draft verify, failover
+│       │   ├── partial_loader.py      # Load only a shard's layers from safetensors
+│       │   ├── weight_quant.py        # Weight-only int8 / int4
+│       │   ├── attn_backend.py        # Attention kernel probe (fa2 / sdpa / eager)
 │       │   ├── inference_engine.py    # Base inference engine
-│       │   ├── pytorch_hf_engine.py   # HuggingFace PyTorch backend
+│       │   ├── pytorch_hf_engine.py   # Shard engine: KV reuse, delta rows, batching
 │       │   └── shard.py               # Model shard abstraction
 │       ├── pipeline/                # Pipeline parallelism
 │       │   ├── scheduler.py           # PipelineScheduler (1F1B schedule generation)
@@ -329,14 +332,15 @@ synapse_ai/
 │       │   ├── codec.py               # Binary tensor encoding (SYNP header)
 │       │   ├── router.py              # TCP/SHM/bridge route choice + quantization policy
 │       │   ├── tls_wrap.py            # TLS contexts, self-signed certs, pinning
-│       │   ├── checkpoint_pull.py     # P2P checkpoint metadata pull
 │       │   ├── tcp_transport.py       # Chunked TCP server/client (TCP_NODELAY, optional TLS)
 │       │   ├── shm_transport.py       # Zero-copy shared-memory transport (same-machine)
 │       │   └── result_router.py       # In-order result reassembly
 │       ├── topology/                 # LACP partitioning engine
 │       │   ├── resource_weight.py     # Multi-resource weighting (disk_io, power, bandwidth)
 │       │   ├── latency_matrix.py      # N×N probing + hierarchical clustering
-│       │   ├── partitioner.py         # compute_partition(method="lrm"|"ilp")
+│       │   ├── partitioner.py         # compute_partition(method="lrm"|"ilp") (legacy)
+│       │   ├── dp_partition.py        # Measured placement (exact DP)
+│       │   ├── layer_profile.py       # ms/layer + memory cap per node
 │       │   ├── device_capabilities.py # Hardware capability detection
 │       │   └── topology.py            # Cluster topology management
 │       ├── orchestration/           # Node runtime

@@ -4,7 +4,6 @@ from .scheduler import (
     PipelineSlot,
     PipelineSchedule,
     PipelineScheduler,
-    PipelineStageState,
 )
 from .stage import (
     PipelineStage,
@@ -34,7 +33,6 @@ __all__ = [
     "PipelineSchedule",
     "PipelineStage",
     "PipelineScheduler",
-    "PipelineStageState",
     "PipelineExecutor",
     "StageResult",
     "StageStats",

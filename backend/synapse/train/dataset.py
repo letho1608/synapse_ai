@@ -96,17 +96,3 @@ def load_dataset(data_path: str, preprocess=lambda i: i, loadline=json.loads):
   return train, valid, test
 
 
-async def load_dataset_async(data_path: str, preprocess=lambda i: i, loadline=json.loads):
-  """Async version - loads all splits in parallel using thread executors."""
-  names = ("train", "valid", "test")
-  async def load_and_check_async(name):
-    dataset_path = Path(data_path) / f"{name}.jsonl"
-    try:
-      return await Dataset.from_path_async(dataset_path, preprocess=preprocess, loadline=loadline)
-    except Exception as e:
-      print(f"Unable to build dataset {dataset_path} ({e})")
-      raise
-
-  results = await asyncio.gather(*(load_and_check_async(n) for n in names))
-  return results  # (train, valid, test)
-

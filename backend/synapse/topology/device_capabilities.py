@@ -239,7 +239,6 @@ async def device_capabilities() -> DeviceCapabilities:
         import traceback
         traceback.print_exc()
         # Fallback to minimal info
-        import psutil
         cpu_cores = psutil.cpu_count(logical=True) or 0
         system_ram_mb = psutil.virtual_memory().total // 2**20
         return DeviceCapabilities(

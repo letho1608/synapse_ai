@@ -1,6 +1,5 @@
 import asyncio
-import time
-from typing import Dict, Optional, List, Callable
+from typing import Dict, Optional, Callable
 from loguru import logger
 from synapse.routing import EventRouter, Event
 
@@ -192,6 +191,3 @@ class ElectionManager:
         """Return True if this node is currently the elected Master."""
         return self.current_master_id == self.node_id
 
-    def get_cluster_nodes(self) -> List[str]:
-        """Returns a list of all currently active node IDs in the cluster."""
-        return list(self.active_nodes.keys()) + [self.node_id]

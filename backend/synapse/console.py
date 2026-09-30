@@ -34,9 +34,6 @@ from contextlib import redirect_stdout
 
 from synapse.cli import (
     DEFAULT_PORT,
-    Cancelled,
-    CliHttpError,
-    abort_inflight as _abort_http,
     api_base,
     cmd_benchmark,
     cmd_client,
@@ -482,14 +479,6 @@ class StatusBar:
             sys.stdout.write(self.line + "\n")
             sys.stdout.flush()
 
-    def _prompt_echo(self):
-        try:
-            import readline
-            buf = readline.get_line_buffer()
-        except Exception:
-            buf = ""
-        sys.stdout.write(PROMPT + buf)
-        sys.stdout.flush()
 
     def emit_above(self, text):
         """Insert log lines above the bar; re-echo bar + prompt buffer."""
@@ -1034,8 +1023,7 @@ def _banner(args, eff_model):
 def run_console(args):
     """Boot the node (like serve) + slash REPL. Returns exit code."""
     _setup_history()
-    from synapse.cli_defaults import apply_to_namespace, effective
-    from synapse.helpers import VERSION  # noqa: F401 (banner via _banner)
+    from synapse.cli_defaults import effective
     eff = effective({}, None)
     eff_model = getattr(args, "model", None) or eff.get("model") or "?"
     use_tui = _want_tui(args)

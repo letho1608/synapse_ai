@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple, List
+from typing import Optional, List
 import numpy as np
 from synapse.inference.shard import Shard
 from synapse.topology.device_capabilities import DeviceCapabilities

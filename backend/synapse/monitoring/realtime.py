@@ -14,12 +14,10 @@ feeds into:
 from __future__ import annotations
 
 import asyncio
-import os
-import platform
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 try:
@@ -49,17 +47,6 @@ class NodeMetrics:
     ram_used_mb: float = 0.0
     ram_total_mb: float = 0.0
     ram_util_pct: float = 0.0
-
-    @property
-    def vram_pressure(self) -> float:
-        """0.0 = empty, 1.0 = full."""
-        if self.gpu_vram_total_mb > 0:
-            return self.gpu_vram_used_mb / self.gpu_vram_total_mb
-        return 0.0
-
-    @property
-    def gpu_available_mb(self) -> float:
-        return max(0.0, self.gpu_vram_total_mb - self.gpu_vram_used_mb)
 
 
 class RealtimeMonitor:
@@ -96,11 +83,6 @@ class RealtimeMonitor:
             except asyncio.CancelledError:
                 pass
 
-    async def sample_now(self) -> NodeMetrics:
-        """Force an immediate sample (runs blocking work in thread)."""
-        metrics = await asyncio.to_thread(_sample_blocking)
-        self._latest = metrics
-        return metrics
 
     # ── internal loop ───────────────────────────────────────────
 

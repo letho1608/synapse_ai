@@ -22,7 +22,6 @@ from synapse.pipeline.scheduler import (
     PipelineSlot,
     PipelineSchedule,
     PipelineScheduler,
-    PipelineStageState,
 )
 
 

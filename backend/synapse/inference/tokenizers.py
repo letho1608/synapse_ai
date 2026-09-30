@@ -4,9 +4,7 @@ from os import PathLike
 import os
 from typing import Union
 from transformers import AutoTokenizer
-import numpy as np
 from synapse.helpers import DEBUG
-from pathlib import Path
 from synapse.loading import get_models_dir
 
 def ensure_downloads_dir():

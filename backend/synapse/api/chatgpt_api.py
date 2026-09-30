@@ -9,7 +9,6 @@ import platform
 import psutil
 import numpy as np
 from pathlib import Path
-from transformers import AutoTokenizer
 from typing import List, Literal, Union, Dict, Optional, Set, Any
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
@@ -23,16 +22,14 @@ from synapse.helpers import PrefixDict, shutdown, get_all_ip_addresses_and_inter
 from synapse.networking.tailscale.tailscale_helpers import get_synapse_api_urls_from_node_list, get_self_tailscale_info
 from synapse.orchestration import Node
 from synapse.model_list import HF_MODELS, HF_MODEL_PARAMS, resolve_hf_id  # Danh sách + metadata cho web UI
-from typing import Callable, Optional
-from synapse.loading import RepoProgressEvent
-import tempfile
+from typing import Callable
 from collections import defaultdict
-from synapse.training.finetune_lora import load_raw_data, load_raw_data_async, format_sample_to_text, _build_lora_config
-from synapse.training.preprocessing import preprocess, preprocess_async
+from synapse.training.finetune_lora import load_raw_data_async, format_sample_to_text, _build_lora_config
+from synapse.training.preprocessing import preprocess_async
 from synapse.loading import get_checkpoints_dir
 from synapse.models import build_base_shard, get_repo
 from synapse.inference.tokenizers import resolve_tokenizer
-from synapse.api.function_calling import build_tool_instructions, parse_tool_call, parse_tool_calls, run_tool_and_format, run_tools_parallel
+from synapse.api.function_calling import build_tool_instructions, parse_tool_calls, run_tool_and_format, run_tools_parallel
 from synapse.api.tools.intent_trigger import detect_tool_intent
 from synapse.api.tools.format_vi import format_tool_result_vi
 
@@ -551,9 +548,6 @@ class ChatGPTAPI:
       if DEBUG >= 1:
         print(f"_save_settings error: {e}")
 
-  def _get_model_cards(self) -> Dict[str, Dict]:
-    """Danh sách model hợp lệ: từ HF_MODELS (download + web UI)."""
-    return {m: {} for m in HF_MODELS}
 
   async def handle_quit(self, request):
     if DEBUG >= 1: print("Received quit signal")
@@ -734,23 +728,6 @@ class ChatGPTAPI:
       payload["model_loaded"] = False
     return web.json_response(payload)
 
-  async def handle_model_support(self, request):
-    try:
-      response = web.StreamResponse(status=200, reason='OK', headers={ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
-      await response.prepare(request)
-      async for path, s in self.node.shard_downloader.get_shard_download_status(self.inference_engine_classname):
-        model_data = { s.shard.model_id: { "downloaded": s.downloaded_bytes == s.total_bytes, "download_percentage": 100 if s.downloaded_bytes == s.total_bytes else 100 * float(s.downloaded_bytes) / float(s.total_bytes), "total_size": s.total_bytes, "total_downloaded": s.downloaded_bytes } }
-        if not await self._safe_write(response, f"data: {json.dumps(model_data)}\n\n".encode()):
-          # Client đã đóng connection, dừng loop
-          break
-      # Chỉ ghi [DONE] nếu client vẫn còn kết nối
-      await self._safe_write(response, b"data: [DONE]\n\n")
-      return response
-
-    except Exception as e:
-      print(f"Error in handle_model_support: {str(e)}")
-      traceback.print_exc()
-      return web.json_response({"detail": f"Server error: {str(e)}"}, status=500)
 
   async def _get_synapse_api_urls(self) -> List[str]:
     """Danh sách Synapse API URL của các node khác (để training phân tán). Loại trừ máy này."""
@@ -776,23 +753,6 @@ class ChatGPTAPI:
         print(f"_get_synapse_api_urls: {e}")
     return []
 
-  async def _trigger_training_on_peers(self, body: dict) -> None:
-    """Gửi cùng lệnh training start tới tất cả node khác (phân tán). Chạy nền."""
-    urls = await self._get_synapse_api_urls()
-    if not urls:
-      return
-    import aiohttp
-    async def post_one(base_url: str) -> None:
-      url = f"{base_url.rstrip('/')}/v1/training/start"
-      try:
-        async with aiohttp.ClientSession() as session:
-          async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            if resp.status in (200, 201) and DEBUG >= 1:
-              print(f"Training phân tán: đã gửi start tới {base_url}")
-      except Exception as e:
-        if DEBUG >= 1:
-          print(f"Training phân tán gửi tới {base_url}: {e}")
-    await asyncio.gather(*[post_one(u) for u in urls], return_exceptions=True)
 
   async def handle_get_models(self, request):
     """Danh sách model: từ HF_MODELS (download + web UI) và hf_models.json."""
@@ -949,7 +909,7 @@ class ChatGPTAPI:
         "downloaded": downloaded,
         "available": available,
       })
-    except Exception as e:
+    except Exception:
       if DEBUG >= 1:
         traceback.print_exc()
       # Fallback
@@ -1082,7 +1042,7 @@ class ChatGPTAPI:
   async def handle_post_models_merge(self, request):
     """Hợp nhất models/adapters. Body: base_model, adapters (list of paths), output_name, merge_type."""
     try:
-      from synapse.training.merging import merge_lora_adapters, merge_models_checkpoints
+      from synapse.training.merging import merge_lora_adapters
       body = await request.json()
       base_model = body.get("base_model")
       adapters = body.get("adapters", []) # List of paths or names in checkpoints/
@@ -1138,7 +1098,7 @@ class ChatGPTAPI:
     print(f"[INFO] handle_post_chat_completions called: path={request.path}, remote={request.remote}")
     print(f"[INFO] Request method: {request.method}, content_type: {request.content_type}")
     try:
-      print(f"[INFO] Reading request JSON...")
+      print("[INFO] Reading request JSON...")
       data = await request.json()
       print(f"[INFO] Request data received: model={data.get('model')}, stream={data.get('stream')}, messages_count={len(data.get('messages', []))}")
       max_tokens = data.get("max_tokens")
@@ -1200,7 +1160,7 @@ class ChatGPTAPI:
                 if msg.role == "user":
                   msg.content = (msg.content or "") + inject
                   break
-            except Exception as e:
+            except Exception:
               if DEBUG >= 1:
                 traceback.print_exc()
         # Inject system prompt và tool instructions
@@ -1446,7 +1406,7 @@ class ChatGPTAPI:
                       print(f"[WARN] process_task_2 cleanup error for {request_id_2}: {cleanup_e}")
                       traceback.print_exc()
                 return web.json_response(completion)
-              except Exception as tool_e:
+              except Exception:
                 if DEBUG >= 1:
                   traceback.print_exc()
                 completion = generate_completion(
@@ -1521,7 +1481,7 @@ class ChatGPTAPI:
 
   async def handle_get_initial_models(self, request):
     """Danh sách model: từ HF_MODELS; downloaded = có trong HF cache."""
-    downloaded_names = self._get_hf_downloaded_names()
+    self._get_hf_downloaded_names()
     model_data = {}
     return web.json_response(model_data)
 
@@ -1862,107 +1822,6 @@ class ChatGPTAPI:
           "network_discovery": discovery_type
       })
   
-  async def handle_check_model_fit(self, request):
-      """
-      Kiểm tra tương thích phần cứng cho một model cụ thể.
-      POST /api/v1/model/check
-      Body: { "model_name": "meta-llama/Llama-3.1-8B-Instruct", "quantization": "Q4_K_M" }
-      """
-      try:
-          body = await request.json()
-          model_name = body.get("model_name", "")
-          quantization = body.get("quantization", "Q4_K_M")
-          
-          if not model_name:
-              return web.json_response({"error": "model_name is required"}, status=400)
-          
-          # Import helpers for model analysis
-          from synapse.helpers import (
-              _estimate_model_memory_gb, _score_fit, _fit_emoji,
-              _load_model_db, _fuzzy_find_model, _QUANT_SPEED
-          )
-          from synapse.topology.device_capabilities import SystemSpecs
-          
-          # Detect hardware
-          specs = SystemSpecs.detect()
-          
-          # Find model in database
-          db = _load_model_db()
-          entry = _fuzzy_find_model(model_name, db)
-          
-          if entry:
-              params_b = entry.get("parameters_raw", 0) / 1e9 if entry.get("parameters_raw") else 7.0
-              ctx = entry.get("context_length", 4096)
-              default_quant = entry.get("quantization", quantization)
-              quant_to_use = quantization if quantization else default_quant
-          else:
-              # Try to parse from model name
-              import re
-              param_match = re.search(r"(\d+\.?\d*)\s*b", model_name.lower())
-              params_b = float(param_match.group(1)) if param_match else 7.0
-              ctx = 4096
-              quant_to_use = quantization
-          
-          # Determine available memory budget
-          if specs.has_gpu and specs.gpu_vram_gb and specs.gpu_vram_gb > 0:
-              budget_gb = specs.gpu_vram_gb
-              memory_label = f"GPU VRAM: {budget_gb:.1f}GB"
-              run_mode = "GPU"
-          elif specs.unified_memory and specs.gpu_vram_gb:
-              budget_gb = specs.gpu_vram_gb
-              memory_label = f"Unified Memory: {budget_gb:.1f}GB"
-              run_mode = "Unified"
-          else:
-              budget_gb = specs.available_ram_gb
-              memory_label = f"System RAM: {budget_gb:.1f}GB available"
-              run_mode = "CPU"
-          
-          # Calculate memory needed
-          mem_required = _estimate_model_memory_gb(params_b, quant_to_use, ctx)
-          fit = _score_fit(mem_required, budget_gb)
-          fit_emoji = _fit_emoji(fit)
-          
-          # Estimate speed (tokens/s) - base speed varies by backend
-          base_speed = 40.0  # Default base speed
-          if specs.backend and specs.backend.value == "CUDA":
-              base_speed = 50.0
-          elif specs.backend and specs.backend.value == "Metal":
-              base_speed = 45.0
-          
-          quant_speed = _QUANT_SPEED.get(quant_to_use, 1.0)
-          estimated_speed = round(base_speed * quant_speed, 1)
-          
-          # Generate notes
-          notes = []
-          if fit == "Too Tight":
-              notes.append("Model requires more memory than available. Consider using lower quantization or fewer context tokens.")
-          elif fit == "Marginal":
-              notes.append("Memory usage is high. May experience slowdowns with large contexts.")
-          elif fit == "Good":
-              notes.append("Model should run well with this configuration.")
-          else:
-              notes.append("Model fits comfortably in memory.")
-          
-          return web.json_response({
-              "model": model_name,
-              "parameters": f"{params_b:.1f}B",
-              "parameters_raw": params_b,
-              "quantization": quant_to_use,
-              "context_length": ctx,
-              "memory_needed_gb": round(mem_required, 2),
-              "memory_available_gb": round(budget_gb, 1),
-              "fit": fit,
-              "fit_emoji": fit_emoji,
-              "estimated_speed": estimated_speed,
-              "run_mode": run_mode,
-              "memory_label": memory_label,
-              "notes": " ".join(notes),
-          })
-      except Exception as e:
-          import traceback
-          if DEBUG >= 2:
-              traceback.print_exc()
-          return web.json_response({"error": str(e)}, status=500)
   
   async def handle_get_models_compatibility(self, request):
       """
@@ -2405,12 +2264,12 @@ class ChatGPTAPI:
     try:
         path.relative_to(data_dir)
         is_in_data = True
-        print(f"[DEBUG] Matched Whitelist (Default Data Dir)")
+        print("[DEBUG] Matched Whitelist (Default Data Dir)")
     except (ValueError, Exception):
         pass
 
     if not is_linked and not is_in_data:
-      print(f"[DEBUG] [LỖI] Truy cập bị từ chối: Đường dẫn không nằm trong Whitelist")
+      print("[DEBUG] [LỖI] Truy cập bị từ chối: Đường dẫn không nằm trong Whitelist")
       return None
 
     if not path.exists():
@@ -2801,6 +2660,10 @@ class ChatGPTAPI:
           if lora_config is not None:
             from peft import get_peft_model
             engine = self.node.inference_engine
+            # Layer-range loading leaves _model None until training needs it:
+            # load the whole model now or LoRA was silently skipped.
+            if getattr(engine, "_model", None) is None and hasattr(engine, "_ensure_full"):
+              await engine._ensure_full(base_shard)
             if hasattr(engine, "_model") and engine._model is not None:
               engine._model = get_peft_model(engine._model, lora_config)
               if hasattr(engine._model, "print_trainable_parameters"):
@@ -3194,7 +3057,7 @@ class ChatGPTAPI:
         "latency_matrix": latency_matrix,
         "training_job": self._training_job,
       })
-    except Exception as e:
+    except Exception:
       if DEBUG >= 1: traceback.print_exc()
       return web.json_response({"nodes": [], "total_nodes": 0, "total_layers": 32, "strategy_name": "Error"}, status=500)
 
@@ -3231,14 +3094,14 @@ class ChatGPTAPI:
         raise RuntimeError(msg) from e
       display_host = "127.0.0.1" if host == "0.0.0.0" else host
 
-      print(f"[INFO] Available endpoints:")
+      print("[INFO] Available endpoints:")
       print(f"[INFO]   - POST http://{display_host}:{port}/v1/chat/completions")
       print(f"[INFO]   - GET  http://{display_host}:{port}/v1/models")
       print(f"[INFO]   - GET  http://{display_host}:{port}/ (status page)")
       try:
         _, tailscale_ips = await get_self_tailscale_info()
         if tailscale_ips:
-          print(f"[INFO]   (Tailscale - máy khác truy cập):")
+          print("[INFO]   (Tailscale - máy khác truy cập):")
           for ip in tailscale_ips:
             print(f"[INFO]   - POST http://{ip}:{port}/v1/chat/completions")
             print(f"[INFO]   - GET  http://{ip}:{port}/v1/models")
@@ -3246,7 +3109,7 @@ class ChatGPTAPI:
         else:
           lan_ips = [ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip and ip not in ("127.0.0.1", "::1", "localhost")]
           if lan_ips:
-            print(f"[INFO]   (Tailscale chưa bật — máy khác truy cập qua LAN):")
+            print("[INFO]   (Tailscale chưa bật — máy khác truy cập qua LAN):")
             for ip in lan_ips:
               print(f"[INFO]   - GET  http://{ip}:{port}/ (status page)")
           else:
@@ -3264,11 +3127,11 @@ class ChatGPTAPI:
         await asyncio.Event().wait()  # Chờ vô hạn cho đến khi task bị cancel
         print("DEBUG: API Server wait loop finished (unexpectedly)!")
       except asyncio.CancelledError:
-        print(f"[INFO] API server shutdown requested")
+        print("[INFO] API server shutdown requested")
         raise  # Re-raise để cleanup được thực hiện
     except asyncio.CancelledError:
       # Normal shutdown
-      print(f"[INFO] API server shutting down...")
+      print("[INFO] API server shutting down...")
     except Exception as e:
       print(f"[ERROR] ERROR starting API server: {e}")
       import traceback
@@ -3279,6 +3142,6 @@ class ChatGPTAPI:
       if runner:
         try:
           await runner.cleanup()
-          print(f"[INFO] API server cleanup completed")
+          print("[INFO] API server cleanup completed")
         except Exception as e:
           print(f"[WARNING] Error during runner cleanup: {e}")

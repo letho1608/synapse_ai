@@ -20,7 +20,7 @@ from __future__ import annotations
 import copy
 import json
 import os
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 import torch
 from torch import nn
@@ -261,7 +261,6 @@ class PartialModel:
         return freed
 
     def loaded_bytes(self) -> int:
-        from synapse.inference.weight_quant import module_bytes
         mods = list(self.layers.values()) + [m for m in (
             self.embed, self.pos_embed, self.final_norm, self.lm_head, self.rotary) if m is not None]
         seen, total = set(), 0

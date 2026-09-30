@@ -14,21 +14,16 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
-import json
 import socket
 import struct
 import time
 import uuid
-from typing import Any, Callable, Dict, Optional, Set, Tuple
-from collections import deque
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from synapse.transport.codec import (
     AsyncTensorForwarder,
     TensorMessage,
-    encode_tensor,
-    decode_tensor,
     CHUNK_MAGIC,
-    CHUNK_TIMEOUT_S,
     MAX_BLOB_BYTES,
     ChunkReassembler,
     ChunkRefused,
@@ -86,7 +81,7 @@ class TCPServer:
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
-        peer = writer.get_extra_info("peername")
+        writer.get_extra_info("peername")
         try:
             sock = writer.get_extra_info("socket")
             if sock is not None:

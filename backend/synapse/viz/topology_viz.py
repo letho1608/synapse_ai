@@ -9,12 +9,9 @@ from synapse.topology.device_capabilities import UNKNOWN_DEVICE_CAPABILITIES
 from rich.console import Console, Group
 from rich.text import Text
 from rich.live import Live
-from rich.style import Style
 from rich.table import Table
 from rich.layout import Layout
-from rich.syntax import Syntax
 from rich.panel import Panel
-from rich.markdown import Markdown
 
 
 class TopologyViz:

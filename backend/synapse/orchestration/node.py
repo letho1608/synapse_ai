@@ -3,15 +3,14 @@ import json
 import asyncio
 import uuid
 import time
-import os
 import traceback
-from typing import List, Dict, Optional, Tuple, Union, Set, Any
+from typing import List, Dict, Optional, Tuple, Set, Any
 from loguru import logger
 from synapse.inference.inference_engine import InferenceEngine, Shard, get_inference_engine
 from synapse.topology.topology import Topology
 from synapse.topology.device_capabilities import device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.topology.partitioning_strategy import Partition, map_partitions_to_shards, TFLOPSProportionalPartitioner
-from synapse.topology.partitioner import compute_partition, LACPPartition, ShardAssignment
+from synapse.topology.partitioner import compute_partition
 from synapse.topology.resource_weight import NodeResources, ResourceScorer, apply_measured_bandwidth
 from synapse.topology.latency_matrix import LatencyMatrix, LatencyEntry, LatencyProber
 from synapse import DEBUG
@@ -21,8 +20,7 @@ from synapse.inference.pytorch_hf_engine import HFShardDownloader as ShardDownlo
 from synapse.routing import EventRouter, Event
 from synapse.routing.libp2p_node import Libp2pNode
 from synapse.orchestration.election import ElectionManager
-from synapse.networking.peer_handle import PeerHandle
-from synapse.shared.state import ClusterState, NodeState
+from synapse.shared.state import ClusterState
 from synapse.monitoring.realtime import RealtimeMonitor, NodeMetrics
 from synapse.transport.codec import encode_tensor, decode_tensor
 
@@ -1047,20 +1045,8 @@ class Node:
         if DEBUG >= 1:
           print(f"[{request_id}] [DEBUG] Sampled token_value: {token_value}")
 
-        # Get eos_token_id safely
-        eos_token_id = None
-        if hasattr(self.inference_engine, 'tokenizer') and self.inference_engine.tokenizer is not None:
-          eos_token_id = getattr(self.inference_engine.tokenizer, 'eos_token_id', None)
-          if eos_token_id is None and hasattr(self.inference_engine.tokenizer, '_tokenizer'):
-            eos_token_id = getattr(self.inference_engine.tokenizer._tokenizer, 'eos_token_id', None)
+        stop_ids = self._stop_token_ids()
 
-        # Qwen-specific stop tokens
-        qwen_stop_tokens = [151643, 151644, 151645]
-
-        stop_ids = set(qwen_stop_tokens)
-        if eos_token_id is not None:
-          stop_ids.add(eos_token_id)
-        
         if len(buf) == 0 and token_value in stop_ids and result.size > 0:
           try:
             retry_logits = np.array(result, copy=True)
@@ -1094,7 +1080,7 @@ class Node:
             is_finished = True
         
         # Stop token detection
-        if (eos_token_id is not None and token_value == eos_token_id) or (token_value in qwen_stop_tokens):
+        if token_value in stop_ids:
           if DEBUG >= 1:
             print(f"[{request_id}] Detected EOS/stop token (ID: {token_value}). Stopping generation.")
           is_finished = True
@@ -1169,14 +1155,8 @@ class Node:
 
 
   def _stop_token_ids(self) -> set:
-    ids = {151643, 151644, 151645}  # Qwen chat stop tokens
-    tok = getattr(self.inference_engine, "tokenizer", None)
-    eos = getattr(tok, "eos_token_id", None) if tok is not None else None
-    if eos is None and tok is not None and hasattr(tok, "_tokenizer"):
-      eos = getattr(tok._tokenizer, "eos_token_id", None)
-    if isinstance(eos, int):
-      ids.add(eos)
-    return ids
+    from synapse.inference.inference_engine import stop_token_ids
+    return stop_token_ids(getattr(self.inference_engine, "tokenizer", None))
 
   async def _publish_verify_result(self, shard, result, request_id, state, orchestrator_id) -> None:
     """Sample the last `verify_n` positions (position j conditioned on the
@@ -1246,7 +1226,7 @@ class Node:
     max_generate_tokens: Optional[int] = None,
   ) -> Optional[np.ndarray]:
     shard = self.get_current_shard(base_shard)
-    start_time = time.perf_counter_ns()
+    time.perf_counter_ns()
     self._schedule_task(
       self.broadcast_opaque_status(
         request_id,
@@ -2100,20 +2080,6 @@ class Node:
     if DEBUG >= 1:
       print(f"[{request_id}] [CALLBACK] Callbacks triggered successfully")
   
-  async def broadcast_result(self, request_id: str, result: List[int], is_finished: bool) -> None:
-    if DEBUG >= 2: print(f"Broadcasting result: {request_id=} {result=} {is_finished=}")
-    async def send_result_to_peer(peer):
-      try:
-        if DEBUG >= 1: print(f"  [BROADCAST] Sending to {peer.id()}...")
-        await asyncio.wait_for(peer.send_result(request_id, result, is_finished), timeout=30.0)
-        if DEBUG >= 1: print(f"  [BROADCAST] Sent to {peer.id()} successfully.")
-      except asyncio.TimeoutError:
-        print(f"!!! [BROADCAST_TIMEOUT] Timeout broadcasting result to {peer.id()} (30s)")
-      except Exception as e:
-        print(f"!!! [BROADCAST_ERROR] Error broadcasting result to {peer.id()}: {e}")
-        traceback.print_exc()
-
-    await asyncio.gather(*[send_result_to_peer(peer) for peer in self.peers], return_exceptions=True)
 
   async def broadcast_opaque_status(self, request_id: str, status: str) -> None:
     if DEBUG >= 8: print(f"Broadcasting opaque status: {request_id=} {status=}")
@@ -2269,32 +2235,43 @@ class Node:
     shards = map_partitions_to_shards(parts, n, model_id)
     return [(p.node_id, shards[i]) for i, p in enumerate(parts) if i < len(shards)]
 
-  async def _warm_replica(self, base_shard: Shard, partitions) -> None:
-    """SYNAPSE_REPLICAS=1: also hold the NEXT stage's layers (if they fit),
-    so when that node dies the patch plan finds a replica already in memory
-    instead of loading weights mid-request."""
+  async def _apply_layer_residency(self, base_shard: Shard, partitions) -> None:
+    """After a new placement: keep only the layers this node serves (plus,
+    with SYNAPSE_REPLICAS=1, the NEXT stage's range if it fits, so a dead
+    successor's range is already in memory for the failover patch) and free
+    the rest. Without this, every re-placement left the old layers loaded
+    for good. A request still on an older plan just reloads on demand."""
     import os as _os
-    if _os.getenv("SYNAPSE_REPLICAS", "0") != "1" or not partitions:
+    if not partitions:
       return
     try:
       from synapse.topology.partitioning_strategy import map_partitions_to_shards
       n = base_shard.n_layers
       shards = map_partitions_to_shards(partitions, n, base_shard.model_id)
       ids = [p.node_id for p in partitions]
-      if self.id not in ids or len(ids) < 2:
-        return
-      i = ids.index(self.id)
-      succ = shards[(i + 1) % len(shards)]
-      mine = shards[i]
-      prof = self._local_layer_profile(base_shard.model_id) or {}
-      if (mine.end_layer - mine.start_layer + 1) + (succ.end_layer - succ.start_layer + 1) \
-          > int(prof.get("max_layers") or 0):
-        return
-      await self.inference_engine.ensure_shard(succ)
-      if DEBUG >= 1:
-        print(f"[REPLICA] {self.id} holds layers {succ.start_layer}-{succ.end_layer} of {ids[(i + 1) % len(ids)]}")
+      keep = set()
+      if self.id in ids:
+        i = ids.index(self.id)
+        mine = shards[i]
+        keep |= set(range(mine.start_layer, mine.end_layer + 1))
+        if _os.getenv("SYNAPSE_REPLICAS", "0") == "1" and len(ids) > 1:
+          succ = shards[(i + 1) % len(shards)]
+          prof = self._local_layer_profile(base_shard.model_id) or {}
+          need = len(keep) + (succ.end_layer - succ.start_layer + 1)
+          if need <= int(prof.get("max_layers") or 0):
+            await self.inference_engine.ensure_shard(succ)
+            keep |= set(range(succ.start_layer, succ.end_layer + 1))
+            if DEBUG >= 1:
+              print(f"[REPLICA] {self.id} holds layers {succ.start_layer}-{succ.end_layer} "
+                    f"of {ids[(i + 1) % len(ids)]}")
+      eng = self.inference_engine
+      release = getattr(eng, "release_layers", None)
+      if callable(release) and getattr(eng, "_model_id", None) == base_shard.model_id:
+        freed = release(sorted(keep))
+        if freed and DEBUG >= 1:
+          print(f"[RESIDENCY] {self.id} freed layers {freed[0]}-{freed[-1]} ({len(freed)})")
     except Exception as e:
-      if DEBUG >= 1: print(f"[REPLICA] warm-up failed: {e}")
+      if DEBUG >= 1: print(f"[RESIDENCY] update failed: {e}")
 
   def _note_profile_model(self, model_id: Optional[str]) -> None:
     if model_id:
@@ -2332,7 +2309,7 @@ class Node:
     import os as _os
     if base_shard is None or _os.getenv("SYNAPSE_PARTITIONER", "measured") == "legacy":
       return None
-    from synapse.topology.dp_partition import NodeProfile, plan, _dp_for_order
+    from synapse.topology.dp_partition import NodeProfile, plan
     model_id, total = base_shard.model_id, base_shard.n_layers
     if not model_id or total <= 0:
       return None
@@ -2358,7 +2335,7 @@ class Node:
     if prev is not None and prev.get("model_id") == model_id and prev.get("total") == total \
         and all(nid in self.topology.nodes for nid, _, _ in prev["stages"]):
       by_id = {p.node_id: p for p in profiles}
-      order = [by_id[nid] for nid, _, _ in prev["stages"]]
+      [by_id[nid] for nid, _, _ in prev["stages"]]
       stages = prev["stages"]
       # current cost of the previous placement
       cost = 0.0
@@ -2672,7 +2649,7 @@ class Node:
     partitions = self._compute_lacp_partition(base_shard)
     self._authoritative_partitions = partitions
     self._authoritative_base_shard = base_shard
-    self._schedule_task(self._warm_replica(base_shard, partitions), "warm_replica")
+    self._schedule_task(self._apply_layer_residency(base_shard, partitions), "layer_residency")
 
     partition_data = [{"node_id": p.node_id, "start": p.start, "end": p.end} for p in partitions]
     await self.event_router.publish("synapse/cluster/partition", {
@@ -2693,5 +2670,5 @@ class Node:
             if base_shard_dict:
                 self._authoritative_base_shard = Shard.from_dict(base_shard_dict)
                 self._note_profile_model(self._authoritative_base_shard.model_id)
-                self._schedule_task(self._warm_replica(
-                  self._authoritative_base_shard, self._authoritative_partitions), "warm_replica")
+                self._schedule_task(self._apply_layer_residency(
+                  self._authoritative_base_shard, self._authoritative_partitions), "layer_residency")

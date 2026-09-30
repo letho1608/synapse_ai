@@ -314,7 +314,7 @@ def decode_tensor(data: bytes) -> Tuple[np.ndarray, Optional[Dict]]:
         "!4sHHII", data[:HEADER_SIZE]
     )
     is_compressed = compr_field & 3
-    compressed_size = compr_field >> 2
+    compr_field >> 2
 
     if magic != MAGIC:
         raise ValueError(f"Invalid magic bytes: {magic!r}")
@@ -434,13 +434,6 @@ class AsyncTensorForwarder:
         if (request_id, stage_id) not in self._queues:
             self._queues[(request_id, stage_id)] = deque()
 
-    def register_receiver(
-        self, request_id: str, stage_id: int,
-    ):
-        """Ensure a receive queue exists for a stage."""
-        key = (request_id, stage_id)
-        if key not in self._queues:
-            self._queues[key] = deque()
 
     async def send(
         self, message: TensorMessage,

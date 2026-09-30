@@ -1,5 +1,4 @@
 import numpy as np
-import os
 from synapse.helpers import DEBUG  # Make sure to import DEBUG
 
 from typing import Tuple, Optional, TYPE_CHECKING
@@ -111,3 +110,19 @@ def get_inference_engine(inference_engine_name: str, shard_downloader: "ShardDow
     return PyTorchHFInferenceEngine(shard_downloader=downloader)
 
   raise ValueError(f"Unsupported inference engine: '{inference_engine_name}'. Supported engines: {supported_engines}")
+
+
+# Qwen chat-template stop tokens (<|endoftext|>, <|im_start|>, <|im_end|>).
+QWEN_STOP_TOKENS = (151643, 151644, 151645)
+
+
+def stop_token_ids(tokenizer) -> set:
+    """Token ids that end a generation: the tokenizer's EOS plus the Qwen
+    chat stop tokens. One definition for every sampling path."""
+    ids = set(QWEN_STOP_TOKENS)
+    eos = getattr(tokenizer, "eos_token_id", None) if tokenizer is not None else None
+    if eos is None and tokenizer is not None and hasattr(tokenizer, "_tokenizer"):
+        eos = getattr(tokenizer._tokenizer, "eos_token_id", None)
+    if isinstance(eos, int):
+        ids.add(eos)
+    return ids

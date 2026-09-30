@@ -3,13 +3,12 @@ import time
 import traceback
 import socket
 import aiohttp
-from typing import List, Dict, Callable, Tuple, Set
-from synapse.networking.discovery import Discovery
+from typing import List, Dict, Callable, Tuple
+from synapse.networking.discovery import Discovery, prune_stale_peers
 from synapse.networking.peer_handle import PeerHandle
 from synapse.topology.device_capabilities import DeviceCapabilities, device_capabilities, UNKNOWN_DEVICE_CAPABILITIES
 from synapse.helpers import DEBUG, DEBUG_DISCOVERY
-from synapse.helpers import get_all_local_ips as _get_all_local_ips
-from .tailscale_helpers import get_device_id, get_self_tailscale_info, update_device_attributes, get_device_attributes, get_tailscale_devices, Device
+from .tailscale_helpers import get_device_id, update_device_attributes, get_device_attributes, get_tailscale_devices, Device
 
 
 class TailscaleDiscovery(Discovery):
@@ -75,7 +74,7 @@ class TailscaleDiscovery(Discovery):
             try:
                 await self.update_device_posture_attributes()
                 if DEBUG_DISCOVERY >= 2:
-                    print(f"Updated device posture attributes")
+                    print("Updated device posture attributes")
             except Exception as e:
                 if DEBUG_DISCOVERY >= 1:
                     print(f"TailscaleDiscovery: Unexpected error in posture update loop: {e}")
@@ -188,122 +187,9 @@ class TailscaleDiscovery(Discovery):
     async def task_cleanup_peers(self):
         while True:
             try:
-                current_time = time.time()
-                peers_to_remove = []
-
-                peer_ids = list(self.known_peers.keys())
-                results = await asyncio.gather(*[self.check_peer(peer_id, current_time) for peer_id in peer_ids], return_exceptions=True)
-
-                for peer_id, should_remove in zip(peer_ids, results):
-                    if should_remove: peers_to_remove.append(peer_id)
-
-                if DEBUG_DISCOVERY >= 2:
-                    print(
-                        "Peer statuses:", {
-                            peer_handle.id(): f"is_connected={await peer_handle.is_connected()}, health_check={await peer_handle.health_check()}, connected_at={connected_at}, last_seen={last_seen}"
-                            for peer_handle, connected_at, last_seen in self.known_peers.values()
-                        }
-                    )
-
-                for peer_id in peers_to_remove:
-                    if peer_id in self.known_peers:
-                        del self.known_peers[peer_id]
-                        if DEBUG_DISCOVERY >= 2: print(f"Removed peer {peer_id} due to inactivity or failed health check.")
+                await prune_stale_peers(self.known_peers, self.discovery_timeout, DEBUG_DISCOVERY)
             except Exception as e:
                 print(f"Error in cleanup peers: {e}")
                 print(traceback.format_exc())
             finally:
                 await asyncio.sleep(self.discovery_interval)
-
-    async def check_peer(self, peer_id: str, current_time: float) -> bool:
-        peer_handle, connected_at, last_seen = self.known_peers.get(peer_id, (None, None, None))
-        if peer_handle is None: return False
-
-        try:
-            is_connected = await peer_handle.is_connected()
-            health_ok = await peer_handle.health_check()
-        except Exception as e:
-            if DEBUG_DISCOVERY >= 2: print(f"Error checking peer {peer_id}: {e}")
-            return True
-
-        should_remove = ((not is_connected and current_time - connected_at > self.discovery_timeout) or (current_time - last_seen > self.discovery_timeout) or (not health_ok))
-        return should_remove
-
-    async def get_devices_for_ui(self) -> List[Dict]:
-        """Trả về danh sách thiết bị Tailscale cho Web UI giám sát (có kèm thông tin Synapse nếu có)."""
-        try:
-            our_device_id, our_tailscale_ips = await get_self_tailscale_info()
-            our_ips_for_match = list(our_tailscale_ips) if our_tailscale_ips else list(_get_all_local_ips())
-            hostname = (socket.gethostname() or "").strip().lower()
-            devices: Dict[str, Device] = await get_tailscale_devices(self.tailscale_api_key, self.tailnet)
-            current_time = time.time()
-            result = []
-            for name, device in devices.items():
-                last_seen_sec = (current_time - device.last_seen.timestamp()) if device.last_seen else None
-                addrs = device.addresses or []
-                addrs_flat = [str(a) if isinstance(a, str) else str(a.get("addr") or a.get("ip") or "") for a in addrs]
-                match_id = our_device_id is not None and str(device.device_id) == str(our_device_id)
-                match_ip = bool(our_ips_for_match and any(
-                    ip == addr or ip in addr or addr.startswith(ip + "/") or addr.startswith(ip + ":")
-                    for ip in our_ips_for_match for addr in addrs_flat if addr
-                ))
-                match_name = (name == self.node_id) or (self.node_id and (name == self.node_id or self.node_id in name))
-                match_hostname = bool(hostname and name and hostname in name.lower())
-                is_self = match_id or match_ip or match_name or match_hostname
-                row = {
-                    "name": name,
-                    "device_id": device.device_id,
-                    "addresses": device.addresses or [],
-                    "last_seen_iso": device.last_seen.isoformat() if device.last_seen else None,
-                    "last_seen_sec_ago": round(last_seen_sec) if last_seen_sec is not None else None,
-                    "is_self": is_self,
-                    "is_synapse_node": False,
-                    "synapse_node_id": None,
-                    "synapse_port": None,
-                    "model": None,
-                    "memory_gb": None,
-                    "flops_fp16": None,
-                    "flops_fp32": None,
-                    "cpu_cores": None,
-                    "disk_gb": None,
-                    "system_ram_gb": None,
-                }
-                try:
-                    peer_id, peer_port, caps = await get_device_attributes(device.device_id, self.tailscale_api_key)
-                    if peer_id:
-                        row["is_synapse_node"] = True
-                        row["synapse_node_id"] = peer_id
-                        row["synapse_port"] = peer_port
-                        row["model"] = caps.model or ""
-                        row["memory_gb"] = caps.memory // 1024 if caps.memory else None
-                        row["flops_fp16"] = float(caps.flops.fp16) if caps.flops else 0.0
-                        row["flops_fp32"] = float(caps.flops.fp32) if caps.flops else 0.0
-                        row["cpu_cores"] = caps.cpu_cores
-                        row["disk_gb"] = caps.disk_gb
-                        row["system_ram_gb"] = (getattr(caps, "system_ram_mb", 0) or 0) // 1024
-                except Exception:
-                    pass
-                # Máy này: luôn dùng device_capabilities local (gọi mới mỗi lần) để hiển thị đúng
-                if is_self:
-                    try:
-                        caps_local = await device_capabilities()
-                    except Exception:
-                        caps_local = self.device_capabilities
-                    if caps_local:
-                        row["is_synapse_node"] = True
-                        row["synapse_node_id"] = self.node_id
-                        row["synapse_port"] = self.node_port
-                        row["model"] = caps_local.model or ""
-                        row["memory_gb"] = caps_local.memory // 1024 if caps_local.memory else 0
-                        row["flops_fp16"] = float(caps_local.flops.fp16) if caps_local.flops else 0.0
-                        row["flops_fp32"] = float(caps_local.flops.fp32) if caps_local.flops else 0.0
-                        row["cpu_cores"] = caps_local.cpu_cores
-                        row["disk_gb"] = caps_local.disk_gb
-                        row["system_ram_gb"] = (getattr(caps_local, "system_ram_mb", 0) or 0) // 1024
-                result.append(row)
-            return result
-        except Exception as e:
-            if DEBUG_DISCOVERY >= 1:
-                print(f"TailscaleDiscovery get_devices_for_ui: {e}")
-                traceback.print_exc()
-            return []

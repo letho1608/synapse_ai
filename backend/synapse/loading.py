@@ -4,14 +4,12 @@ Handles loading models from HuggingFace cache.
 """
 
 import os
-import json
-import asyncio
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict
 from dataclasses import dataclass
 from synapse.inference.shard import Shard
-from synapse.helpers import AsyncCallbackSystem, DEBUG
+from synapse.helpers import AsyncCallbackSystem
 
 
 @dataclass

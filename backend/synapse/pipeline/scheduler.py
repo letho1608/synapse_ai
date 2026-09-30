@@ -28,12 +28,9 @@ with micro-batch overlapping:
 
 from __future__ import annotations
 
-import asyncio
-import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional, Callable, Awaitable, Any, Tuple
+from typing import Dict, List, Optional, Any
 import numpy as np
 
 
@@ -240,15 +237,3 @@ class PipelineScheduler:
             return 0.0
 
         return single_time / pipeline_time
-
-
-@dataclass
-class PipelineStageState:
-    """Runtime state for a single pipeline stage."""
-    stage: PipelineStage
-    current_step: int = 0
-    pending_input: Optional[np.ndarray] = None
-    pending_output: Optional[np.ndarray] = None
-    completed_batches: int = 0
-    total_time_ms: float = 0.0
-    batches_per_second: float = 0.0

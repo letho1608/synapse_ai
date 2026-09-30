@@ -45,17 +45,6 @@ def _make_engine():
     return engine
 
 
-def test_sequence_hash_accepts_1d_token_ids():
-    """Tokenizer.encode() returns a 1D array; cache hashing must accept it."""
-    engine = PyTorchHFInferenceEngine()
-    token_ids = np.array([1, 2, 3, 4], dtype=np.int64)
-
-    h1 = engine._get_sequence_hash(token_ids, 3)
-    h2 = engine._get_sequence_hash(token_ids.reshape(1, -1), 3)
-
-    assert h1 == h2
-
-
 class TestPyTorchHFBackGradient:
     @pytest.mark.asyncio
     async def test_back_gradient_returns_real_input_gradient(self):

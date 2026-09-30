@@ -1,7 +1,7 @@
 import asyncio
 import time
 import uuid
-from typing import Optional, Tuple, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set
 import numpy as np
 from synapse.networking.peer_handle import PeerHandle
 from synapse.inference.shard import Shard
@@ -158,7 +158,6 @@ class P2PPeerHandle(PeerHandle):
                 loss = res.get("loss", 0.0)
                 grads_data = res.get("grads_data")
                 if grads_data is not None:
-                    from synapse.inference.shard import Shard
                     grads_shape = res.get("grads_shape", [])
                     grads_dtype = res.get("grads_dtype", "float32")
                     grads = np.frombuffer(grads_data, dtype=np.dtype(grads_dtype)).reshape(grads_shape)
@@ -231,7 +230,7 @@ class P2PPeerHandle(PeerHandle):
             if DEBUG >= 3: print(f"[RPC] {self._id} publishing to {request_topic}")
             print(f"[DEBUG-RPC] publishing to event_router topic={request_topic}", flush=True)
             await self.event_router.publish(request_topic, data)
-            print(f"[DEBUG-RPC] publish returned, waiting for future...", flush=True)
+            print("[DEBUG-RPC] publish returned, waiting for future...", flush=True)
             if DEBUG >= 3: print(f"[RPC] {self._id} waiting for {response_topic}, timeout={timeout}s")
             # Wait for response
             result = await asyncio.wait_for(future, timeout=timeout)

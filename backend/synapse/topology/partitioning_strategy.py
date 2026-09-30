@@ -1,11 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional
+from typing import List, Optional
 from dataclasses import dataclass
 from .topology import Topology
 from synapse.inference.shard import Shard
-from synapse.topology.device_capabilities import device_capabilities
-from synapse.topology.resource_weight import NodeResources
-import asyncio
 
 
 # Partitions shard-space into pieces of contiguous shards, represented by floating point range [start, end) between 0 and 1

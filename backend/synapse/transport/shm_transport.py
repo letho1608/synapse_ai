@@ -153,10 +153,6 @@ class SharedMemoryTransport:
         if peer_t is not None:
             self._local_notify[peer_id] = peer_t._deliver
 
-    def unregister_peer(self, addr: str) -> None:
-        pid = self._peer_ids.pop(addr, None)
-        if pid:
-            self._local_notify.pop(pid, None)
 
     def can_deliver(self, addr: str) -> bool:
         """True only when send_tensor can actually deliver to this peer: it

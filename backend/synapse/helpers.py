@@ -6,12 +6,9 @@ from typing import Callable, TypeVar, Optional, Dict, Generic, Tuple, List
 import socket
 import random
 import psutil
-import re
-import subprocess
 from pathlib import Path
 import tempfile
 import json
-from concurrent.futures import ThreadPoolExecutor
 import traceback
 
 DEBUG = int(os.getenv("DEBUG", default="0"))
@@ -359,7 +356,7 @@ def check_model_hardware_fit(model_name: str) -> None:
         run_mode = "CPU"
 
     print(f"\n{'='*55}")
-    print(f"  SYSTEM - Hardware Check")
+    print("  SYSTEM - Hardware Check")
     print(f"{'='*55}")
     print(f"  CPU  : {specs.cpu_name} ({specs.total_cpu_cores} cores)")
     print(f"  RAM  : {specs.total_ram_gb:.1f}GB total, {specs.available_ram_gb:.1f}GB available")
@@ -367,7 +364,7 @@ def check_model_hardware_fit(model_name: str) -> None:
         unified_tag = " [Unified]" if specs.unified_memory else ""
         print(f"  GPU  : {specs.gpu_name} ({specs.gpu_vram_gb:.1f}GB VRAM{unified_tag})")
     else:
-        print(f"  GPU  : Not detected")
+        print("  GPU  : Not detected")
     print(f"  Mode : {run_mode} ({memory_label})")
     print(f"{'='*55}")
 
@@ -375,7 +372,7 @@ def check_model_hardware_fit(model_name: str) -> None:
         params_b = entry.get("parameters_raw", 0) / 1e9 if entry.get("parameters_raw") else 7.0
         ctx = entry.get("context_length", 4096)
         default_quant = entry.get("quantization", "Q4_K_M")
-        min_ram = entry.get("min_ram_gb", params_b * 0.6)
+        entry.get("min_ram_gb", params_b * 0.6)
 
         mem_required = _estimate_model_memory_gb(params_b, default_quant, ctx)
         fit = _score_fit(mem_required, budget_gb)
@@ -400,7 +397,7 @@ def check_model_hardware_fit(model_name: str) -> None:
                             candidates.append((m["name"], p, mem_est))
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 if candidates:
-                    print(f"\n  [ADVICE] Smaller models for your hardware:")
+                    print("\n  [ADVICE] Smaller models for your hardware:")
                     for name, p, mem in candidates[:3]:
                         print(f"     * {name} ({p:.1f}B, ~{mem:.1f}GB)")
     else:
@@ -526,13 +523,6 @@ class PrefixDict(Generic[K, V]):
 
   def find_prefix(self, argument: str) -> List[Tuple[K, V]]:
     return [(key, value) for key, value in self.items.items() if argument.startswith(key)]
-
-  def find_longest_prefix(self, argument: str) -> Optional[Tuple[K, V]]:
-    matches = self.find_prefix(argument)
-    if len(matches) == 0:
-      return None
-
-    return max(matches, key=lambda x: len(x[0]))
 
 
 def get_or_create_node_id(port: int = None):
@@ -681,8 +671,4 @@ def start_parent_watchdog(interval_s: float = 1.0, _exit=os._exit, _own_start=No
     t.start()
     return t
 
-
-def is_frozen():
-  return getattr(sys, 'frozen', False) or os.path.basename(sys.executable) == "synapse" \
-    or '__nuitka__' in globals() or getattr(sys, '__compiled__', False)
 

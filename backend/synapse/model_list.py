@@ -55,7 +55,6 @@ def resolve_hf_id(model_name: str) -> str:
             return v
             
     norm_key = key.lower().replace("-", "").replace("_", "")
-    key_parts = key.lower().split(":")
     norm_parts = norm_key.split(":")
     
     best_match = None

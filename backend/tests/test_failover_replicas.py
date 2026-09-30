@@ -122,3 +122,50 @@ class TestReplan:
         ft._health["B"].last_heartbeat = time.time() - 60
         assert not node._node_alive("B")
         assert node._node_alive(node.id)
+
+
+class TestLayerResidency:
+    """After a placement a node keeps only its own range (+ the successor's
+    with SYNAPSE_REPLICAS=1) and frees the rest; before, every re-placement
+    left the old layers in memory for good."""
+
+    def _node(self, monkeypatch):
+        node = _placement.TestNodeWiring._node(monkeypatch, ("A", "B"))
+        node._local_layer_profile = lambda m: {"ms_per_layer": 1.0, "max_layers": 100}
+
+        class Eng:
+            _model_id = "m"
+
+            def __init__(self):
+                self.loaded = set(range(30))
+                self.ensured = []
+
+            def release_layers(self, keep):
+                freed = sorted(self.loaded - set(keep))
+                self.loaded &= set(keep)
+                return freed
+
+            async def ensure_shard(self, shard):
+                self.ensured.append((shard.start_layer, shard.end_layer))
+                self.loaded |= set(range(shard.start_layer, shard.end_layer + 1))
+        node.inference_engine = Eng()
+        return node
+
+    @pytest.mark.asyncio
+    async def test_keeps_only_own_range(self, monkeypatch):
+        from synapse.topology.partitioning_strategy import Partition
+        node = self._node(monkeypatch)
+        await node._apply_layer_residency(Shard("m", 0, 29, 30),
+                                          [Partition("A", 0.0, 0.5), Partition("B", 0.5, 1.0)])
+        assert node.inference_engine.loaded == set(range(0, 15))
+
+    @pytest.mark.asyncio
+    async def test_replica_keeps_successor_range(self, monkeypatch):
+        from synapse.topology.partitioning_strategy import Partition
+        monkeypatch.setenv("SYNAPSE_REPLICAS", "1")
+        node = self._node(monkeypatch)
+        node.inference_engine.loaded = set(range(0, 15))
+        await node._apply_layer_residency(Shard("m", 0, 29, 30),
+                                          [Partition("A", 0.0, 0.5), Partition("B", 0.5, 1.0)])
+        assert node.inference_engine.ensured == [(15, 29)]
+        assert node.inference_engine.loaded == set(range(30))
