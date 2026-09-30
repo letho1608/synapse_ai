@@ -60,6 +60,57 @@ def verify_speculative_tokens(
     return accepted
 
 
+class _ResultWaiter:
+    """One step's result, subscribed before the step is sent.
+
+    Accepts the last stage's sampled tokens for this micro-batch id, or a
+    kv_miss reply from any stage for it."""
+
+    def __init__(self, event_router, request_id: str, node_id: str,
+                 micro_batch_id: int, last_stage_start: int):
+        self._router = event_router
+        self._topic = f"synapse/inference/result/{request_id}"
+        self._request_id = request_id
+        self._node_id = node_id
+        self._mb = micro_batch_id
+        self._last = last_stage_start
+        self._event = asyncio.Event()
+        self._result: Optional[RoutedResult] = None
+        self._router.subscribe(self._topic, self._on)
+
+    def _on(self, event: Any) -> None:
+        data = event.data if hasattr(event, "data") else event
+        if not isinstance(data, dict) or self._event.is_set():
+            return
+        if data.get("micro_batch_id", 0) != self._mb:
+            return
+        miss = bool(data.get("kv_miss"))
+        src = data.get("source_stage_id")
+        if not miss and src is not None and src != self._last:
+            return
+        self._result = RoutedResult(
+            request_id=self._request_id, orchestrator_id=self._node_id,
+            micro_batch_id=self._mb, source_stage_id=self._last,
+            tokens=list(data.get("tokens") or []),
+            is_finished=bool(data.get("is_finished", False)),
+            metadata={"kv_miss": miss, "node_id": data.get("node_id")},
+        )
+        self._event.set()
+
+    async def wait(self, timeout: float) -> Optional[RoutedResult]:
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        return self._result
+
+    def close(self) -> None:
+        try:
+            self._router.unsubscribe(self._topic, self._on)
+        except Exception:
+            pass
+
+
 class DistributedInferenceSession:
     """
     Per-request state for distributed inference across multiple nodes.
@@ -142,6 +193,14 @@ class DistributedPipelineController:
         self.forwarder = forwarder or AsyncTensorForwarder(node_id)
         self.result_router = ResultRouter(node_id)
         self._sessions: Dict[str, DistributedInferenceSession] = {}
+        # request_id -> [[node_id, start, end, n_layers], ...] in stage order.
+        self._plans: Dict[str, List[List[Any]]] = {}
+        self._sampling: Dict[str, Dict[str, Any]] = {}
+        # request_id -> {"steps", "drafted", "accepted_draft", "kv_miss"}
+        self.decode_stats: Dict[str, Dict[str, int]] = {}
+        self.step_timeout = 60.0
+        self.liveness_poll_s = 1.0
+        self.max_failovers = 2
         self._running = False
 
     async def start(self) -> None:
@@ -161,22 +220,30 @@ class DistributedPipelineController:
         max_generate_tokens: int = 1024,
         on_token_callback: Optional[Callable] = None,
         num_micro_batches: int = 1,
+        sampling_state: Optional[Dict[str, Any]] = None,
+        replan_fn: Optional[Callable] = None,
+        alive_fn: Optional[Callable[[str], bool]] = None,
     ) -> List[int]:
         """
         Run distributed inference across multiple nodes.
 
-        For prompt (prefill) phase, splits input into micro-batches for
-        pipeline-parallel overlapping. For decode (autoregressive) phase,
-        processes one token at a time since each depends on previous.
+        Every step is one pipeline pass of [prompt + history + draft]
+        (see _run_step); the prompt is step 0.
 
         Args:
             base_shard: Shard with full model info
             prompt: The input prompt
             request_id: Unique request ID
-            partition_assignments: List of (node_id, shard) tuples from LACP partitioner
+            partition_assignments: List of (node_id, shard) tuples in stage order
             max_generate_tokens: Max tokens to generate
             on_token_callback: Called with (request_id, tokens, is_finished)
-            num_micro_batches: Number of micro-batches to split prompt into (>=1)
+            num_micro_batches: kept for API compatibility (unused)
+            replan_fn: (current_assignments, excluded_node_ids) -> new
+                assignments or None. Used when a stage node dies mid-request:
+                the step is resent to the new plan with full hidden states
+                and generation continues (Petals-style failover).
+            alive_fn: node_id -> bool (heartbeat view), polled while waiting
+                so a dead stage is detected in seconds, not at the timeout.
 
         Returns:
             List of generated token IDs
@@ -193,196 +260,108 @@ class DistributedPipelineController:
             num_micro_batches=num_micro_batches,
         )
         self._sessions[request_id] = session
+        # Sampling knobs (e.g. temperature) ride every stage's inference_state:
+        # the LAST stage samples, on another node, with only what we send it.
+        self._sampling[request_id] = dict(sampling_state or {})
+        self._plans[request_id] = [
+            [nid, int(sh.start_layer), int(sh.end_layer), int(sh.n_layers)]
+            for nid, sh in partition_assignments
+        ]
 
         if on_token_callback:
             self.result_router.register_token_callback(request_id, on_token_callback)
 
         all_generated_tokens: List[int] = []
 
+        async def emit(tokens: List[int], finished: bool) -> None:
+            if not on_token_callback:
+                return
+            try:
+                if asyncio.iscoroutinefunction(on_token_callback):
+                    await on_token_callback(request_id, tokens, finished)
+                else:
+                    on_token_callback(request_id, tokens, finished)
+            except Exception as e:
+                if DEBUG >= 1: print(f"[{request_id}] on_token_callback error: {e}")
+
         try:
             token_ids = await self.inference_engine.encode(base_shard, prompt)
-            if token_ids is None or token_ids.size == 0:
+            if token_ids is None or np.asarray(token_ids).size == 0:
                 return []
+            prompt_ids = [int(t) for t in np.asarray(token_ids).reshape(-1)]
+            stop_ids = self._stop_ids()
+            lookahead = max(0, int(getattr(self, "lookahead_window", 3)))
+            stats = self.decode_stats.setdefault(request_id, {
+                "steps": 0, "drafted": 0, "accepted_draft": 0, "kv_miss": 0})
 
-            # Real encoders (e.g. PyTorchHFEngine.encode) return a flattened
-            # 1-D token array; the pipeline expects (1, seq_len). Normalize so
-            # the prompt phase below (token_ids.shape[1], slicing) works and
-            # multi-node inference does not crash and silently fall back to a
-            # single node.
-            if token_ids.ndim == 1:
-                token_ids = token_ids.reshape(1, -1)
-
-            first_stage_node_id, first_stage_shard = partition_assignments[0]
-            last_stage_node_id, last_stage_shard = partition_assignments[-1]
-
-            # Prompt phase: use micro-batching for pipeline parallelism
-            prompt_length = token_ids.shape[1]
-            if num_micro_batches > 1 and prompt_length >= num_micro_batches:
-                mb_size = max(1, prompt_length // num_micro_batches)
-                micro_batches = []
-                for mb_idx in range(num_micro_batches):
-                    start_idx = mb_idx * mb_size
-                    end_idx = (mb_idx + 1) * mb_size if mb_idx < num_micro_batches - 1 else prompt_length
-                    mb_tokens = token_ids[:, start_idx:end_idx]
-                    micro_batches.append((mb_idx, mb_tokens))
-
-                # Pipeline fill: send micro-batches to first stage sequentially
-                prompt_results: List[int] = []
-                async def collect_prompt_result(mb_idx: int) -> None:
-                    res = await self._collect_result(
-                        request_id, last_stage_node_id, last_stage_shard, timeout=120.0,
-                        expected_micro_batch_id=mb_idx,
-                        expected_source_stage_id=last_stage_shard.start_layer,
-                    )
-                    if res is not None and res.tokens:
-                        prompt_results.extend(res.tokens)
-
-                for mb_idx, mb_tokens in micro_batches:
-                    await self._send_input_to_stage(
-                        first_stage_node_id, first_stage_shard,
-                        mb_tokens, request_id, is_prompt=True,
-                        microbatch_id=mb_idx,
-                    )
-
-                for mb_idx, _ in micro_batches:
-                    await collect_prompt_result(mb_idx)
-
-                if prompt_results:
-                    all_generated_tokens.extend(prompt_results)
-                    if on_token_callback:
-                        try:
-                            if asyncio.iscoroutinefunction(on_token_callback):
-                                await on_token_callback(request_id, prompt_results, False)
-                            else:
-                                on_token_callback(request_id, prompt_results, False)
-                        except Exception as e:
-                            if DEBUG >= 1: print(f"[{request_id}] on_token_callback error: {e}")
-            else:
-                # Single batch: send all tokens at once
-                await self._send_input_to_stage(
-                    first_stage_node_id, first_stage_shard,
-                    token_ids, request_id, is_prompt=True,
-                    microbatch_id=0,
-                )
-
-                result = await self._collect_result(
-                    request_id, last_stage_node_id, last_stage_shard, timeout=60.0,
-                    expected_micro_batch_id=0,
-                    expected_source_stage_id=last_stage_shard.start_layer,
-                )
-                if result is not None and result.tokens:
-                    all_generated_tokens.extend(result.tokens)
-                    # Stream the prompt-phase continuation exactly like the
-                    # micro-batched branch does, so buffer/UI consumers see
-                    # the full generation.
-                    if on_token_callback:
-                        try:
-                            if asyncio.iscoroutinefunction(on_token_callback):
-                                await on_token_callback(request_id, result.tokens, False)
-                            else:
-                                on_token_callback(request_id, result.tokens, False)
-                        except Exception as e:
-                            if DEBUG >= 1: print(f"[{request_id}] on_token_callback error: {e}")
-
-            # Decode phase: true pipeline-parallel micro-batch overlapping
-            # Instead of sending one batch and waiting, fire multiple micro-batches
-            # into the pipeline before collecting results. Each stage processes
-            # concurrently: Stage 1 works on batch N while Stage 0 loads batch N+1.
-            lookahead_window = getattr(self, "lookahead_window", 3)
-            ngram_size = 3
-            
+            # One pipeline pass per step: [prompt + history + draft] goes in,
+            # the last stage samples every draft position, and we keep the
+            # longest verified prefix (+1 token). A pass with an empty draft
+            # is plain decoding; the prompt is simply step 0.
+            step = 0
+            plan = list(partition_assignments)
+            excluded: set = set()
+            force_full = False
+            stats.setdefault("failovers", 0)
             while not session.is_finished and len(all_generated_tokens) < max_generate_tokens:
-                # Build N-gram lookahead guesses
-                guesses = []
-                if lookahead_window > 0 and len(all_generated_tokens) >= ngram_size + 1:
-                    history = all_generated_tokens
-                    suffix = history[-ngram_size:]
-                    for i in range(len(history) - ngram_size - 1, 0, -1):
-                        if history[i:i+ngram_size] == suffix:
-                            guesses = history[i+ngram_size : i+ngram_size+lookahead_window]
-                            if guesses:
-                                break
-                
-                # Pipeline-parallel decode: fire multiple micro-batches concurrently
-                # so stages overlap (Stage 1 processes batch N while Stage 0 processes batch N+1)
-                num_decode_batches = max(2, lookahead_window)  # At least 2 for overlap
-                decode_batches = []
-                
-                # Full true context for every decode micro-batch: the entire
-                # prompt plus the verified generation history. The model is
-                # conditioned on the whole context, not just the last token.
-                full_context = token_ids.flatten().tolist() + list(all_generated_tokens)
-                for db_idx in range(num_decode_batches):
-                    # Each micro-batch extends the true context by a PREFIX of
-                    # guesses: batch 0 sees [prompt ... history], batch 1 adds
-                    # g0, batch 2 adds g0, g1, ... A token is only ever
-                    # accepted after every guess feeding its context has been
-                    # verified by the previous batch's prediction, so no token
-                    # from a contaminated context can leak into the output.
-                    batch_guesses = guesses[:db_idx]
-                    candidate_tokens = full_context + batch_guesses
-                    input_tensor = np.array([candidate_tokens], dtype=np.int64)
-                    decode_batches.append((db_idx, input_tensor))
-                
-                # Fire ALL micro-batches into the pipeline immediately (no waiting)
-                # Stage 0 sends batch 0, then immediately sends batch 1, etc.
-                # While Stage 0 loads batch 1, Stage 1 is already processing batch 0.
-                for db_idx, input_tensor in decode_batches:
-                    await self._send_input_to_stage(
-                        first_stage_node_id, first_stage_shard,
-                        input_tensor, request_id, is_prompt=False,
-                        microbatch_id=db_idx,
-                    )
-                
-                # Collect results from the last stage as they complete, each
-                # matched to its micro-batch so an out-of-order result is
-                # never misattributed (batch identity check).
-                decode_results = []
-                for db_idx in range(len(decode_batches)):
-                    next_result = await self._collect_result(
-                        request_id, last_stage_node_id, last_stage_shard, timeout=30.0,
-                        expected_micro_batch_id=db_idx,
-                        expected_source_stage_id=last_stage_shard.start_layer,
-                    )
-                    if next_result is not None:
-                        decode_results.append(next_result)
-                
-                if not decode_results:
+                draft = self._ngram_draft(prompt_ids + all_generated_tokens, lookahead)
+                room = max_generate_tokens - len(all_generated_tokens)
+                draft = draft[: max(0, room - 1)]
+                context = prompt_ids + all_generated_tokens + draft
+                sampled, dead = await self._run_step(
+                    request_id, plan, context, draft,
+                    all_generated_tokens, step, alive_fn=alive_fn, full=force_full)
+                step += 1
+                if sampled is None:
+                    # A stage died (heartbeats) or the step timed out: re-plan
+                    # around the dead nodes and resend this same step with
+                    # full hidden states; the new stages rebuild their KV.
+                    new_plan = None
+                    if replan_fn is not None and stats["failovers"] < self.max_failovers:
+                        excluded |= set(dead)
+                        try:
+                            new_plan = replan_fn(list(plan), set(excluded)) if dead else list(plan)
+                        except Exception as e:
+                            if DEBUG >= 1: print(f"[{request_id}] replan failed: {e}")
+                            new_plan = None
+                    if new_plan:
+                        stats["failovers"] += 1
+                        if DEBUG >= 1:
+                            print(f"[{request_id}] [FAILOVER] dead={sorted(dead)} new plan="
+                                  f"{[(n, s.start_layer, s.end_layer) for n, s in new_plan]}")
+                        plan = list(new_plan)
+                        self._plans[request_id] = [
+                            [nid, int(sh.start_layer), int(sh.end_layer), int(sh.n_layers)]
+                            for nid, sh in plan]
+                        force_full = True
+                        continue
+                    session.error = session.error or TimeoutError("pipeline step timed out")
                     break
-
-                # Verify guesses across all micro-batch results. Order by
-                # micro-batch id so batch i's prediction is matched against
-                # the context [last] + guesses[:i] regardless of arrival order.
-                decode_results.sort(key=lambda r: r.micro_batch_id)
-                all_accepted = verify_speculative_tokens(
-                    guesses, [r.tokens for r in decode_results]
-                )
-                if not all_accepted:
+                force_full = False
+                accepted = verify_speculative_tokens(draft, [[t] for t in sampled])
+                if not accepted:
                     break
-                
-                all_generated_tokens.extend(all_accepted)
-                
-                if on_token_callback:
-                    try:
-                        if asyncio.iscoroutinefunction(on_token_callback):
-                            await on_token_callback(request_id, all_accepted, False)
-                        else:
-                            on_token_callback(request_id, all_accepted, False)
-                    except Exception:
-                        pass
-
-                if any(r.is_finished for r in decode_results):
+                stats["steps"] += 1
+                stats["drafted"] += len(draft)
+                stats["accepted_draft"] += len(accepted) - 1
+                finished = False
+                for i, t in enumerate(accepted):
+                    if t in stop_ids:
+                        accepted = accepted[:i]
+                        finished = True
+                        break
+                accepted = accepted[:room]
+                all_generated_tokens.extend(accepted)
+                if accepted:
+                    await emit(accepted, False)
+                tail = all_generated_tokens[-10:]
+                if len(tail) == 10 and len(set(tail)) == 1:
+                    finished = True  # same token 10x: a repetition loop
+                if finished:
                     break
 
             session.is_finished = True
-            if on_token_callback:
-                try:
-                    if asyncio.iscoroutinefunction(on_token_callback):
-                        await on_token_callback(request_id, [], True)
-                    else:
-                        on_token_callback(request_id, [], True)
-                except Exception:
-                    pass
+            await emit([], True)
 
         except Exception as e:
             session.error = e
@@ -391,6 +370,8 @@ class DistributedPipelineController:
                 traceback.print_exc()
         finally:
             self._sessions.pop(request_id, None)
+            self._plans.pop(request_id, None)
+            self._sampling.pop(request_id, None)
             self.result_router.unregister_token_callback(request_id)
             # Clear KV cache on all nodes
             await self.event_router.publish(
@@ -400,6 +381,83 @@ class DistributedPipelineController:
 
         return all_generated_tokens
 
+    def _stop_ids(self) -> set:
+        ids = {151643, 151644, 151645}  # Qwen chat stop tokens
+        tok = getattr(self.inference_engine, "tokenizer", None)
+        eos = getattr(tok, "eos_token_id", None) if tok is not None else None
+        if isinstance(eos, int):
+            ids.add(eos)
+        return ids
+
+    @staticmethod
+    def _ngram_draft(history: List[int], k: int, n: int = 3) -> List[int]:
+        """Prompt-lookup draft: find the latest earlier occurrence of the last
+        n tokens and propose the k tokens that followed it."""
+        if k <= 0 or len(history) < n + 1:
+            return []
+        suffix = history[-n:]
+        for i in range(len(history) - n - 1, -1, -1):
+            if history[i:i + n] == suffix:
+                follow = history[i + n: i + n + k]
+                if follow:
+                    return list(follow)
+        return []
+
+    async def _run_step(self, request_id: str, partition_assignments, context: List[int],
+                        draft: List[int], generated: List[int], step: int,
+                        alive_fn: Optional[Callable[[str], bool]] = None, full: bool = False):
+        """Send one context through the pipeline.
+
+        Returns (tokens, dead): the sampled tokens for the last len(draft)+1
+        positions, or (None, dead_node_ids) when the step did not complete
+        (dead is empty on a plain timeout).
+
+        Stages forward only recomputed hidden rows (delta_rows). A stage that
+        lacks the cached prefix answers kv_miss (e.g. it just replaced a dead
+        node), and the step is resent once with full hidden states."""
+        first_node, first_shard = partition_assignments[0]
+        last_node, last_shard = partition_assignments[-1]
+        stats = self.decode_stats.setdefault(request_id, {})
+        modes = (False,) if full else (True, False)
+        for attempt, delta_rows in enumerate(modes):
+            mb_id = step * 2 + attempt
+            waiter = self._result_waiter(request_id, mb_id, last_shard.start_layer)
+            try:
+                await self._send_input_to_stage(
+                    first_node, first_shard, np.array([context], dtype=np.int64),
+                    request_id, is_prompt=(step == 0), microbatch_id=mb_id,
+                    extra_state={"verify_n": len(draft) + 1, "draft": list(draft),
+                                 "gen_ids": list(generated), "delta_rows": delta_rows},
+                )
+                res, dead = await self._await_result(waiter, partition_assignments, alive_fn)
+            finally:
+                waiter.close()
+            if res is None:
+                return None, dead
+            if res.metadata.get("kv_miss"):
+                stats["kv_miss"] = stats.get("kv_miss", 0) + 1
+                continue
+            return list(res.tokens), set()
+        return None, set()
+
+    async def _await_result(self, waiter, plan, alive_fn):
+        """Wait for the step's result, polling stage liveness every second
+        so a dead node is noticed after a few missed heartbeats instead of
+        after the full step timeout. Returns (result, dead_node_ids)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.step_timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None, set()
+            res = await waiter.wait(min(self.liveness_poll_s, remaining))
+            if res is not None:
+                return res, set()
+            if alive_fn is not None:
+                dead = {nid for nid, _ in plan if nid != self.node_id and not alive_fn(nid)}
+                if dead:
+                    return None, dead
+
     async def _send_input_to_stage(
         self,
         target_node_id: str,
@@ -408,19 +466,29 @@ class DistributedPipelineController:
         request_id: str,
         is_prompt: bool = False,
         microbatch_id: int = 0,
+        extra_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         topic = f"synapse/inference/tensor/{target_node_id}"
 
-        # B4: exact-dtype default; INT8 only with explicit opt-in.
+        # Per-row INT8 by default, only toward peers that negotiated it.
         from synapse.transport.router import should_quantize
-        quantize = should_quantize(str(input_data.dtype))
+        quantize = should_quantize(str(input_data.dtype), target_id=target_node_id,
+                                   self_id=self.node_id)
         
         encoded_payload = encode_tensor(
             input_data,
             metadata={
                 "request_id": request_id,
                 "shard": target_shard.to_dict(),
-                "inference_state": {"is_prompt": is_prompt, "microbatch_id": microbatch_id},
+                "inference_state": {
+                    "is_prompt": is_prompt, "microbatch_id": microbatch_id,
+                    # The request carries its own stage plan, so every hop
+                    # runs exactly the layers the orchestrator assigned and
+                    # forwards to the right owner, whatever its local view.
+                    "partition_plan": self._plans.get(request_id),
+                    **self._sampling.get(request_id, {}),
+                    **(extra_state or {}),
+                },
                 "_orchestrator_id": self.node_id,
                 "microbatch_id": microbatch_id,
                 "_sent_at": time.time(),
@@ -493,6 +561,11 @@ class DistributedPipelineController:
         finally:
             self.event_router.unsubscribe(result_topic, on_p2p_result)
 
+    def _result_waiter(self, request_id: str, micro_batch_id: int, last_stage_start: int):
+        """Subscribe to the request's result topic now; wait() later."""
+        return _ResultWaiter(self.event_router, request_id, self.node_id,
+                             micro_batch_id, last_stage_start)
+
     def get_session(self, request_id: str) -> Optional[DistributedInferenceSession]:
         return self._sessions.get(request_id)
 
@@ -554,9 +627,10 @@ class DistributedPipelineController:
                         next_node_id, next_shard = partition_assignments[next_stage_idx]
                         topic = f"synapse/inference/tensor/{next_node_id}"
 
-                        # B4: exact-dtype default; INT8 only with explicit opt-in.
+                        # Per-row INT8 by default, only toward peers that negotiated it.
                         from synapse.transport.router import should_quantize as _should_q2
-                        quantize = _should_q2(str(result.data.dtype))
+                        quantize = _should_q2(str(result.data.dtype), target_id=next_node_id,
+                                              self_id=self.node_id)
                         
                         encoded_payload = encode_tensor(
                             result.data,

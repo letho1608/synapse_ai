@@ -170,7 +170,9 @@ def stream_completion(api_base, model, prompt, max_tokens, timeout=300):
     if completion_tokens is None:
         completion_tokens = max(1, int(len(full.split()) * 1.3))
     ttft = (first_ts - t0) if first_ts else None
-    wall = t1 - (first_ts or t0)
+    # End-to-end rate (incl. TTFT). Measuring only from the first streamed
+    # chunk overstated it wildly when the server released tokens in a burst.
+    wall = t1 - t0
     tps = (completion_tokens / wall) if wall > 0 else 0.0
     return {
         "ttft_s": ttft,
@@ -193,6 +195,7 @@ def main():
     ap.add_argument("--out", required=True, help="results JSONL path")
     ap.add_argument("--allow-loopback", action="store_true", help="permit 127.0.0.1 runs (labeled measured:false)")
     ap.add_argument("--failover", action="store_true", help="semi-auto failover timing (operator kills a host on prompt)")
+    ap.add_argument("--prompt", default=None, help="measure this prompt instead of the fixed set")
     args = ap.parse_args()
 
     urls = [u.strip() for u in args.api_urls.split(",") if u.strip()]
@@ -229,7 +232,8 @@ def main():
 
     target = urls[0]
     results = []
-    for pi, prompt in enumerate(FIXED_PROMPTS):
+    prompts = [args.prompt] if args.prompt else FIXED_PROMPTS
+    for pi, prompt in enumerate(prompts):
         for rep in range(args.reps):
             try:
                 # warmup rep 0 of prompt 0 is discarded
@@ -260,7 +264,7 @@ def main():
 
     if args.single_url:
         try:
-            s = stream_completion(args.single_url.rstrip("/"), args.model, FIXED_PROMPTS[0], args.max_tokens)
+            s = stream_completion(args.single_url.rstrip("/"), args.model, prompts[0], args.max_tokens)
             base = {"type": "single_baseline", "single_url": args.single_url}
             base.update(s)
             emit(base)

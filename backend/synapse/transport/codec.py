@@ -153,6 +153,61 @@ DTYPE_MAP = {
 DTYPE_REVERSE = {v: k for k, v in DTYPE_MAP.items()}
 
 
+Q_MODE_INT8_ROW = "int8_row"
+
+
+# Largest-|x| entries per row kept exactly (float32) instead of quantized.
+# LLM hidden states carry a few huge "massive activation" channels; with a
+# plain per-row scale they flatten every other channel (measured on
+# SmolLM2-135M, 2-stage split, teacher-forced: top-1 agreement 0.953 /
+# KL 8.8e-3 without outliers vs 0.99+ / ~1e-4 with 4-16 kept).
+Q_OUTLIERS_PER_ROW = 8
+
+
+def _quantize_rows_int8(tensor: np.ndarray, k: int = Q_OUTLIERS_PER_ROW):
+    """Symmetric INT8, one float32 scale per row of the last axis, with the
+    k largest-magnitude entries of each row carried exactly.
+
+    Returns (q, payload_tail, k): q int8 in the input shape; payload_tail =
+    scales f32[rows] + outlier indices u32[rows, k] + values f32[rows, k].
+    """
+    x = np.asarray(tensor, dtype=np.float32)
+    rows = x.reshape(1, -1) if x.ndim <= 1 else x.reshape(-1, x.shape[-1])
+    n_rows, width = rows.shape
+    k = max(0, min(int(k), width))
+    rows = rows.copy()
+    if k and n_rows:
+        idx = np.argpartition(-np.abs(rows), k - 1, axis=1)[:, :k].astype(np.uint32)
+        vals = np.take_along_axis(rows, idx.astype(np.intp), 1).astype(np.float32)
+        np.put_along_axis(rows, idx.astype(np.intp), 0.0, 1)
+    else:
+        idx = np.zeros((n_rows, 0), dtype=np.uint32)
+        vals = np.zeros((n_rows, 0), dtype=np.float32)
+    scales = (np.abs(rows).max(axis=1) / 127.0).astype(np.float32) if rows.size else \
+        np.ones(n_rows, dtype=np.float32)
+    scales[~(scales > 0)] = 1.0  # all-zero (or NaN) rows
+    q = np.rint(rows / scales[:, None]).clip(-127, 127).astype(np.int8)
+    tail = scales.tobytes() + idx.tobytes() + vals.tobytes()
+    return q.reshape(x.shape), tail, k
+
+
+def _dequantize_rows_int8(q: np.ndarray, tail: bytes, k: int, shape, orig_dtype: str) -> np.ndarray:
+    count = q.size
+    width = shape[-1] if len(shape) >= 1 and shape[-1] else max(count, 1)
+    n_rows = 1 if len(shape) <= 1 else (count // width if width else 0)
+    if count == 0 or n_rows == 0:
+        return np.zeros(shape, dtype=np.dtype(orig_dtype))
+    scales = np.frombuffer(tail, dtype=np.float32, count=n_rows)
+    off = 4 * n_rows
+    idx = np.frombuffer(tail, dtype=np.uint32, count=n_rows * k, offset=off).reshape(n_rows, k)
+    off += 4 * n_rows * k
+    vals = np.frombuffer(tail, dtype=np.float32, count=n_rows * k, offset=off).reshape(n_rows, k)
+    rows = q.astype(np.float32).reshape(n_rows, -1) * scales[:, None]
+    if k:
+        np.put_along_axis(rows, idx.astype(np.intp), vals, 1)
+    return rows.reshape(shape).astype(np.dtype(orig_dtype))
+
+
 def encode_tensor(
     tensor: np.ndarray,
     metadata: Optional[Dict] = None,
@@ -168,17 +223,18 @@ def encode_tensor(
         raise TypeError(f"Expected np.ndarray, got {type(tensor)}")
 
     target_tensor = tensor
-    q_scale = 1.0
-    
-    # Apply dynamic quantization if requested and applicable
-    if quantize_int8 and tensor.dtype in [np.float32, np.float16]:
-        abs_max = np.max(np.abs(tensor))
-        if abs_max > 0:
-            q_scale = abs_max / 127.0
-            target_tensor = (tensor / q_scale).clip(-127, 127).astype(np.int8)
-        else:
-            target_tensor = tensor.astype(np.int8)
-            q_scale = 1.0
+    q_tail: Optional[bytes] = None
+    q_k = 0
+
+    # INT8 wire quantization, one symmetric scale per row (per token for
+    # [..., seq, hidden] activations) plus exact outliers: a single
+    # per-tensor scale let one outlier flush every other value to 0
+    # (teacher-forced top-1 agreement ~1-6% on a real model). Rounded, not
+    # truncated. Scales/outliers travel after the int8 data (see _q_mode).
+    # Per-row quantization is deterministic per row, so prefix rows stay
+    # byte-identical across decode steps (downstream KV reuse keeps working).
+    if quantize_int8 and tensor.dtype in (np.float32, np.float16, np.float64):
+        target_tensor, q_tail, q_k = _quantize_rows_int8(tensor)
 
     dtype_code = DTYPE_MAP.get(target_tensor.dtype)
     if dtype_code is None:
@@ -189,6 +245,8 @@ def encode_tensor(
         raise ValueError(f"Too many dimensions: {ndim}")
 
     raw_data = target_tensor.tobytes()
+    if q_tail is not None:
+        raw_data += q_tail
     uncompressed_size = len(raw_data)
 
     if compress and uncompressed_size > 4096:
@@ -216,17 +274,17 @@ def encode_tensor(
 
     # Combine metadata with quantization info
     meta_dict = metadata.copy() if metadata else {}
-    if quantize_int8 and q_scale != 1.0:
-        meta_dict["_q_scale"] = float(q_scale)
+    if q_tail is not None:
+        meta_dict["_q_mode"] = Q_MODE_INT8_ROW
+        meta_dict["_q_k"] = q_k
         meta_dict["_orig_dtype"] = str(tensor.dtype)
 
     if meta_dict:
         import json
         meta_json = json.dumps(meta_dict).encode("utf-8")
-        if len(meta_json) > 1024: # Increased limit for q-info
-             # If too long, prune non-essential meta but keep q-info
-             q_only = {"_q_scale": meta_dict.get("_q_scale"), "_orig_dtype": meta_dict.get("_orig_dtype")}
-             meta_json = json.dumps(q_only).encode("utf-8")
+        if len(meta_json) > 0xFFFF:
+            # Never prune: dropping request_id/shard silently misroutes.
+            raise ValueError(f"Tensor metadata too large: {len(meta_json)} bytes")
         meta_bytes = struct.pack("!H", len(meta_json)) + meta_json # Use H (2 bytes) for meta len
     else:
         meta_bytes = struct.pack("!H", 0)
@@ -297,9 +355,15 @@ def decode_tensor(data: bytes) -> Tuple[np.ndarray, Optional[Dict]]:
         if len(raw_data) != uncompressed_size:
             pass
 
+    if metadata and metadata.get("_q_mode") == Q_MODE_INT8_ROW:
+        count = int(np.prod(shape)) if shape else 1
+        q = np.frombuffer(raw_data[:count], dtype=np.int8)
+        return _dequantize_rows_int8(q, raw_data[count:], int(metadata.get("_q_k", 0)),
+                                     tuple(shape), metadata.get("_orig_dtype", "float32")), metadata
+
     tensor = np.frombuffer(raw_data, dtype=dtype_obj).reshape(shape)
-    
-    # De-quantize if scale is present
+
+    # Legacy per-tensor INT8 (peers from before _q_mode).
     if metadata and "_q_scale" in metadata:
         scale = metadata["_q_scale"]
         orig_dtype = metadata.get("_orig_dtype", "float16")
@@ -430,6 +494,25 @@ class AsyncTensorForwarder:
             await writer_fn(data)
         finally:
             self._send_semaphore.release()
+
+    @staticmethod
+    def decode_message(data: bytes, request_id: str = "") -> Optional[TensorMessage]:
+        """Decode one packet into a TensorMessage, without any reordering."""
+        try:
+            tensor, metadata = decode_tensor(data)
+        except (ValueError, struct.error):
+            return None
+        if not metadata:
+            return None
+        return TensorMessage(
+            request_id=metadata.get("request_id", request_id),
+            orchestrator_id=metadata.get("orchestrator_id", ""),
+            micro_batch_id=metadata.get("micro_batch_id", 0),
+            source_stage=metadata.get("source_stage", 0),
+            target_stage=metadata.get("target_stage", 0),
+            tensor=tensor,
+            metadata=metadata,
+        )
 
     def receive(
         self, request_id: str, source_stage: int, data: bytes,

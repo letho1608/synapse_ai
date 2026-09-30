@@ -195,15 +195,27 @@ def test_router_branches_and_counters():
     assert s.snapshot() == {"tcp-chunked": 2, "bridge": 1}
 
 
-def test_should_quantize_exact_default(monkeypatch):
+def test_should_quantize_int8_default_with_opt_out(monkeypatch):
+    from synapse.transport.router import FEATURE_Q8ROW, set_peer_features_lookup
     monkeypatch.delenv("SYNAPSE_TRANSPORT_INT8", raising=False)
-    assert should_quantize("float32") is False
-    assert should_quantize("float16") is False
-    monkeypatch.setenv("SYNAPSE_TRANSPORT_INT8", "1")
     assert should_quantize("float32") is True
     assert should_quantize("float16") is True
-    assert should_quantize("int64") is False
+    assert should_quantize("int64") is False  # token ids never quantized
     assert should_quantize("int8") is False
+    monkeypatch.setenv("SYNAPSE_TRANSPORT_INT8", "0")
+    assert should_quantize("float32") is False
+    monkeypatch.delenv("SYNAPSE_TRANSPORT_INT8")
+    # Mixed versions: only toward peers that negotiated the feature, and
+    # only per the SENDER's own handshakes.
+    feats = {"new-peer": [FEATURE_Q8ROW, "snp1"], "old-peer": ["snp1"]}
+    set_peer_features_lookup("me", lambda pid: feats.get(pid, []))
+    try:
+        assert should_quantize("float32", target_id="new-peer", self_id="me") is True
+        assert should_quantize("float32", target_id="old-peer", self_id="me") is False
+        assert should_quantize("float32", target_id="unknown", self_id="me") is False
+        assert should_quantize("float32", target_id="old-peer", self_id="other") is True
+    finally:
+        set_peer_features_lookup("me", None)
     assert chunking_enabled({"SYNAPSE_CHUNKED_TCP": "1"}) is True
     assert chunking_enabled({}) is True  # default ON (bridge fallback intact)
     assert chunking_enabled({"SYNAPSE_CHUNKED_TCP": "0"}) is False

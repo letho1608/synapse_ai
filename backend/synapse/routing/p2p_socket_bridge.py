@@ -29,7 +29,8 @@ PACKET_TYPE_CKPT_CHUNK = 0x08
 BRIDGE_VERSION = 1
 FEATURE_SNP1 = "snp1"            # SYNP binary tensor payloads (codec.py)
 FEATURE_CKPT_JSON1 = "ckpt-json1"  # JSON checkpoint P2P pull (fault_tolerance.py)
-DEFAULT_FEATURES = (FEATURE_SNP1, FEATURE_CKPT_JSON1)
+FEATURE_Q8ROW1 = "q8row1"        # per-row INT8 tensor payloads (codec int8_row)
+DEFAULT_FEATURES = (FEATURE_SNP1, FEATURE_CKPT_JSON1, FEATURE_Q8ROW1)
 PACKET_MIN_VERSION = {
     PACKET_TYPE_EVENT: 1,
     PACKET_TYPE_HANDSHAKE: 1,
@@ -78,6 +79,9 @@ class P2PSocketBridge:
         self._ssl_server_ctx = ssl_server_ctx
         self._ssl_client_ctx = ssl_client_ctx
         self.tls_fp = tls_fp
+        # Set by the node once its binary tensor transport is listening;
+        # advertised in the handshake so peers can reach it.
+        self.tcp_port: Optional[int] = None
         # C-W3: bind address for the P2P listener (default all interfaces).
         self.bind_host = bind_host or "0.0.0.0"
         self._last_errors: Dict[str, Dict] = {}  # peer_id -> last error packet received
@@ -485,6 +489,17 @@ class P2PSocketBridge:
             # string and feed it to decode_tensor() (which expects bytes),
             # silently dropping every binary tensor sent between nodes.
             return {"__bytes__": True, "data": obj.hex()}
+        # Topology payloads carry DeviceCapabilities/DeviceFlops objects; the
+        # topology broadcast failed on every attempt without this.
+        if hasattr(obj, "to_dict") and callable(obj.to_dict):
+            return obj.to_dict()
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):  # pydantic
+            return obj.model_dump()
+        import dataclasses
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return dataclasses.asdict(obj)
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
     async def _read_loop(self, peer_id: str, reader: asyncio.StreamReader):
@@ -624,6 +639,8 @@ class P2PSocketBridge:
             # Reserved for TLS pinning (transport/tls_wrap.py). Advertised
             # from the bridge's configured pin; unenforced while --tls off.
             "tls_fp": self.tls_fp,
+            # Port of this node's binary tensor transport (None = bridge only).
+            "tcp_port": getattr(self, "tcp_port", None),
         }
         data = json.dumps(handshake).encode('utf-8')
         writer.write(struct.pack("!IB", len(data), pkt_type) + data)
@@ -645,6 +662,7 @@ class P2PSocketBridge:
             "caps_hash": info.get("caps_hash"),
             "features": list(info.get("features") or []),
             "tls_fp": info.get("tls_fp"),
+            "tcp_port": info.get("tcp_port"),
         }
         try:
             bv = self._peer_handshakes[peer_id]["bridge_version"]

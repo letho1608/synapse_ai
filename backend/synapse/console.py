@@ -1001,14 +1001,34 @@ def _want_tui(args) -> bool:
     return True
 
 
+def card_header_line(label):
+    """Line-mode card header (same glyphs as the TUI, font-safe)."""
+    return "▸ %s" % label
+
+
+def card_footer(rc, dt):
+    """Line-mode card footer: `● done · 1.2s` / `× exit 3 · 0.1s`.
+
+    ✔/✘ were used before; Consolas (legacy console font) has neither and
+    drew tofu boxes.
+    """
+    return ("● done · %.1fs" % dt) if rc == 0 else ("× exit %s · %.1fs" % (rc, dt))
+
+
 def _banner(args, eff_model):
     from synapse.helpers import VERSION
-    print("synapse console %s (deterministic commands, no agent)" % VERSION)
-    print("model: %s | api: 127.0.0.1:%s | p2p: %s" % (
-        eff_model, args.chat_port or DEFAULT_PORT,
-        args.node_port if args.node_port is not None else "(backend default)"))
-    print("try: /status  /topology  /help")
-    print("/quit stops the node and exits cleanly.")
+    p2p = args.node_port if args.node_port is not None else "backend default"
+    rows = [
+        "  ● synapse console %s · deterministic, no agent" % VERSION,
+        "    model   %s" % eff_model,
+        "    api     127.0.0.1:%s  ·  p2p %s" % (args.chat_port or DEFAULT_PORT, p2p),
+        "    try     /status   /topology   /help   ·   /quit exits cleanly",
+    ]
+    width = max(60, max(len(r) for r in rows) + 2)
+    print("╭" + "─" * width + "╮")
+    for r in rows:
+        print("│" + r.ljust(width) + "│")
+    print("╰" + "─" * width + "╯")
 
 
 def run_console(args):
@@ -1111,7 +1131,7 @@ def run_console(args):
                     label = "/" + cands[int(stripped) - 1] + (
                         " " + " ".join(pargv) if pargv else "")
                     t0 = time.monotonic()
-                    print("▸ %s" % label)
+                    print(card_header_line(label))
                     try:
                         with redirect_stdout(buf):
                             keep, rc = dispatch(cands[int(stripped) - 1], pargv,
@@ -1123,9 +1143,7 @@ def run_console(args):
                     out = buf.getvalue()
                     sys.stdout.write(out)
                     ctx.transcript.append(out.rstrip("\n"))
-                    print("%s exit %s · %.1fs"
-                          % ("✔" if rc == 0 else "✘", rc,
-                             time.monotonic() - t0))
+                    print(card_footer(rc, time.monotonic() - t0))
                     if not keep:
                         break
                     bar.refresh_data()
@@ -1143,7 +1161,7 @@ def run_console(args):
                 buf = io.StringIO()
                 ctx.job_event = threading.Event()
                 t0 = time.monotonic()
-                print("▸ !%s" % act[1])
+                print(card_header_line("!" + act[1]))
                 try:
                     with redirect_stdout(buf):
                         rc = run_shell(act[1], cancel_event=ctx.job_event)
@@ -1156,8 +1174,7 @@ def run_console(args):
                 out = buf.getvalue()
                 sys.stdout.write(out)
                 ctx.transcript.append(out.rstrip("\n"))
-                print("%s exit %s · %.1fs"
-                      % ("✔" if rc == 0 else "✘", rc, time.monotonic() - t0))
+                print(card_footer(rc, time.monotonic() - t0))
                 bar.refresh_data()
                 bar.print_bar()
                 continue
@@ -1185,7 +1202,7 @@ def run_console(args):
             buf = io.StringIO()
             label = "/" + act[1] + (" " + " ".join(act[2]) if act[2] else "")
             t0 = time.monotonic()
-            print("▸ %s" % label)
+            print(card_header_line(label))
             try:
                 with redirect_stdout(buf):
                     keep, rc = dispatch(act[1], act[2], defaults, ctx)
@@ -1197,8 +1214,7 @@ def run_console(args):
             sys.stdout.write(out)
             if out.strip():
                 ctx.transcript.append(out.rstrip("\n"))
-            print("%s exit %s · %.1fs"
-                  % ("✔" if rc == 0 else "✘", rc, time.monotonic() - t0))
+            print(card_footer(rc, time.monotonic() - t0))
             if not keep:
                 break
             if proc.poll() is not None:

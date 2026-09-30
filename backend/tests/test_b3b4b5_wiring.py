@@ -119,7 +119,8 @@ async def test_master_broadcasts_authoritative_partition_before_distributed(monk
     calls = {}
 
     async def fake_distributed(base_shard, prompt, request_id,
-                               max_generate_tokens=None, num_micro_batches=1):
+                               max_generate_tokens=None, num_micro_batches=1,
+                               sampling_state=None):
         calls["base_shard"] = base_shard
         return [1, 2]
 

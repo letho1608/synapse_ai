@@ -9,7 +9,7 @@
 
 | # | Việc | Hiện trạng 2026-09-11 | Commit sửa |
 |---|------|----------------------|------------|
-| A1 | Resume-from-checkpoint: survivor nạp lại checkpoint | **REOPENED (red-team B1, 2026-09-11)** — rebalance có gọi `engine.load_checkpoint()` (`orchestration/node.py:554-575`) nhưng `PyTorchHF.load_checkpoint()` là `pass` (`inference/pytorch_hf_engine.py:586-587`) trong khi save vẫn persist (`:589-596`); staging không check identity (`fault_tolerance.py:334-339`). Survivor khôi phục metadata, KHÔNG khôi phục weights | `120f856 A1` (wire) + REOPEN `08-red-team B1` — implement real load hoặc `raise NotImplementedError`; test assert weight-hash đổi, không chỉ flag |
+| A1 | Resume-from-checkpoint: survivor nạp lại checkpoint | DONE 2026-09-29 — training ghi `*.weights.pt` (chỉ layer của shard) mỗi `SYNAPSE_CKPT_WEIGHTS_EVERY` bước (mặc định 10), JSON ghi `weights_path/weights_step`; rebalance gọi `load_checkpoint(weights_path)` → copy đúng dải layer của node chết vào model survivor (test hash layer khớp, layer ngoài dải không đổi, thiếu layer → từ chối). Còn thiếu: file weights nằm trên máy node chết → khác máy cần shared dir hoặc replicate chủ động sang peer (chưa làm; không có → degraded) | `120f856` + `08-red-team B1` + đợt 2026-09-29 |
 | A2 | 1F1B backprop thật | DONE — `inference/pytorch_hf_engine.py:613-704` torch autograd thật + seed bằng downstream grad; chỉ trả `(None,None)` khi không có model | `5c46160 A2` |
 | A3 | Distributed decode full prompt | DONE — `inference/distributed_engine.py:290` dùng `full_context = prompt + history`; `_collect_result` check batch-identity | `22201b1 A3+B1+B2` |
 | A4 | Bridge chặn frame >10 MiB | DONE 1 nửa — cap nâng lên 256 MiB configurable + explicit `frame_too_large` (`routing/p2p_socket_bridge.py:22,505-514`); test 12 MB tensor pass | `5e6bbf0 A4` |
@@ -119,3 +119,91 @@ Quyết định: synapse xây theo kiểu **CLI terminal**, giữ web UI hiện 
 **Đã xóa:** liệt kê ở trên (verify zero-importer trước khi xóa).
 **Hoãn có lý do:** gộp test/partitioner/dataset/frontend (đụng việc bạn); autoscale actuating + INT8 default + TLS on (cần C1/GPU/certs); đo multi-size probe (cần mạng thật).
 **Tailscale không CLI (log spam):** `start()` probe 1 lần, thiếu CLI thì bỏ hẳn vòng posture + in 1 dòng hướng sang udp/manual; `stop()` chịu None (`test_tailscale_nocli` 2 passed).
+
+## Đợt 2026-09-29 (suite 428 passed + test mới)
+
+**Sửa lỗi thật (mỗi mục có test behavioral):**
+- Checkpoint **không bao giờ ghi được với model mặc định**: model id `HuggingFaceTB/SmolLM2-135M-Instruct` có `/` → tên file trỏ vào thư mục con không tồn tại. `_safe_name` giờ thay `/` và `:` (NTFS ADS) bằng `_`, dùng chung cho save/load/pull; `load_latest_checkpoint` không còn nhận nhầm file của node `a_b` khi hỏi node `a` (`test_shard_weights_restore.py`).
+- A1 thật: khôi phục weights dải layer của node chết (xem bảng A).
+- Launcher bị kill cứng → backend mồ côi giữ cổng (nguyên nhân `test_system::test_api_full` flaky). `SYNAPSE_PARENT_PID` + watchdog khởi động trước import nặng, chống PID tái dùng (`test_parent_watchdog.py`, kill cứng end-to-end).
+- `SYNAPSE_TLS` chỉ bọc bridge; đường tensor chunked-TCP (mặc định bật) vẫn plaintext. `TensorTCPTransport` giờ dùng chung ctx TLS với bridge; client plaintext không chèn được frame (`test_tcp_tls.py`).
+- `synapse.model_discovery` không import được (`List/Dict/Any` thiếu) → `/v1/models/search` luôn 500, pull repo HF ngoài danh sách luôn lỗi; thêm timeout + auth header cho search (`test_api_endpoints.py`).
+- `_pretty` không định nghĩa trong `update_peers` (NameError khi DEBUG>=3); xoá handler `handle_get_download_progress` trùng (bản chết).
+- CLI: `main.py --help` chỉ hiện `--no-frontend`; `--port N console` lỗi "invalid choice". Giờ help hiện đủ lệnh (có `console`), cờ global map sang console (`test_cli.py`).
+- README: sửa các khẳng định lỗi thời (TLS, checkpoint, chunked mặc định bật, KV mặc định bật, CLI/console, đường `pip install`, cây thư mục).
+
+**Còn lại (cần phần cứng/mạng thật):** C1 live 2-3 máy; replicate weights chủ động sang peer (C2 — pull từ node đã chết là bất khả); TLS bật trên multi-host; autoscale actuating; perf GPU.
+
+## Đợt 2026-09-29 (2): xóa frontend, bật INT8 mặc định
+
+- **Xóa `frontend/`** (CLI-first): API không còn `mkdir frontend/` + `/_static/`; `GET /` = trang trạng thái tích hợp (204 khi `--headless`). README/launcher cập nhật.
+- **Lỗi engine nghiêm trọng (tìm ra khi đo INT8):** CPU dùng `eager` + `attention_mask=None` → KHÔNG có causal mask (SmolLM2 trả lời "France is land"); transformers 5 đổi `past_key_value`→`past_key_values` (Cache) nên KV không bao giờ được ghi mà cache-hit vẫn cắt input; stage sau chỉ nhận hidden của token mới; GPT-2 thiếu `wpe`; CPU chạy bf16 ("auto"). Sửa: mask causal 4-D tường minh, `DynamicCache` theo (request, dải layer), stage không cuối trả hidden đủ độ dài, stage sau khớp prefix theo hàng byte-exact, bỏ cache theo hash nội dung (Cache mutate tại chỗ bị chia sẻ), CPU fp32. `test_engine_reference_parity.py`: token-identical với HF `model()`/`generate` ở 1/2/3 stage (tiny GPT-2 + SmolLM2). Test parity cũ so hai đường cùng hỏng nên không phát hiện.
+- **INT8 codec:** per-tensor scale → per-row + 8 outlier/hàng giữ fp32, làm tròn thay vì cắt, tensor toàn 0 không còn trả về int8, metadata >1 KiB không còn bị cắt mất `request_id` (quá 64 KiB thì raise). Đo teacher-forced (SmolLM2, 6 prompt, 2 và 3 stage): per-tensor cũ top-1 1–6% / KL 8–11; per-row 95–96% / 7e-3; per-row+outlier 100% / 5e-5.
+- **Bật INT8 mặc định** (`SYNAPSE_TRANSPORT_INT8=0` để tắt), chỉ tới peer đã negotiate feature `q8row1` (peer cũ nhận exact dtype; tra theo node gửi). Gate: `test_int8_quality.py` (top-1 ≥ 0.98, min ≥ 0.95, KL ≤ 1e-3).
+- **Chat qua API trả lời rác (kiểm chứng end-to-end bằng server thật):**
+  - Số layer đoán bừa 28 cho mọi model không có trong `HF_MODEL_LAYERS` (~480/500+, gồm model mặc định SmolLM2 = 30) → shard "cuối" dừng sớm, lm_head chạy trên hidden giữa model. Giờ đọc `num_hidden_layers` từ `config.json` (`models.layers_from_config`) và engine từ chối shard có `n_layers` sai.
+  - Engine phục vụ đủ 2 kiểu gọi: full-context (khớp prefix) và delta (chỉ token mới + `kv_len` trong `inference_state`), phân loại không mơ hồ (nối dài chính xác = full-context; ids int32/int64 so theo giá trị).
+  - Handler bỏ qua system prompt đã cấu hình và chèn cứng "Trả lời bằng tiếng Việt"; `temperature` của request bị bỏ qua (node luôn dùng 0.7). Giờ dùng đúng system prompt cấu hình, temperature đi trong `inference_state`; bỏ default dict dùng chung `inference_state={}`.
+  - Kết quả end-to-end (`python main.py`, POST `/v1/chat/completions`, temperature 0): "The capital of France is Paris." — trước đó "land" / "Din Son T shallow…". Test: `test_engine_reference_parity.py` (logits + generate khớp HF cho full-context, delta, và đúng convention của node).
+
+## Đợt 2026-09-29 (3): kiểm chứng "đã thật sự phân tán chưa"
+
+**Cách kiểm:** chạy 2 rồi 3 process backend thật (manual discovery, 127.0.0.1, cổng riêng), gửi 1 request chat, đọc log `forward layers a-b` của từng node.
+
+**Trước khi sửa: CHƯA phân tán đúng.** Lần 1: trả lời rỗng sau 172 s; lần sau: "The capital capital capital" (105 s). Nguyên nhân (đều đã sửa, test trong `test_distributed_real_wiring.py`):
+1. Node tự coi **chính nó** chết (heartbeat của mình không bao giờ quay về) → rebalance bỏ chính nó mỗi vài giây.
+2. Node nhận **bỏ qua shard trong message**, tự tính lại shard theo view phân vùng cục bộ; 2 node ngang nhau có thứ tự hòa khác nhau → **cả 2 cùng chạy layer 0–14**, hidden state bị đẩy qua lại ~170 lần. Sửa: request mang `partition_plan`; mỗi hop chạy đúng shard được gửi (`exact_shard`) và chuyển tiếp theo plan.
+3. Broadcast topology luôn fail (pydantic `DeviceFlops` không JSON được); mọi lỗi handler bị `gather(return_exceptions=True)` nuốt im lặng → giờ log ra.
+4. Stage cuối lấy mẫu với nhiệt độ mặc định 0.7 (temperature của request không tới node cuối) → giờ đi trong `inference_state`.
+5. Controller bắn 3 micro-batch **y hệt** mỗi bước decode khi chưa có guess (3× compute) và engine chạy song song trên cùng KV cache → hỏng cache. Giờ 1 batch khi không guess + khóa forward trong engine.
+6. Đường TCP chunked "mặc định bật" **chưa bao giờ chạy giữa 2 process**: peer đăng ký cổng *bridge* của nhau làm địa chỉ tensor; phía nhận gom mọi frame vào 1 bucket `"__inbound__"` chờ micro_batch 1,2,… mãi → mọi bước decode sau bước đầu bị treo. Giờ `tcp_port` quảng bá trong handshake, phía nhận giao ngay. SHM (chỉ trong 1 process) không còn bị chọn cho peer khác process.
+
+**Sau khi sửa (INT8 bật, temperature 0):** 2 process — A chạy 0–14 ×8, B chạy 15–29 ×8, tensor qua `tcp-chunked`, "The capital of France is Paris." (giống 1 node), ~4–5 s. 3 process — 0–9 / 10–19 / 20–29, cùng đáp án, ~8.5 s. Test live: `test_live_multiprocess_split.py` (2 process thật, assert dải layer + đáp án + transport).
+
+**Chưa kiểm được:** nhiều **máy** thật (C1) — mạng thật, băng thông, failover. Lưu ý Windows: dải cổng 50000–50059 có thể bị hệ thống giữ (Hyper-V) → cổng node mặc định 50051 không bind được.
+
+## Đợt 2026-09-30: bổ sung theo tài liệu liên quan + rà soát tính năng
+
+Làm theo `research/related-work.md`, các mục 1, 3, 4, 5, 6, 7.
+
+**Mục 6 – nạp theo dải layer + lượng tử trọng số**
+- Mỗi node trước đây nạp **toàn bộ** model.
+- Giờ `partial_loader.py` dựng skeleton trên meta và chỉ nạp các layer của shard (+ embedding ở stage đầu, head ở stage cuối) từ safetensors.
+- `weight_quant.py`:
+  - int8: top-1 100%, KL 0,006.
+  - int4 bất đối xứng: top-1 51% trên model 135M, nên chỉ dùng khi int8 không vừa.
+- `encode()` chỉ nạp tokenizer.
+
+**Mục 4 – kiểm tra draft trong một lượt**
+- Mỗi bước decode = một lượt `[prompt + lịch sử + draft]`; stage cuối lấy mẫu ở mọi vị trí draft.
+- KV được cắt về tiền tố chung.
+- Giữa các stage chỉ gửi các dòng mới (`row_offset`); thiếu KV thì trả `kv_miss` và bước được gửi lại đầy đủ.
+- Lỗi thật tìm thấy khi chạy live: mẫu chưa kiểm chứng lọt vào stream ("That in one Paris").
+
+**Mục 3 – continuous batching**
+- 4 request: 12,8 → 23,3 tok/s.
+- 8 request: 12,3 → 35,0 tok/s.
+- Token của từng request giống hệt khi chạy riêng.
+
+**Mục 5 – phân chia theo số đo**
+- `dp_partition.py` (quy hoạch động, đã đối chiếu vét cạn) + `layer_profile.py` (ms/layer thật hoặc probe, giới hạn bộ nhớ).
+- Profile đi qua gossip; phân chia chỉ đổi khi rẻ hơn ≥10%.
+
+**Mục 7 – failover giữa request**
+- Theo dõi heartbeat trong lúc chờ.
+- Vá kế hoạch (ưu tiên node đang giữ bản sao, rồi đến stage liền kề), gửi lại đúng bước đó.
+- `SYNAPSE_REPLICAS=1` giữ sẵn layer của stage kế tiếp.
+- Live: giết 1 trong 3 tiến trình khi đang stream, câu trả lời vẫn giống hệt.
+
+**Mục 1 – README** viết lại phần mở đầu và kiến trúc: không còn "bubble-free / 333 tok/s"; có bảng số đo và biến môi trường.
+
+**Lỗi sửa khi rà soát tính năng**
+- Bầu master: hai node nhường nhau cùng lúc thì không còn master nào; nay tự hội tụ.
+- Stream API mất khoảng trắng (giải mã từng token rồi strip): nay giải mã tăng dần.
+- Stream giữ lại 20 token dù không có tool.
+- Chunk cuối không có `usage`.
+- Settings `load_quantization` / `lookahead_window` / `transport_quantization` / `lacp_priority` không có tác dụng; nay được áp dụng và lưu lại.
+- `/v1/models` báo `ready: true` cho mọi model.
+- `benchmark` dùng model "default" nên bị 400; `--prompt` bị bỏ qua; tok/s bị thổi phồng (~400) vì đo từ chunk đầu tiên.
+- `settings.json` trong repo đè model mặc định (Qwen chưa có trong cache); `--default-model` nay thắng.
+- Checkpoint FT ghi vào thư mục gốc cache HF; nay ở `~/.synapse/checkpoints`, test dùng thư mục tạm.

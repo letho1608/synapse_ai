@@ -79,6 +79,9 @@ class Node:
     # Real bandwidth probing for same-machine/peer links (TCP echo probes).
     self._latency_prober = LatencyProber()
     self._measured_bandwidth: Dict[str, float] = {}
+    self._measured_rtt: Dict[str, float] = {}  # peer -> measured ping RTT (ms)
+    # Measured-placement objective set from API settings (None = env default).
+    self.partition_objective: Optional[str] = None
 
     # LACP Distributed Pipeline Extension
     self._distributed_pipeline = None
@@ -220,9 +223,37 @@ class Node:
     # the default 1.0 — compute it now that real hardware is known.
     self._refresh_election_weight()
     
+    # Start TCP transport for binary tensor forwarding BEFORE the bridge, so
+    # the bridge handshake can advertise its (ephemeral) port to peers.
+    # Peers used to register our bridge port as the tensor address, so the
+    # chunked-TCP path could never connect between real processes.
+    try:
+        from synapse.transport.tcp_transport import TensorTCPTransport
+        # Reuse the bridge's TLS contexts so SYNAPSE_TLS covers tensors too.
+        _bridge = getattr(self.libp2p_node, "_bridge", None)
+        self.tcp_transport = TensorTCPTransport(
+          node_id=self.id,
+          ssl_server_ctx=getattr(_bridge, "_ssl_server_ctx", None),
+          ssl_client_ctx=getattr(_bridge, "_ssl_client_ctx", None),
+        )
+        tcp_port = await self.tcp_transport.start()
+        if _bridge is not None:
+          _bridge.tcp_port = tcp_port
+        if DEBUG >= 1:
+            print(f"[TCP] Binary tensor transport listening on port {tcp_port}")
+    except Exception as e:
+        if DEBUG >= 1:
+            print(f"[TCP] Failed to start binary transport: {e}")
+        self.tcp_transport = None
+
     if DEBUG >= 1: print("Starting node: Starting Event Router and P2P Mesh...")
     await self.event_router.start()
     await self.libp2p_node.start()
+    # INT8 wire payloads go only to peers whose handshake negotiated them.
+    _bridge = getattr(self.libp2p_node, "_bridge", None)
+    if _bridge is not None and hasattr(_bridge, "negotiated_features"):
+      from synapse.transport.router import set_peer_features_lookup
+      set_peer_features_lookup(self.id, _bridge.negotiated_features)
     await self.election_manager.start()
     self.election_manager.set_monitor(self.monitor)
     self._setup_p2p_rpc_handlers()
@@ -246,18 +277,6 @@ class Node:
     if DEBUG >= 2: print(f"Collected topology: {self.topology}")
     if DEBUG >= 1: print("Node started successfully!")
     self._schedule_task(self.periodic_topology_collection(2.0), "periodic_topology_collection")
-
-    # Start TCP transport for binary tensor forwarding
-    try:
-        from synapse.transport.tcp_transport import TensorTCPTransport
-        self.tcp_transport = TensorTCPTransport(node_id=self.id)
-        tcp_port = await self.tcp_transport.start()
-        if DEBUG >= 1:
-            print(f"[TCP] Binary tensor transport listening on port {tcp_port}")
-    except Exception as e:
-        if DEBUG >= 1:
-            print(f"[TCP] Failed to start binary transport: {e}")
-        self.tcp_transport = None
 
     # Start zero-copy shared-memory transport for same-machine peers
     try:
@@ -523,9 +542,20 @@ class Node:
     eng = getattr(self, "inference_engine", None)
     model_ids = [getattr(eng, "_model_id", None)] if eng is not None else []
     model_ids = [m for m in model_ids if m]
-    await self.event_router.publish(CAPABILITIES_TOPIC, build_capability_doc(
+    profiles = {}
+    for mid in set(model_ids) | set(getattr(self, "_profile_models", set())):
+      prof = await asyncio.get_running_loop().run_in_executor(
+        None, self._local_layer_profile, mid)
+      if prof:
+        profiles[mid] = prof
+    doc = build_capability_doc(
       self.id, getattr(self, "device_capabilities", None),
-      model_ids=model_ids, version=_VER), origin="local")
+      model_ids=model_ids, version=_VER, layer_profiles=profiles)
+    # Which layers we hold: failover prefers a node that already has them.
+    loaded = getattr(eng, "loaded_layers", None)
+    if model_ids and callable(loaded):
+      doc["loaded_layers"] = {model_ids[0]: list(loaded())}
+    await self.event_router.publish(CAPABILITIES_TOPIC, doc, origin="local")
     outstanding = getattr(self, "outstanding_requests", {})
     in_flight = len(outstanding) if hasattr(outstanding, "__len__") else 0
     maxc = getattr(self, "max_concurrent_requests", 32) or 32
@@ -745,7 +775,10 @@ class Node:
                 )
                 # B1: the engine reports whether weights were REALLY restored.
                 # A False here means metadata-only resume (degraded, not silent).
-                restored = await engine.load_checkpoint(shard, ckpt.checkpoint_path)
+                # Prefer the shard layer-weights file; the JSON path alone is
+                # metadata and can only ever yield a degraded resume.
+                restored = await engine.load_checkpoint(
+                  shard, getattr(ckpt, "weights_path", None) or ckpt.checkpoint_path)
                 if not restored:
                   self._last_recovery_degraded = {
                     "dead_node_id": dead_id, "target": target,
@@ -805,7 +838,11 @@ class Node:
         inference_state = data.get("inference_state")
         orchestrator_id = data.get("_orchestrator_id")
 
-    await self.process_tensor(shard, tensor_data, request_id, inference_state, orchestrator_id=orchestrator_id)
+    # Run EXACTLY the shard the sender assigned: recomputing it from our
+    # local partition view let two nodes with a different view both run
+    # layers 0..k and bounce hidden states back and forth.
+    await self.process_tensor(shard, tensor_data, request_id, inference_state,
+                              orchestrator_id=orchestrator_id, exact_shard=True)
     await self._ack_peer(data if isinstance(data, dict) else metadata)
 
   async def _ack_peer(self, data) -> None:
@@ -880,6 +917,10 @@ class Node:
     request_id = data.get("request_id")
     tokens = data.get("tokens", [])
     is_finished = data.get("is_finished", False)
+    if data.get("verify") or data.get("kv_miss"):
+      # Raw per-position samples (incl. unverified draft positions) for the
+      # orchestrator's decode loop only; it streams the verified tokens.
+      return
 
     # The token buffer is fed by the verified decode-loop callback
     # (node_extension) or by the sampling node's direct append — the P2P
@@ -963,6 +1004,13 @@ class Node:
     
     is_finished = self.buffered_token_output[request_id][1] or (len(self.buffered_token_output[request_id][0]) >= self.max_generate_tokens)
 
+    # Orchestrator-driven decode (distributed path): sample one token per
+    # requested position and hand them back; the orchestrator verifies the
+    # draft, applies stop rules and streams. No per-request buffer here.
+    if shard.is_last_layer() and isinstance(inference_state, dict)         and inference_state.get("verify_n") is not None:
+      await self._publish_verify_result(shard, result, request_id, inference_state, orchestrator_id)
+      return None
+
     # Tokens generation logic: only needed for LLMs
     if shard.is_last_layer() and not is_finished:
       # Check for empty results before sampling
@@ -987,7 +1035,12 @@ class Node:
             top_indices = np.argsort(last_logits)[-top_k:][::-1]
             print(f"[{request_id}] [DEBUG] Top {top_k} logits: {[(int(idx), float(last_logits[idx])) for idx in top_indices]}")
         
-        token = await self.inference_engine.sample(result, temp=self.default_sample_temperature, generated_ids=buf if buf else None)
+        # Per-request temperature travels in inference_state (set by the API
+        # from the request body); the node default applies otherwise.
+        temp = self.default_sample_temperature
+        if inference_state and inference_state.get("temperature") is not None:
+          temp = float(inference_state["temperature"])
+        token = await self.inference_engine.sample(result, temp=temp, generated_ids=buf if buf else None)
         await self.inference_engine.ensure_shard(shard)
         token_value = token.item()
         
@@ -1016,7 +1069,7 @@ class Node:
                 retry_logits[0, -1, sid] = -1e9
             retry_token = await self.inference_engine.sample(
               retry_logits,
-              temp=self.default_sample_temperature,
+              temp=temp,
               generated_ids=buf if buf else None,
             )
             token = retry_token
@@ -1074,6 +1127,7 @@ class Node:
         request_id,
         self.get_partition_index(offset=1, base_shard=shard),
         inference_state,
+        target=self._next_stage_from_plan(shard, inference_state),
       )
       if forwarded_tokens is not None and forwarded_tokens.size > 0:
         self._on_token_received(request_id, forwarded_tokens.flatten().tolist(), False)
@@ -1114,12 +1168,81 @@ class Node:
         return np.array(self.buffered_token_output.get(request_id, ([], False))[0])
 
 
+  def _stop_token_ids(self) -> set:
+    ids = {151643, 151644, 151645}  # Qwen chat stop tokens
+    tok = getattr(self.inference_engine, "tokenizer", None)
+    eos = getattr(tok, "eos_token_id", None) if tok is not None else None
+    if eos is None and tok is not None and hasattr(tok, "_tokenizer"):
+      eos = getattr(tok._tokenizer, "eos_token_id", None)
+    if isinstance(eos, int):
+      ids.add(eos)
+    return ids
+
+  async def _publish_verify_result(self, shard, result, request_id, state, orchestrator_id) -> None:
+    """Sample the last `verify_n` positions (position j conditioned on the
+    history + draft[:j], same repetition penalty as sequential decoding) and
+    publish all of them. With a deterministic draft, "sample, then accept
+    while the sample equals the guess" is exact speculative sampling."""
+    n = int(state.get("verify_n") or 1)
+    draft = [int(t) for t in (state.get("draft") or [])]
+    gen = [int(t) for t in (state.get("gen_ids") or [])]
+    temp = self.default_sample_temperature
+    if state.get("temperature") is not None:
+      temp = float(state["temperature"])
+    arr = np.asarray(result)
+    rows = arr.reshape(-1, arr.shape[-1]) if arr.size else arr.reshape(0, 1)
+    if rows.shape[0] < n:
+      # Fewer output rows than draft positions would shift every sampled
+      # token by the missing count: never answer, ask for a full resend.
+      await self._publish_kv_miss(shard, request_id, state, orchestrator_id)
+      return
+    stop_ids = self._stop_token_ids()
+    tokens: List[int] = []
+    for j in range(n):
+      row = rows[rows.shape[0] - n + j][None, None, :]
+      hist = gen + draft[:j]
+      tok = int(np.asarray(await self.inference_engine.sample(
+        row, temp=temp, generated_ids=hist or None)).reshape(-1)[0])
+      if not hist and tok in stop_ids:
+        # Same rule as the sequential path: never end on the first token.
+        masked = np.array(row, copy=True)
+        for sid in stop_ids:
+          if 0 <= sid < masked.shape[-1]:
+            masked[..., sid] = -1e9
+        tok = int(np.asarray(await self.inference_engine.sample(
+          masked, temp=temp, generated_ids=None)).reshape(-1)[0])
+      tokens.append(tok)
+    payload = {
+      "request_id": request_id,
+      "tokens": tokens,
+      "is_finished": False,
+      "verify": True,
+      "micro_batch_id": state.get("microbatch_id", 0),
+      "source_stage_id": shard.start_layer,
+    }
+    await self.event_router.publish(f"synapse/inference/result/{request_id}", payload)
+    if orchestrator_id and orchestrator_id != self.id:
+      await self.event_router.publish(f"synapse/inference/result/{orchestrator_id}", payload)
+
+  async def _publish_kv_miss(self, shard, request_id, state, orchestrator_id) -> None:
+    """A stage lacks the cached prefix it was asked to extend: tell the
+    orchestrator to resend this step with full hidden states."""
+    payload = {
+      "request_id": request_id, "tokens": [], "is_finished": False,
+      "kv_miss": True, "node_id": self.id,
+      "micro_batch_id": (state or {}).get("microbatch_id", 0),
+      "source_stage_id": None,
+    }
+    await self.event_router.publish(f"synapse/inference/result/{request_id}", payload)
+    if orchestrator_id and orchestrator_id != self.id:
+      await self.event_router.publish(f"synapse/inference/result/{orchestrator_id}", payload)
+
   async def process_prompt(
     self,
     base_shard: Shard,
     prompt: str,
     request_id: Optional[str] = None,
-    inference_state: Optional[dict] = {},
+    inference_state: Optional[dict] = None,
     max_generate_tokens: Optional[int] = None,
   ) -> Optional[np.ndarray]:
     shard = self.get_current_shard(base_shard)
@@ -1197,6 +1320,8 @@ class Node:
           request_id=request_id,
           max_generate_tokens=max_generate_tokens,
           num_micro_batches=self.num_micro_batches,
+          sampling_state={k: v for k, v in (inference_state or {}).items()
+                          if k in ("temperature",)},
         )
         if tokens:
           return np.array(tokens) if tokens else None
@@ -1462,10 +1587,12 @@ class Node:
     request_id: Optional[str] = None,
     inference_state: Optional[dict] = None,
     orchestrator_id: Optional[str] = None,
+    exact_shard: bool = False,
   ) -> Optional[np.ndarray]:
-    shard = self.get_current_shard(base_shard)
+    shard = base_shard if exact_shard else self.get_current_shard(base_shard)
     start_time = time.perf_counter_ns()
-    resp = await self._process_tensor(shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
+    resp = await self._process_tensor(shard, tensor, request_id, inference_state,
+                                      orchestrator_id=orchestrator_id, exact_shard=True)
     end_time = time.perf_counter_ns()
     elapsed_time_ns = end_time - start_time
     if DEBUG >= 2: print(f"[{request_id}] process_tensor: {base_shard=} {shard=} {tensor.size=} {tensor.shape=} {elapsed_time_ns=}")
@@ -1478,10 +1605,11 @@ class Node:
     request_id: Optional[str] = None,
     inference_state: Optional[dict] = None,
     orchestrator_id: Optional[str] = None,
+    exact_shard: bool = False,
   ) -> Optional[np.ndarray]:
     if request_id is None:
       request_id = str(uuid.uuid4())
-    shard = self.get_current_shard(base_shard)
+    shard = base_shard if exact_shard else self.get_current_shard(base_shard)
 
     # CRITICAL FIX: Store orchestrator_id for downstream forwarding chain
     if orchestrator_id:
@@ -1500,7 +1628,16 @@ class Node:
           input_data = full_ids
           if DEBUG >= 2:
             print(f"[{request_id}] First layer: full sequence length {len(full_ids)} (prompt + {len(buf)} generated)")
-      result, inference_state = await self.inference_engine.infer_tensor(request_id, shard, input_data, inference_state)
+      try:
+        result, inference_state = await self.inference_engine.infer_tensor(request_id, shard, input_data, inference_state)
+      except Exception as e:
+        if type(e).__name__ == "KVMissError":
+          self.outstanding_requests.pop(request_id, None)
+          if DEBUG >= 1: print(f"[{request_id}] kv miss on {shard}: {e}")
+          await self._publish_kv_miss(shard, request_id, inference_state,
+                                      orchestrator_id or self._request_orchestrator_map.get(request_id))
+          return None
+        raise
       ret = await self.process_inference_result(shard, result, request_id, inference_state, orchestrator_id=orchestrator_id)
       return ret
     except Exception as e:
@@ -1556,6 +1693,22 @@ class Node:
               "_orchestrator_id": self.id,
           })
   
+  def _next_stage_from_plan(self, shard: Shard, inference_state: Optional[dict]):
+    """(node_id, Shard) owning layer shard.end_layer + 1 in the request's
+    partition_plan, or None when the request carries no plan."""
+    plan = (inference_state or {}).get("partition_plan") if isinstance(inference_state, dict) else None
+    if not plan:
+      return None
+    nxt = shard.end_layer + 1
+    for entry in plan:
+      try:
+        nid, start, end, n = entry[0], int(entry[1]), int(entry[2]), int(entry[3])
+      except (TypeError, ValueError, IndexError):
+        return None
+      if start == nxt:
+        return nid, Shard(shard.model_id, start, end, n)
+    return None
+
   async def forward_tensor(
     self,
     base_shard: Shard,
@@ -1563,23 +1716,28 @@ class Node:
     request_id: str,
     target_index: int,
     inference_state: Optional[dict] = None,
+    target: Optional[Tuple[str, Shard]] = None,
   ) -> None:
-    if DEBUG >= 1: print(f"target partition index: {target_index}")
-    target_id = self._compute_lacp_partition(base_shard)[target_index].node_id
-    target_shard = self.get_current_shard(base_shard, target_index)
-    if DEBUG >= 2: print(f"Computed target from: {base_shard} {target_index}, {self.topology}. target shard: {target_shard}")
+    if target is not None:
+      target_id, target_shard = target
+    else:
+      if DEBUG >= 1: print(f"target partition index: {target_index}")
+      target_id = self._compute_lacp_partition(base_shard)[target_index].node_id
+      target_shard = self.get_current_shard(base_shard, target_index)
+    if DEBUG >= 2: print(f"Forward target: {target_id} shard {target_shard}")
 
     orchestrator_id = self._orchestrator_id_for_request(request_id)
 
     if target_id == self.id:
-      return await self.process_tensor(target_shard, tensor, request_id, inference_state, orchestrator_id=orchestrator_id)
+      return await self.process_tensor(target_shard, tensor, request_id, inference_state,
+                                       orchestrator_id=orchestrator_id, exact_shard=True)
     else:
       start_send = time.perf_counter()
-      # B4: exact-dtype default. INT8 only with explicit opt-in
-      # (SYNAPSE_TRANSPORT_INT8=1 or a negotiated offer flag).
+      # Per-row INT8 by default, only toward peers that negotiated it
+      # (SYNAPSE_TRANSPORT_INT8=0 = exact dtype).
       try:
         from synapse.transport.router import should_quantize as _should_q
-        quantize = _should_q(str(tensor.dtype))
+        quantize = _should_q(str(tensor.dtype), target_id=target_id, self_id=self.id)
       except Exception:
         quantize = False
       if DEBUG >= 2:
@@ -1613,13 +1771,18 @@ class Node:
           _addr = None
         _tcp = getattr(self, "tcp_transport", None)
         _shm = getattr(self, "shm_transport", None)
+        _tcp_addr = self._peer_tcp_addr(target_id, _addr)
+        if _tcp is not None and _tcp_addr and _tcp_addr not in _tcp._peer_map:
+          _tcp.register_peer(_tcp_addr, target_id)
         _route, _reason = _choose(
           self.id, target_id, _addr, len(encoded_payload),
-          shm_registered=bool(_shm is not None and _addr and _shm.is_local_peer(_addr)),
-          tcp_registered=bool(_tcp is not None and _addr and _addr in _tcp._peer_map),
+          # SHM delivers only within one process (in-process notifier); a
+          # same-host peer in another process always failed -> bridge.
+          shm_registered=bool(_shm is not None and _addr and _shm.can_deliver(_addr)),
+          tcp_registered=bool(_tcp is not None and _tcp_addr and _tcp_addr in _tcp._peer_map),
         )
-        if _route == "tcp-chunked" and _addr is not None and _tcp is not None:
-          routed = await _tcp.send_blob_chunked(_addr, encoded_payload)
+        if _route == "tcp-chunked" and _tcp_addr is not None and _tcp is not None:
+          routed = await _tcp.send_blob_chunked(_tcp_addr, encoded_payload)
           self._record_transport("tcp-chunked" if routed else "tcp-chunked:fallback")
         elif _route == "shm" and _addr is not None and _shm is not None:
           routed = await _shm.send_tensor(
@@ -1690,6 +1853,7 @@ class Node:
         meta.get("request_id", getattr(msg, "request_id", None)),
         meta.get("inference_state"),
         orchestrator_id=meta.get("_orchestrator_id", getattr(msg, "orchestrator_id", None)),
+        exact_shard=True,  # same rule as on_p2p_tensor: run the assigned shard
       )
     except Exception as e:
       self._record_transport(via + ":error")
@@ -1767,6 +1931,8 @@ class Node:
     successful_connects = [peer for peer, result in zip(peers_to_connect, connect_results) if result is True]
     failed_connects = [peer for peer, result in zip(peers_to_connect, connect_results) if result is False]
     if DEBUG >= 3:
+      def _pretty(ps):
+        return [f"{p.id()}@{p.addr()}" for p in ps]
       if successful_disconnects: print(f"Successfully disconnected peers: {_pretty(successful_disconnects)}")
       if failed_disconnects: print(f"Failed to disconnect peers: {_pretty(failed_disconnects)}")
       if successful_connects: print(f"Successfully connected peers: {_pretty(successful_connects)}")
@@ -1775,6 +1941,15 @@ class Node:
     self.peers = next_peers
     self._register_transport_peers()
     return len(peers_added) > 0 or len(peers_removed) > 0 or len(peers_updated) > 0
+
+  def _peer_tcp_addr(self, peer_id: str, bridge_addr: Optional[str]) -> Optional[str]:
+    """host:tcp_port of a peer's tensor transport (from its handshake)."""
+    bridge = getattr(self.libp2p_node, "_bridge", None)
+    info = getattr(bridge, "_peer_handshakes", {}).get(peer_id) if bridge else None
+    port = (info or {}).get("tcp_port")
+    if not port or not bridge_addr or ":" not in bridge_addr:
+      return None
+    return f"{bridge_addr.rsplit(':', 1)[0]}:{int(port)}"
 
   def _register_transport_peers(self):
     """Register every peer on the binary transports.
@@ -1794,10 +1969,14 @@ class Node:
       except Exception:
         continue
       if self.tcp_transport is not None:
-        try:
-          self.tcp_transport.register_peer(addr, peer_id)
-        except Exception:
-          pass
+        # The peer's tensor transport listens on its own (ephemeral) port,
+        # advertised in the bridge handshake; its bridge port is not it.
+        tcp_addr = self._peer_tcp_addr(peer_id, addr)
+        if tcp_addr:
+          try:
+            self.tcp_transport.register_peer(tcp_addr, peer_id)
+          except Exception:
+            pass
       if self.shm_transport is not None and is_same_machine(addr, own_addr):
         try:
           self.shm_transport.register_peer(addr, peer_id)
@@ -2000,10 +2179,218 @@ class Node:
     except Exception:
       pass
 
+  def _node_alive(self, node_id: str) -> bool:
+    """Heartbeat view of a node (used to detect a dead stage mid-request).
+
+    Unknown to the fault-tolerance monitor = alive (no false failovers)."""
+    if node_id == self.id:
+      return True
+    ft = getattr(self, "fault_tolerance", None)
+    health = getattr(ft, "_health", {}).get(node_id) if ft is not None else None
+    if health is None:
+      return True
+    if getattr(health, "is_blacklisted", False):
+      return False
+    last = getattr(health, "last_heartbeat", None)
+    interval = getattr(ft, "HEARTBEAT_INTERVAL", 2.0)
+    return not last or (time.time() - last) <= 3 * interval + 1.0
+
+  def _layers_held(self, node_id: str, model_id: str) -> set:
+    """Decoder layers a node has in memory (own engine, or peer gossip)."""
+    if node_id == self.id:
+      eng = self.inference_engine
+      if getattr(eng, "_model_id", None) != model_id:
+        return set()
+      fn = getattr(eng, "loaded_layers", None)
+      return set(fn()) if callable(fn) else set()
+    doc = (getattr(self, "_peer_capabilities", {}) or {}).get(node_id) or {}
+    return set((doc.get("loaded_layers") or {}).get(model_id) or [])
+
+  def _replan_excluding(self, base_shard: Shard, current, exclude: set):
+    """New stage plan for a running request without the `exclude` nodes.
+
+    Patch first (Petals-style): each dead stage's range goes to a live node,
+    preferring one that already HOLDS those layers (a replica), then a
+    neighbouring stage (the ranges merge), within its memory cap. Other
+    stages keep their KV caches. If no patch fits, a fresh placement over
+    the surviving nodes."""
+    model_id, n = base_shard.model_id, base_shard.n_layers
+    alive = [nid for nid in self.topology.nodes.keys()
+             if nid not in exclude and self._node_alive(nid)]
+    if not alive:
+      return None
+    stages = [(nid, sh.start_layer, sh.end_layer) for nid, sh in current]
+    caps = {}
+    for nid in alive:
+      prof = (self._local_layer_profile(model_id) if nid == self.id else
+              ((getattr(self, "_peer_capabilities", {}).get(nid) or {}).get("layer_profiles") or {}).get(model_id))
+      caps[nid] = int(prof["max_layers"]) if prof and prof.get("max_layers") else n
+    patched = []
+    ok = True
+    for i, (nid, a, b) in enumerate(stages):
+      if nid not in exclude:
+        patched.append([nid, a, b])
+        continue
+      need = set(range(a, b + 1))
+      used = lambda x: sum(bb - aa + 1 for m, aa, bb in patched if m == x) + \
+        sum(bb - aa + 1 for m, aa, bb in stages[i + 1:] if m == x)
+      neighbours = {patched[-1][0] if patched else None,
+                    stages[i + 1][0] if i + 1 < len(stages) else None}
+      cands = [c for c in alive if used(c) + (b - a + 1) <= caps.get(c, n)]
+      if not cands:
+        ok = False
+        break
+      cands.sort(key=lambda c: (not need <= self._layers_held(c, model_id),
+                                c not in neighbours, used(c)))
+      patched.append([cands[0], a, b])
+    if ok:
+      merged = []
+      for nid, a, b in patched:
+        if merged and merged[-1][0] == nid and merged[-1][2] + 1 == a:
+          merged[-1][2] = b
+        else:
+          merged.append([nid, a, b])
+      # a node may appear once in a chain (one KV cache per range is fine,
+      # but a loop back to an earlier node would need two forwards per hop)
+      if len({m[0] for m in merged}) == len(merged):
+        return [(nid, Shard(model_id, a, b, n)) for nid, a, b in merged]
+    saved = self.topology
+    try:
+      from synapse.topology.topology import Topology
+      sub = Topology()
+      for nid in alive:
+        sub.update_node(nid, saved.nodes[nid])
+      self.topology = sub
+      self._last_placement = None
+      parts = self._compute_lacp_partition(base_shard)
+    finally:
+      self.topology = saved
+    from synapse.topology.partitioning_strategy import map_partitions_to_shards
+    shards = map_partitions_to_shards(parts, n, model_id)
+    return [(p.node_id, shards[i]) for i, p in enumerate(parts) if i < len(shards)]
+
+  async def _warm_replica(self, base_shard: Shard, partitions) -> None:
+    """SYNAPSE_REPLICAS=1: also hold the NEXT stage's layers (if they fit),
+    so when that node dies the patch plan finds a replica already in memory
+    instead of loading weights mid-request."""
+    import os as _os
+    if _os.getenv("SYNAPSE_REPLICAS", "0") != "1" or not partitions:
+      return
+    try:
+      from synapse.topology.partitioning_strategy import map_partitions_to_shards
+      n = base_shard.n_layers
+      shards = map_partitions_to_shards(partitions, n, base_shard.model_id)
+      ids = [p.node_id for p in partitions]
+      if self.id not in ids or len(ids) < 2:
+        return
+      i = ids.index(self.id)
+      succ = shards[(i + 1) % len(shards)]
+      mine = shards[i]
+      prof = self._local_layer_profile(base_shard.model_id) or {}
+      if (mine.end_layer - mine.start_layer + 1) + (succ.end_layer - succ.start_layer + 1) \
+          > int(prof.get("max_layers") or 0):
+        return
+      await self.inference_engine.ensure_shard(succ)
+      if DEBUG >= 1:
+        print(f"[REPLICA] {self.id} holds layers {succ.start_layer}-{succ.end_layer} of {ids[(i + 1) % len(ids)]}")
+    except Exception as e:
+      if DEBUG >= 1: print(f"[REPLICA] warm-up failed: {e}")
+
+  def _note_profile_model(self, model_id: Optional[str]) -> None:
+    if model_id:
+      if not hasattr(self, "_profile_models"):
+        self._profile_models = set()
+      self._profile_models.add(model_id)
+
+  def _local_layer_profile(self, model_id: str):
+    """This node's measured layer cost for model_id (cached ~30 s)."""
+    cache = getattr(self, "_profile_cache", None)
+    if cache is None:
+      cache = self._profile_cache = {}
+    hit = cache.get(model_id)
+    if hit and time.time() - hit.get("ts", 0) < 30.0:
+      return hit
+    try:
+      from synapse.topology.layer_profile import local_profile
+      prof = local_profile(self.inference_engine, model_id)
+    except Exception as e:
+      if DEBUG >= 1: print(f"[PROFILE] {model_id}: {e}")
+      prof = None
+    if prof:
+      cache[model_id] = prof
+    return prof
+
+  def _measured_placement(self, base_shard: Optional[Shard]) -> Optional[List[Partition]]:
+    """DP placement from measured ms/layer, memory caps and hop times.
+
+    Needs a profile from EVERY topology node for this model (own + gossip);
+    otherwise None and the caller uses the legacy weighting. Keeps the
+    previous placement unless the new one is >= 10% cheaper under the
+    current measurements (no churn from measurement noise).
+    SYNAPSE_PARTITIONER=legacy disables it; SYNAPSE_PARTITION_OBJECTIVE =
+    throughput (default) | latency."""
+    import os as _os
+    if base_shard is None or _os.getenv("SYNAPSE_PARTITIONER", "measured") == "legacy":
+      return None
+    from synapse.topology.dp_partition import NodeProfile, plan, _dp_for_order
+    model_id, total = base_shard.model_id, base_shard.n_layers
+    if not model_id or total <= 0:
+      return None
+    self._note_profile_model(model_id)
+    profiles = []
+    peers = getattr(self, "_peer_capabilities", {}) or {}
+    for nid in self.topology.nodes.keys():
+      if nid == self.id:
+        prof = self._local_layer_profile(model_id)
+      else:
+        prof = ((peers.get(nid) or {}).get("layer_profiles") or {}).get(model_id)
+      if not prof or not prof.get("ms_per_layer") or not prof.get("max_layers"):
+        return None
+      profiles.append(NodeProfile(nid, float(prof["ms_per_layer"]), int(prof["max_layers"])))
+    rtt = {}
+    for peer, ms in getattr(self, "_measured_rtt", {}).items():
+      rtt[(self.id, peer)] = ms / 2.0  # one-way hop
+    objective = getattr(self, "partition_objective", None) or       _os.getenv("SYNAPSE_PARTITION_OBJECTIVE", "throughput")
+    placement = plan(profiles, total, rtt, objective)
+    if placement is None:
+      return None
+    prev = getattr(self, "_last_placement", None)
+    if prev is not None and prev.get("model_id") == model_id and prev.get("total") == total \
+        and all(nid in self.topology.nodes for nid, _, _ in prev["stages"]):
+      by_id = {p.node_id: p for p in profiles}
+      order = [by_id[nid] for nid, _, _ in prev["stages"]]
+      stages = prev["stages"]
+      # current cost of the previous placement
+      cost = 0.0
+      for i, (nid, a, b) in enumerate(stages):
+        stage = (b - a + 1) * by_id[nid].ms_per_layer
+        if i:
+          stage += rtt.get((stages[i - 1][0], nid), rtt.get((nid, stages[i - 1][0]), 2.0))
+        cost = cost + stage if objective == "latency" else max(cost, stage)
+      fits = all(b - a + 1 <= by_id[nid].max_layers for nid, a, b in stages)
+      if fits and placement.cost_ms >= 0.9 * cost:
+        return [Partition(node_id=nid, start=a / total, end=(b + 1) / total) for nid, a, b in stages]
+    self._last_placement = {"model_id": model_id, "total": total, "stages": placement.stages,
+                            "cost_ms": placement.cost_ms, "objective": objective,
+                            "profiles": {p.node_id: {"ms_per_layer": p.ms_per_layer,
+                                                     "max_layers": p.max_layers} for p in profiles}}
+    if DEBUG >= 1:
+      print(f"[PLACEMENT] {objective}: {placement.stages} cost={placement.cost_ms:.2f}ms")
+    return [Partition(node_id=nid, start=a / total, end=(b + 1) / total)
+            for nid, a, b in placement.stages]
+
   def _compute_lacp_partition(self, base_shard: Optional[Shard] = None) -> List[Partition]:
-    """Compute partition using TFLOPS-proportional (default) or LACP multi-resource scoring."""
+    """Measured DP placement when every node has reported its layer cost;
+    else TFLOPS-proportional (default) or LACP multi-resource scoring."""
     num_layers = base_shard.n_layers if base_shard and base_shard.n_layers > 0 else 32
     model_id = base_shard.model_id if base_shard else ""
+    try:
+      measured = self._measured_placement(base_shard)
+    except Exception as e:
+      measured = None
+      if DEBUG >= 1: print(f"[PLACEMENT] measured placement failed: {e}")
+    if measured:
+      return measured
 
     if self.tflops_proportional:
         partitioner = TFLOPSProportionalPartitioner()
@@ -2093,6 +2480,7 @@ class Node:
             # P2 (was: one peer's ping fanned out to EVERY self->other cell,
             # masking slow peers behind one fast one): record per-peer only.
             if latency_ms > 0:
+              self._measured_rtt[peer.id()] = float(latency_ms)
               try:
                 if peer.id() in self._latency_cache.get(self.id, {}):
                   self._latency_cache[self.id][peer.id()] = latency_ms
@@ -2284,6 +2672,7 @@ class Node:
     partitions = self._compute_lacp_partition(base_shard)
     self._authoritative_partitions = partitions
     self._authoritative_base_shard = base_shard
+    self._schedule_task(self._warm_replica(base_shard, partitions), "warm_replica")
 
     partition_data = [{"node_id": p.node_id, "start": p.start, "end": p.end} for p in partitions]
     await self.event_router.publish("synapse/cluster/partition", {
@@ -2303,3 +2692,6 @@ class Node:
             self._authoritative_partitions = [Partition(**p) for p in partition_data]
             if base_shard_dict:
                 self._authoritative_base_shard = Shard.from_dict(base_shard_dict)
+                self._note_profile_model(self._authoritative_base_shard.model_id)
+                self._schedule_task(self._warm_replica(
+                  self._authoritative_base_shard, self._authoritative_partitions), "warm_replica")

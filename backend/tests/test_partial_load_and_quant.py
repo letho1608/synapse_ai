@@ -1,0 +1,160 @@
+"""
+Behavioral tests: a node holds only the layers it serves, and weight-only
+quantization keeps the model's answers.
+
+Found 2026-09-30: ensure_shard() called AutoModelForCausalLM.from_pretrained
+on every node, so each node held the WHOLE model and "run models too big for
+one machine" was not true. Layer-range loading materializes only
+[start, end] (+ embedding on the first stage, norm + head on the last).
+"""
+import sys
+
+import numpy as np
+import pytest
+import torch
+
+TINY = ("peft-internal-testing/tiny-random-GPT2LMHeadModel", 5)
+SMOL = ("HuggingFaceTB/SmolLM2-135M-Instruct", 30)
+
+
+def _cached(model_id):
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        return isinstance(try_to_load_from_cache(model_id, "config.json"), str)
+    except Exception:
+        return False
+
+
+needs_smol = pytest.mark.skipif(not _cached(SMOL[0]), reason="SmolLM2 not cached")
+
+
+@pytest.fixture(autouse=True)
+def _env(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch_directml", None)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("SYNAPSE_PARTIAL_LOAD", "1")
+    monkeypatch.setenv("SYNAPSE_WEIGHT_QUANT", "none")
+
+
+def _engine():
+    from synapse.inference.pytorch_hf_engine import PyTorchHFInferenceEngine
+    return PyTorchHFInferenceEngine()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", [pytest.param(TINY, id="tiny-gpt2"),
+                                  pytest.param(SMOL, id="smollm2", marks=needs_smol)])
+async def test_middle_stage_holds_only_its_layers(spec):
+    from synapse.inference.shard import Shard
+    model_id, n = spec
+    lo, hi = 1, n - 2
+    eng = _engine()
+    await eng.ensure_shard(Shard(model_id, lo, hi, n))
+    assert eng.loaded_layers() == list(range(lo, hi + 1))
+    pm = eng._pm
+    assert pm.embed is None and pm.lm_head is None and pm.final_norm is None
+    per_layer = pm.layer_param_count() * 4  # fp32 on CPU
+    assert pm.loaded_bytes() <= per_layer * (hi - lo + 1) + 1_000_000
+    # A layer outside the range is not silently available.
+    with pytest.raises(RuntimeError, match="not loaded"):
+        eng._get_transformer_components()["layers"][0]
+
+
+@pytest.mark.asyncio
+@needs_smol
+async def test_two_half_shards_split_the_memory():
+    """Two nodes serving 0-14 and 15-29 each hold about half the layers."""
+    from synapse.inference.shard import Shard
+    model_id, n = SMOL
+    a, b = _engine(), _engine()
+    await a.ensure_shard(Shard(model_id, 0, 14, n))
+    await b.ensure_shard(Shard(model_id, 15, 29, n))
+    full = _engine()
+    await full.ensure_shard(Shard(model_id, 0, 29, n))
+    layer_bytes = full._pm.layer_param_count() * 4 * n
+    assert a.loaded_layers() == list(range(0, 15)) and b.loaded_layers() == list(range(15, 30))
+    assert a._pm.embed is not None and a._pm.lm_head is None
+    assert b._pm.embed is None and b._pm.lm_head is not None
+    # Each half carries ~half the decoder weights (+ its end: embed or head).
+    for eng in (a, b):
+        assert eng._pm.loaded_bytes() < 0.5 * layer_bytes + 120_000_000
+    assert a._pm.loaded_bytes() + b._pm.loaded_bytes() < full._pm.loaded_bytes() + 120_000_000
+
+
+@pytest.mark.asyncio
+async def test_layers_load_on_demand_and_release():
+    from synapse.inference.shard import Shard
+    model_id, n = TINY
+    eng = _engine()
+    await eng.ensure_shard(Shard(model_id, 0, 1, n))
+    assert eng.loaded_layers() == [0, 1]
+    await eng.ensure_shard(Shard(model_id, 2, 4, n))  # new range after a re-plan
+    assert eng.loaded_layers() == [0, 1, 2, 3, 4]
+    assert eng.release_layers([2, 3, 4]) == [0, 1]
+    assert eng.loaded_layers() == [2, 3, 4]
+
+
+def test_quant_linear_round_trip_and_conv1d():
+    from synapse.inference.weight_quant import QuantLinear, quantize_module
+    torch.manual_seed(0)
+    w = torch.randn(48, 100)
+    for mode, tol in (("int8", 0.01), ("int4", 0.12)):
+        q = QuantLinear(w, torch.zeros(48), mode)
+        rel = float((q.dequantize() - w).norm() / w.norm())
+        assert rel < tol, (mode, rel)
+    from transformers.pytorch_utils import Conv1D
+    conv = Conv1D(24, 40)  # GPT-2 layout: weight [in, out]
+    x = torch.randn(3, 40)
+    ref = conv(x)
+    holder = torch.nn.Sequential(conv)
+    assert quantize_module(holder, "int8") == 1
+    assert torch.allclose(holder(x), ref, atol=0.05)
+
+
+def test_auto_mode_quantizes_only_when_needed():
+    from synapse.inference.weight_quant import choose_mode
+    gb = 1 << 30
+    assert choose_mode(2 * gb, 16 * gb, "auto") == "none"
+    assert choose_mode(10 * gb, 8 * gb, "auto") == "int8"
+    assert choose_mode(40 * gb, 8 * gb, "auto") == "int4"
+    assert choose_mode(40 * gb, 8 * gb, "none") == "none"
+
+
+@pytest.mark.asyncio
+@needs_smol
+async def test_int8_weights_keep_answers_and_shrink_memory(monkeypatch):
+    """Quality gate (teacher-forced over the prompt positions, 6 prompts):
+    int8 keeps top-1 at >= 99% with small KL and holds the decoder layers in
+    well under half the fp32 bytes. Measured 2026-09-30: top-1 100%,
+    KL 0.006, whole shard 0.41x (the fp32 embedding dominates what is left).
+    int4 (asymmetric, group 32) measured top-1 51%, KL 0.63 on this 135M
+    model, so auto mode only picks it when int8 cannot fit."""
+    from synapse.inference.shard import Shard
+    model_id, n = SMOL
+    prompts = ["The capital of France is", "def fibonacci(n):\n    ",
+               "Water boils at a temperature of", "In 1492, Christopher Columbus",
+               "The quick brown fox jumps over", "Machine learning is a field of"]
+    shard = Shard(model_id, 0, n - 1, n)
+
+    async def run(mode):
+        monkeypatch.setenv("SYNAPSE_WEIGHT_QUANT", mode)
+        eng = _engine()
+        outs = []
+        for p in prompts:
+            ids = np.asarray(await eng.encode(shard, p), dtype=np.int64)
+            x, _ = await eng.infer_tensor(None, shard, ids)
+            outs.append(np.asarray(x).reshape(-1, x.shape[-1]))
+        layers = sum(eng._pm.layers[i] is not None for i in range(n))
+        from synapse.inference.weight_quant import module_bytes
+        return outs, sum(module_bytes(eng._pm.layers[i]) for i in range(n)), layers
+
+    ref, ref_bytes, _ = await run("none")
+    got, q_bytes, _ = await run("int8")
+    agree, kls = [], []
+    for r, g in zip(ref, got):
+        agree += list(r.argmax(-1) == g.argmax(-1))
+        lr, lg = torch.log_softmax(torch.tensor(r), -1), torch.log_softmax(torch.tensor(g), -1)
+        kls.append(float((lr.exp() * (lr - lg)).sum(-1).mean()))
+    assert np.mean(agree) >= 0.99, np.mean(agree)
+    assert np.mean(kls) <= 0.02, np.mean(kls)
+    assert q_bytes < 0.3 * ref_bytes, q_bytes / ref_bytes

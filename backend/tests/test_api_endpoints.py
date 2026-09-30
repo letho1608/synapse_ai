@@ -74,11 +74,13 @@ async def test_root_route_serves_real_page():
 
 
 @pytest.mark.asyncio
-async def test_root_falls_back_to_bundled_page_when_frontend_missing():
-    """Even with no on-disk frontend, GET / returns the bundled page."""
+async def test_root_serves_builtin_page_without_frontend_dir():
+    """No web frontend exists (CLI-first); GET / is the built-in page and
+    constructing the API must not recreate a frontend/ directory."""
+    root = Path(__file__).resolve().parents[2]
     node = MockNode()
     api = ChatGPTAPI(node=node, inference_engine_classname="PyTorchEngine")
-    api.static_dir = Path(tempfile.mkdtemp())  # empty dir -> no index.html
+    assert not (root / "frontend").exists()
     req = make_mocked_request('GET', '/')
     resp = await api.handle_root(req)
     assert resp.status == 200
@@ -115,3 +117,32 @@ async def test_distributed_status_falls_back_to_peer_count_before_topology_conve
     assert resp.status == 200
     assert data["partitions_count"] == 2
     assert data["multi_node_inference"] is True
+
+
+@pytest.mark.asyncio
+async def test_models_search_route_works(monkeypatch):
+    """/v1/models/search used to 500 on every call: synapse.model_discovery
+    could not even be imported (List/Dict/Any used without typing import),
+    which also broke pulling any HF repo id outside the built-in list."""
+    import io
+    import urllib.request
+
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["timeout"] = timeout
+        return io.BytesIO(json.dumps([{"modelId": "org/tiny", "downloads": 3}]).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    api = ChatGPTAPI(node=MockNode(), inference_engine_classname="PyTorchEngine")
+    client = TestClient(TestServer(api.app))
+    await client.start_server()
+    try:
+        resp = await client.get('/v1/models/search?q=tiny llm')
+        assert resp.status == 200, await resp.text()
+        data = (await resp.json())["data"]
+        assert data and data[0]["name"] == "org/tiny"
+        assert "search=tiny%20llm" in seen["url"] and seen["timeout"]
+    finally:
+        await client.close()

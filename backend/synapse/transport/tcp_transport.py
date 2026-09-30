@@ -47,9 +47,12 @@ MAX_SINGLE_FRAME_BYTES = 100 * 1024 * 1024
 class TCPServer:
     """Per-node TCP server that receives binary tensor frames."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 0):
+    def __init__(self, host: str = "0.0.0.0", port: int = 0, ssl_ctx=None):
         self.host = host
         self.port = port
+        # TLS server context (SYNAPSE_TLS on): the tensor path must be
+        # encrypted exactly like the event bridge, never quietly plaintext.
+        self._ssl_ctx = ssl_ctx
         self._server: Optional[asyncio.AbstractServer] = None
         self._on_frame: Optional[Callable[[bytes], None]] = None
         self._reassembler = ChunkReassembler()
@@ -61,7 +64,7 @@ class TCPServer:
 
     async def start(self) -> int:
         self._server = await asyncio.start_server(
-            self._handle_connection, self.host, self.port,
+            self._handle_connection, self.host, self.port, ssl=self._ssl_ctx,
         )
         for sock in self._server.sockets:
             self.port = sock.getsockname()[1]
@@ -150,9 +153,10 @@ class TCPServer:
 class TCPClientPool:
     """Pool of outbound TCP connections per peer."""
 
-    def __init__(self, connect_timeout: float = 5.0):
+    def __init__(self, connect_timeout: float = 5.0, ssl_ctx=None):
         self._conns: Dict[str, Tuple[asyncio.StreamWriter, float]] = {}
         self._connect_timeout = connect_timeout
+        self._ssl_ctx = ssl_ctx
         self._lock = asyncio.Lock()
 
     async def send(self, peer_addr: str, data: bytes) -> bool:
@@ -189,7 +193,7 @@ class TCPClientPool:
                     return writer
             try:
                 writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
+                    asyncio.open_connection(host, port, ssl=self._ssl_ctx),
                     timeout=self._connect_timeout,
                 )
                 writer = writer[1]
@@ -233,10 +237,13 @@ class TensorTCPTransport:
         node_id: str,
         host: str = "0.0.0.0",
         port: int = 0,
+        ssl_server_ctx=None,
+        ssl_client_ctx=None,
     ):
         self.node_id = node_id
-        self.server = TCPServer(host, port)
-        self.client_pool = TCPClientPool()
+        self.server = TCPServer(host, port, ssl_ctx=ssl_server_ctx)
+        self.client_pool = TCPClientPool(ssl_ctx=ssl_client_ctx)
+        self.tls = ssl_server_ctx is not None
         self.forwarder = AsyncTensorForwarder(node_id)
         self._peer_map: Dict[str, str] = {}  # peer_addr -> peer_id
 
@@ -260,7 +267,11 @@ class TensorTCPTransport:
 
     def _on_frame(self, data: bytes):
         try:
-            msg = self.forwarder.receive("__inbound__", 0, data)
+            # Deliver immediately. Reordering all inbound frames in one
+            # "__inbound__" bucket by micro_batch_id (0, 1, 2, ... forever)
+            # parked every later decode step (which reuses micro-batch 0)
+            # indefinitely; batch identity is checked by the result collector.
+            msg = AsyncTensorForwarder.decode_message(data)
             if msg is not None and self._on_tensor:
                 self._on_tensor(msg)
         except Exception as e:

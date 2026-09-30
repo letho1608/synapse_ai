@@ -10,6 +10,11 @@ if TYPE_CHECKING:
     from synapse.loading import ShardDownloader
 
 
+# Per-shard layer-weights checkpoint (failover restore of a dead node's range).
+SHARD_WEIGHTS_FORMAT = "synapse-shard-weights/1"
+SHARD_WEIGHTS_SUFFIX = ".weights.pt"
+
+
 class InferenceEngine(ABC):
 
   @abstractmethod
@@ -35,6 +40,11 @@ class InferenceEngine(ABC):
 
   async def save_checkpoint(self, shard: Shard, path: str):
     pass
+
+  def save_shard_weights(self, shard: Shard, path: str) -> bool:
+    """Persist only this shard's layer weights to `path` (a single file) so a
+    survivor can restore the range after failover. True only when written."""
+    return False
 
   _train_warned = False
   _evaluate_warned = False

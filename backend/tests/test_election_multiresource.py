@@ -177,3 +177,43 @@ async def test_late_stronger_master_claim_converges_startup_split_brain():
         await weak.stop()
         await strong.stop()
         await router.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n_nodes", [2, 3])
+async def test_crossed_yield_deadlock_converges_to_one_master(n_nodes):
+    """Found 2026-09-30 in a live 3-process run: at startup A was master and
+    B had self-claimed; in the same tick A yielded to B and B yielded to A.
+    Each then stayed "sticky" on a live master that did not claim itself, so
+    NO node was master (measured placement never ran). A node whose master
+    does not claim itself must re-pick, and all nodes must converge."""
+    from synapse.orchestration.election import ElectionManager
+    from synapse.routing import EventRouter
+
+    router = EventRouter()
+    ids = ["node-a", "node-b", "node-c"][:n_nodes]
+    ems = [ElectionManager(nid, router, compute_weight=10.0 + i, dynamic_weight=False)
+           for i, nid in enumerate(ids)]
+    for em in ems:
+        em.TICK_INTERVAL = 0.05
+    # Crossed state: a follows b, b follows a, c (if any) follows a.
+    ems[0].current_master_id = "node-b"
+    ems[1].current_master_id = "node-a"
+    if n_nodes == 3:
+        ems[2].current_master_id = "node-a"
+    await router.start()
+    for em in ems:
+        await em.start()
+    try:
+        for _ in range(80):
+            await asyncio.sleep(0.05)
+            masters = {em.current_master_id for em in ems}
+            if len(masters) == 1 and sum(em.is_master() for em in ems) == 1:
+                break
+        masters = {em.current_master_id for em in ems}
+        assert len(masters) == 1, [em.current_master_id for em in ems]
+        assert sum(em.is_master() for em in ems) == 1
+    finally:
+        for em in ems:
+            await em.stop()
+        await router.stop()

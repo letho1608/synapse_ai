@@ -116,3 +116,25 @@ def test_unknown_command_exits_usage():
     with pytest.raises(SystemExit) as e:
         main(["frobnicate"])
     assert e.value.code == EXIT_USAGE or e.value.code == 2
+
+
+def test_console_reachable_after_global_flags(monkeypatch):
+    """`--port N --headless console ...` must reach the console entry with
+    the globals mapped onto console flags (was: argparse 'invalid choice')."""
+    import synapse.console as console_mod
+    seen = {}
+    monkeypatch.setattr(console_mod, "main", lambda a: seen.setdefault("argv", a) and 0)
+    main(["--port", "6000", "--headless", "--log-format", "json", "console", "--line"])
+    argv = seen["argv"]
+    assert argv[argv.index("--chat-port") + 1] == "6000"
+    assert "--headless" in argv and "--line" in argv
+    assert argv[argv.index("--log-format") + 1] == "json"
+    # An explicit console --chat-port wins over the global --port.
+    seen.clear()
+    main(["--port", "6000", "console", "--chat-port", "7000"])
+    assert seen["argv"].count("--chat-port") == 1
+    assert seen["argv"][seen["argv"].index("--chat-port") + 1] == "7000"
+
+
+def test_help_lists_console():
+    assert "console" in build_parser().format_help()

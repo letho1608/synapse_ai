@@ -152,9 +152,24 @@ class ElectionManager:
                     # otherwise node B would elect itself while node A (the
                     # current master) keeps itself, producing a split brain.
                     self._master_became_offline_at = None
-                    if new_master_id != self.current_master_id:
+                    claim = self.active_nodes[self.current_master_id].get("current_master_id")
+                    if claim is not None and claim != self.current_master_id:
+                        # The node we follow does not consider itself master
+                        # (e.g. two nodes yielded to each other in the same
+                        # tick and each became "sticky" on the other: nobody
+                        # was master). Follow the strongest self-claimer, or
+                        # the strongest candidate if nobody claims; every node
+                        # computes the same answer from the same heartbeats.
+                        claimers = [nid for nid, info in self.active_nodes.items()
+                                    if info.get("current_master_id") == nid]
+                        pick = min(claimers, key=lambda x: (-all_candidates[x]["weight"], x)) \
+                            if claimers else new_master_id
+                        logger.info(f"Node {self.node_id}: {self.current_master_id} does not claim "
+                                    f"master (claims {claim}); following {pick}")
+                        self.current_master_id = pick
+                    elif new_master_id != self.current_master_id:
                         logger.info(f"Node {self.node_id} recognizes {self.current_master_id} as Master (sticky)")
-                    # Keep current_master_id unchanged: no reassignment.
+                    # Otherwise keep current_master_id unchanged: no reassignment.
                 else:
                     if self._master_became_offline_at is None:
                         self._master_became_offline_at = now

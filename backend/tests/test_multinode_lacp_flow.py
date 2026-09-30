@@ -158,14 +158,21 @@ class TestSHMWiring:
             _FakePeer("node-b", "127.0.0.1:60123"),
             _FakePeer("node-remote", "10.9.9.9:60124"),
         ]
+        # Peers advertise their tensor-transport port in the bridge handshake;
+        # an old peer without it stays bridge-only.
+        node.libp2p_node._bridge.record_peer_handshake(
+            "node-b", {"node_id": "node-b", "tcp_port": 61001})
         node._register_transport_peers()
 
         # Same-machine peer is reachable via shared memory; remote peer is not.
         assert node.shm_transport.is_local_peer("127.0.0.1:60123")
         assert not node.shm_transport.is_local_peer("10.9.9.9:60124")
-        # The TCP transport still registers every peer (fallback path intact).
-        assert "127.0.0.1:60123" in node.tcp_transport._peer_map
-        assert "10.9.9.9:60124" in node.tcp_transport._peer_map
+        # TCP registers the ADVERTISED tensor port, never the bridge port
+        # (the bridge port was registered before, so chunked TCP could never
+        # connect between real processes).
+        assert "127.0.0.1:61001" in node.tcp_transport._peer_map
+        assert "127.0.0.1:60123" not in node.tcp_transport._peer_map
+        assert not any(a.startswith("10.9.9.9") for a in node.tcp_transport._peer_map)
 
         # End-to-end: send through the node's SHM transport to a registered
         # same-machine peer transport; the tensor arrives intact.

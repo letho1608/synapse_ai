@@ -8,6 +8,11 @@ import sys
 import time
 import traceback
 import uuid
+# Start the launcher watchdog before the heavy imports below (torch etc.
+# take seconds): a launcher killed in that window must not leave an orphan.
+if __name__ == "__main__":
+  from synapse.helpers import start_parent_watchdog
+  start_parent_watchdog()
 import numpy as np
 from tqdm import tqdm
 from synapse.train.dataset import load_dataset, iterate_batches
@@ -128,7 +133,7 @@ if args.headless:
 
 system_info = get_system_info()
 
-# Engine mặc định: PyTorch + Hugging Face (danh sách model trong model_list, download + web UI)
+# Engine mặc định: PyTorch + Hugging Face (danh sách model trong model_list, download qua API/CLI)
 inference_engine_name = args.inference_engine if hasattr(args, "inference_engine") and getattr(args, "inference_engine", None) else "pytorch"
 inference_engine = get_inference_engine(inference_engine_name, None)
 shard_downloader: ShardDownloader = inference_engine.shard_downloader
@@ -244,6 +249,10 @@ api = ChatGPTAPI(
   system_prompt=args.system_prompt,
   chatgpt_api_port=args.chatgpt_api_port,
 )
+if args.default_model:
+  # An explicit --default-model wins over config/settings.json (which the
+  # API loads in its constructor); settings only fill in when none is given.
+  api.default_model = args.default_model
 buffered_token_output = {}
 def update_topology_viz(req_id, tokens, is_finished):
   if not topology_viz: return

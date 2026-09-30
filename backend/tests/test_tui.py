@@ -125,7 +125,8 @@ def test_line_style_semantics():
     assert T.line_style("[ok] saved") == "ok"
     assert T.line_style("api  PASS  detail") == "ok"
     assert T.line_style("(ngắt — phiên còn)") == "warn"
-    assert T.line_style("[console] running") == ""
+    assert T.line_style("[console] running") == "muted"
+    assert T.line_style("› /status") == "echo"
     assert T.line_style("plain output") == ""
     assert T.line_style("") == ""
 
@@ -140,7 +141,7 @@ def test_highlighter_applies_class():
 
     out = T.TranscriptHighlighter().apply_transformation(_TI())
     assert isinstance(out, Transformation)
-    assert out.fragments == [("class:echo", "> /status"), ("class:echo", " end")]
+    assert out.fragments == [("class:echo", "> /status end")]
 
     class _TI2:
         def unpack(self):
@@ -238,8 +239,8 @@ def test_spawn_backend_failure_raises():
 
 
 def test_footer_and_collapse():
-    assert T._footer(0, 12.34) == "✔ exit 0 · 12.3s"
-    assert T._footer(3, 0.06) == "✘ exit 3 · 0.1s"
+    assert T._footer(0, 12.34) == "  ● done · 12.3s"
+    assert T._footer(3, 0.06) == "  × exit 3 · 0.1s"
     short = "a\nb"
     assert T._collapse(short) == short
     long_text = "\n".join("l%d" % i for i in range(40))

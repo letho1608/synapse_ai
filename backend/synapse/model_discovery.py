@@ -1,7 +1,9 @@
 import json
 import os
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List
 from pathlib import Path
 from synapse.helpers import DEBUG, QUANT_BPP
 
@@ -211,7 +213,8 @@ def search_hugging_face(query: str, limit: int = 10) -> List[Dict[str, Any]]:
     """Tìm kiếm models trên Hugging Face API."""
     try:
         url = f"{HF_API}?search={urllib.parse.quote(query)}&limit={limit}&full=true&config=true"
-        with urllib.request.urlopen(url) as response:
+        req = urllib.request.Request(url, headers=_auth_headers())
+        with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode())
             results = []
             for m in data:

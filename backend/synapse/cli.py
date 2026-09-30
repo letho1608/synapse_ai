@@ -236,6 +236,12 @@ def build_parser():
     sub = p.add_subparsers(dest="command", required=True)
     port_parent = _port_parent()
 
+    # Listed for --help only: main() routes `console` to synapse.console
+    # before argparse ever parses it.
+    sub.add_parser("console", add_help=False,
+                   help="interactive shell: boot a node + slash-command TUI "
+                        "(see `console --help`)")
+
     s = sub.add_parser("serve", help="run a node in the foreground")
     s.add_argument("--model", default=None)
     s.add_argument("--node-id", default=None)
@@ -289,6 +295,9 @@ def _backend_env(headless=False):
     env = dict(os.environ)
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = backend_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    # Backend exits if this launcher is killed (no orphan holding ports).
+    from synapse.helpers import PARENT_PID_ENV
+    env[PARENT_PID_ENV] = str(os.getpid())
     if headless:
         # T2.1: narrows GET / to a 204 stub (handle_root); API/logs/healthcheck+/v1/* unaffected.
         env["SYNAPSE_HEADLESS"] = "1"
@@ -605,7 +614,7 @@ def cmd_benchmark(args):
            "--model", args.model or "default", "--max-tokens", str(args.max_tokens),
            "--reps", str(args.reps), "--out", out, "--allow-loopback"]
     if args.prompt:
-        cmd += ["--model", args.model or "default"]
+        cmd += ["--prompt", args.prompt]
     if args.failover:
         cmd += ["--failover"]
     # Console TUI: a child inheriting the terminal would paint over the
@@ -654,12 +663,46 @@ def cmd_benchmark(args):
     return EXIT_OK if rc == 0 else EXIT_FAIL
 
 
+def _split_console(argv):
+    """Return console argv when `console` follows only global flags, else None.
+
+    Global flags map onto console's own: --headless / --log-format pass
+    through, --port N becomes --chat-port N unless the console args set it.
+    """
+    i, glob = 0, []
+    while i < len(argv):
+        a = argv[i]
+        if a == "console":
+            rest = list(argv[i + 1:])
+            out = []
+            for j, g in enumerate(glob):
+                if g == "--port":
+                    if "--chat-port" not in rest:
+                        out += ["--chat-port", glob[j + 1]]
+                elif g == "--log-format":
+                    out += [g, glob[j + 1]]
+                elif g == "--headless":
+                    out.append(g)
+            return out + rest
+        if a in ("--port", "--log-format") and i + 1 < len(argv):
+            glob += [a, argv[i + 1]]
+            i += 2
+            continue
+        if a == "--headless":
+            glob.append(a)
+            i += 1
+            continue
+        return None
+    return None
+
+
 def main(argv=None):
     # Console is a separate entry (serve flags + REPL); route before argparse
     # so `synapse console ...` never collides with subcommand parsing.
-    if argv is not None and argv[:1] == ["console"]:
+    console_argv = _split_console(list(sys.argv[1:] if argv is None else argv))
+    if console_argv is not None:
         from synapse.console import main as console_main
-        return console_main(argv[1:])
+        return console_main(console_argv)
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "port", None) is None:

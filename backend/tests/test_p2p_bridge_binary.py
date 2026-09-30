@@ -30,6 +30,22 @@ from synapse.routing.p2p_socket_bridge import P2PSocketBridge
 from synapse.transport.codec import decode_tensor, encode_tensor
 
 
+class _FreePorts(dict):
+    """Nominal port -> a port that is actually free right now. The nominal
+    numbers sit in the OS ephemeral range, where any client socket (a
+    browser, here) may already hold them."""
+
+    def __missing__(self, key):
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self[key] = sock.getsockname()[1]
+        return self[key]
+
+
+P = _FreePorts()
+
+
 class _MeshNode:
     """Minimal node: a real Libp2pNode whose P2PSocketBridge listens on port."""
 
@@ -77,8 +93,8 @@ def test_json_serialize_roundtrips_bytes():
 async def test_binary_tensor_survives_bridge_roundtrip():
     """A tensor published as {"bin": encode_tensor(...)} on node A reaches
     node B's subscriber as decodable bytes — the production inference path."""
-    a = _MeshNode("br-a", 59111)
-    b = _MeshNode("br-b", 59112)
+    a = _MeshNode("br-a", P[59111])
+    b = _MeshNode("br-b", P[59112])
     await a.start()
     await b.start()
 
@@ -95,7 +111,7 @@ async def test_binary_tensor_survives_bridge_roundtrip():
 
     b.er.subscribe("synapse/inference/tensor/br-b", on_tensor)
 
-    await a.connect_to(b, "127.0.0.1:59112")
+    await a.connect_to(b, f"127.0.0.1:{P[59112]}")
     await asyncio.sleep(0.5)
 
     expected = np.arange(12, dtype=np.int32).reshape(3, 4)
@@ -131,7 +147,7 @@ async def test_bridge_echoes_raw_latency_probe():
     production listener so RTT/bandwidth can be measured."""
     from synapse.topology.latency_matrix import LatencyProber
 
-    a = _MeshNode("br-probe-a", 59121)
+    a = _MeshNode("br-probe-a", P[59121])
     await a.start()
 
     reader, writer = await asyncio.open_connection("127.0.0.1", a.port)
@@ -154,7 +170,7 @@ async def test_latency_prober_measures_bandwidth_against_bridge():
     (probe echo) and returns a positive bandwidth estimate."""
     from synapse.topology.latency_matrix import LatencyProber
 
-    a = _MeshNode("br-bw-a", 59131)
+    a = _MeshNode("br-bw-a", P[59131])
     await a.start()
 
     prober = LatencyProber()
@@ -171,8 +187,8 @@ async def test_large_frame_over_old_10mib_cap_is_delivered():
     """A frame larger than the old hardcoded 10 MiB limit (a 12 MB float32
     tensor expands to ~24 MB of JSON hex) is now delivered intact end-to-end
     with the default 256 MiB cap — the silent-drop regression is gone."""
-    a = _MeshNode("br-lg-a", 59141)
-    b = _MeshNode("br-lg-b", 59142)
+    a = _MeshNode("br-lg-a", P[59141])
+    b = _MeshNode("br-lg-b", P[59142])
     await a.start()
     await b.start()
 
@@ -185,7 +201,7 @@ async def test_large_frame_over_old_10mib_cap_is_delivered():
 
     b.er.subscribe("synapse/inference/tensor/br-lg-b", on_tensor)
 
-    await a.connect_to(b, "127.0.0.1:59142")
+    await a.connect_to(b, f"127.0.0.1:{P[59142]}")
     await asyncio.sleep(0.5)
 
     # 3M float32 = 12 MB raw; JSON hex encoding doubles the frame to ~24 MB,
@@ -219,8 +235,8 @@ async def test_oversized_frame_gets_explicit_error_back_to_sender():
     dropped: the receiver answers with an explicit error packet and the
     sender records it (subscriber never sees the payload)."""
     small_cap = 4096
-    a = _MeshNode("br-err-a", 59151, max_frame_size=small_cap)
-    b = _MeshNode("br-err-b", 59152, max_frame_size=small_cap)
+    a = _MeshNode("br-err-a", P[59151], max_frame_size=small_cap)
+    b = _MeshNode("br-err-b", P[59152], max_frame_size=small_cap)
     await a.start()
     await b.start()
 
@@ -231,7 +247,7 @@ async def test_oversized_frame_gets_explicit_error_back_to_sender():
 
     b.er.subscribe("synapse/inference/tensor/br-err-b", on_tensor)
 
-    await a.connect_to(b, "127.0.0.1:59152")
+    await a.connect_to(b, f"127.0.0.1:{P[59152]}")
     await asyncio.sleep(0.5)
 
     # 2K float32 = 8 KB raw -> ~16 KB hex frame, far beyond the 4096 cap.

@@ -43,6 +43,12 @@ class ShardCheckpoint:
     # None for in-memory-only checkpoints. Lets the recovery path hand the
     # exact file to the engine's checkpoint-load path.
     checkpoint_path: Optional[str] = None
+    # Shard layer-weights file (engine.save_shard_weights) holding this
+    # node's range as of `weights_step`; None = metadata-only checkpoint.
+    # Recovery hands this to engine.load_checkpoint() so the survivor
+    # restores real weights instead of resuming degraded.
+    weights_path: Optional[str] = None
+    weights_step: Optional[int] = None
 
 
 @dataclass
@@ -106,8 +112,10 @@ class FaultToleranceManager:
 
     def __init__(self, node_id: str, checkpoint_dir: str = None):
         if checkpoint_dir is None:
-            from synapse.loading import get_checkpoints_dir
-            checkpoint_dir = get_checkpoints_dir()
+            # Was the HF hub cache root: shard checkpoints landed next to the
+            # user's model downloads. Own directory, overridable.
+            checkpoint_dir = os.getenv("SYNAPSE_CHECKPOINT_DIR") or os.path.join(
+                os.path.expanduser("~"), ".synapse", "checkpoints")
         self.node_id = node_id
         self.checkpoint_dir = checkpoint_dir
         self._health: Dict[str, NodeHealth] = {}
@@ -146,7 +154,8 @@ class FaultToleranceManager:
         return [nid for nid, h in self._health.items() if h.is_alive]
 
     def get_dead_nodes(self) -> List[str]:
-        return [nid for nid, h in self._health.items() if not h.is_alive]
+        return [nid for nid, h in self._health.items()
+                if not h.is_alive and nid != self.node_id]
 
     def is_node_alive(self, node_id: str) -> bool:
         h = self._health.get(node_id)
@@ -162,6 +171,8 @@ class FaultToleranceManager:
         step: int,
         kv_cache: Optional[Dict] = None,
         optimizer_state: Optional[Dict] = None,
+        weights_path: Optional[str] = None,
+        weights_step: Optional[int] = None,
     ) -> str:
         """Save a shard state checkpoint to JSON. Returns checkpoint path."""
         ckpt = ShardCheckpoint(
@@ -172,13 +183,16 @@ class FaultToleranceManager:
             step=step,
             kv_cache=kv_cache,
             optimizer_state=optimizer_state,
+            weights_path=weights_path,
+            weights_step=weights_step,
         )
 
         # Prefix the filename with the node id so checkpoints written by
         # different nodes never collide for identical shard ranges, and so a
         # cross-node recovery (a *different* FaultToleranceManager looking for
         # this node's state) can find the file on the shared checkpoint dir.
-        filename = f"{self.node_id}_{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
+        filename = (f"{self._safe_name(self.node_id)}_{self._safe_name(model_id)}"
+                    f"_L{start_layer}-{end_layer}_step{step}.ckpt")
         filepath = os.path.join(self.checkpoint_dir, filename)
         ckpt.checkpoint_path = filepath
 
@@ -243,7 +257,7 @@ class FaultToleranceManager:
             return max(ckpts, key=lambda c: c.timestamp)
 
         # Cross-node fallback: scan disk for files saved by this node.
-        prefix = f"{node_id}_"
+        prefix = f"{self._safe_name(node_id)}_"
         newest: Optional[ShardCheckpoint] = None
         try:
             entries = os.listdir(self.checkpoint_dir)
@@ -253,7 +267,8 @@ class FaultToleranceManager:
             if not fname.startswith(prefix) or not fname.endswith(".ckpt"):
                 continue
             data = self._json_deserialize(os.path.join(self.checkpoint_dir, fname))
-            if data is None:
+            # The prefix alone also matches node "a_b" when asked for "a".
+            if data is None or data.get("node_id", node_id) != node_id:
                 continue
             ckpt = ShardCheckpoint(**{k: v for k, v in data.items() if k in ShardCheckpoint.__dataclass_fields__})
             ckpt.checkpoint_path = os.path.join(self.checkpoint_dir, fname)
@@ -270,9 +285,10 @@ class FaultToleranceManager:
         node-prefixed format. If several nodes saved the same shard range, the
         most recently modified file wins.
         """
-        legacy = f"{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt"
+        safe_model = self._safe_name(model_id)
+        legacy = f"{safe_model}_L{start_layer}-{end_layer}_step{step}.ckpt"
         patterns = (
-            f"*_{model_id}_L{start_layer}-{end_layer}_step{step}.ckpt",
+            f"*_{safe_model}_L{start_layer}-{end_layer}_step{step}.ckpt",
             legacy,
         )
         candidates = []
@@ -365,10 +381,15 @@ class FaultToleranceManager:
 
     @staticmethod
     def _safe_name(name: str) -> str:
-        """Confine a node/model id to a flat filename segment (H5 traversal)."""
-        base = os.path.basename(str(name or ""))
-        base = "".join(c if (c.isalnum() or c in ("-", "_", ".", ":")) else "_" for c in base)
-        return base or "unknown"
+        """Confine a node/model id to a flat filename segment (H5 traversal).
+
+        Separators become "_" rather than being cut off, so HF repo ids
+        ("org/name") stay distinct per org and never create subdirectories;
+        ":" is also replaced (it opens an NTFS alternate data stream).
+        """
+        base = "".join(c if (c.isalnum() or c in ("-", "_", ".")) else "_"
+                       for c in str(name or ""))
+        return base.strip(".") or "unknown"
 
     def _confine(self, filename: str) -> str:
         """Resolve filename inside checkpoint_dir or raise (H5 traversal)."""
@@ -536,9 +557,15 @@ class FaultToleranceManager:
         while self._running:
             await asyncio.sleep(self.HEARTBEAT_INTERVAL)
 
-            # Check every registered node for timeout
+            # Check every registered node for timeout. We are alive by
+            # definition: nobody delivers our own heartbeat back to us, so
+            # timing ourselves out made every node declare ITSELF dead every
+            # few seconds and rebalance itself out of the pipeline.
             for nid in list(self._health.keys()):
                 h = self._health[nid]
+                if nid == self.node_id:
+                    h.record_heartbeat()
+                    continue
                 h.check_timeout(self.HEARTBEAT_TIMEOUT)
 
             dead = self.get_dead_nodes()

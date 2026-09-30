@@ -173,3 +173,19 @@ Danh sách lệnh (giữ nguyên ý nghĩa cũ, chỉ thêm 3 lệnh mục 5):
 * Builtin: `synapse` (mặc định, dark kiểu Tokyonight), `ember-dark` (accent cam `#d77757`, success `#4eba65`, error `#ff6b80` — tông Claude), `ember-light` (success `#2c7a39`, error `#ab2b3f`).
 * Custom: file `~/.synapse/themes/<ten>.json` dạng `{name, base, overrides}` (schema Claude) + `defs`/tham chiếu/`{"dark","light"}`/`none`/ANSI (schema OpenCode); token lạ hoặc JSON hỏng bị bỏ qua, không bao giờ crash UI.
 * Chọn: `/theme` (liệt kê) hoặc `/theme <ten>` hoặc overlay `C-x t`. Lưu ở `~/.synapse/theme.json`; TUI đổi màu ngay, line-mode boot sau.
+
+## 11. Giao diện v2 (2026-09-30) — quy ước nhìn
+
+Kiểm chứng bằng ảnh chụp headless (render buffer màn hình prompt_toolkit → PNG) ở 3 theme và 2 cỡ terminal; khóa bằng `backend/tests/test_tui_look.py`.
+
+* **Glyph chỉ dùng bộ có trong CẢ Cascadia Mono (Windows Terminal) lẫn Consolas (console cũ):** `› ▸ ● ○ × │ ╭╮╰╯ ─ · • …`. `✔ ✘ ❯ ◆ ⏳` bị bỏ vì Consolas vẽ thành ô vuông. Test quét mọi chuỗi UI sinh ra.
+* **Transcript có cấu trúc** (chữ gốc không đổi, chỉ tô màu từng đoạn):
+  * `› câu hỏi` (accent) — lượt người dùng; `● trả lời` + thụt 2 dòng sau — model.
+  * Thẻ lệnh: `▸ /lệnh  · HH:MM:SS` → thân dưới gờ mờ `  │ ` → `  ● done · 0.4s` (xanh) / `  × exit 1 · 30.2s` (đỏ). Dòng trống trước mỗi lượt/thẻ.
+  * Banner chào = hộp bo góc (`╭─ synapse ─╮`): phiên bản, model, API, theme, lệnh gợi ý, phím chính.
+* **Panel phải** (≥100 cột, bo góc, tiêu đề `ops`): `CLUSTER` (chấm ●/○ online, peers, model, modes) · `JOBS` (spinner `·•●•` + giây) · `LOGS` (10 dòng cuối, bỏ tiền tố `[node]`).
+* **Ô nhập** bo góc, viền accent khi focus, cao đúng số dòng (1–8), placeholder mờ “Ask the model, or type / for commands” (“running… ctrl+c to stop” khi bận).
+* **Thanh trạng thái 1 dòng:** pill `synapse` · `● online` / `• running 12s` / `○ api down` · node · peers · model · mode; phải: `ctrl+p commands  ctrl+x ? keys  ctrl+c quit` (tự bỏ khi hẹp).
+* **Menu `/`, palette, picker, theme:** hộp bo góc giữa màn hình, dòng chọn tô nền `selection` + `▸`, tên lệnh accent, mô tả mờ. Bảng phím (`ctrl+x ?`) chia nhóm INPUT / OVERLAYS / SESSION. Confirm: `y` / `n`, mặc định no.
+* Lớp style riêng `mrow.*` (không dùng `menu` — trùng lớp mặc định nền xám của prompt_toolkit).
+* Line-mode cùng ngôn ngữ nhìn: banner hộp bo góc, `▸` header, `● done` / `× exit N`.

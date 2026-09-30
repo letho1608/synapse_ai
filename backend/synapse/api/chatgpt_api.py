@@ -37,8 +37,8 @@ from synapse.api.tools.intent_trigger import detect_tool_intent
 from synapse.api.tools.format_vi import format_tool_result_vi
 
 
-# Bundled fallback page served at GET / when no on-disk frontend exists, so the
-# root route always returns a real page (backend-served, no npm dependency).
+# Built-in liveness page served at GET / (the project is CLI-first; there is
+# no separate web frontend).
 _DEFAULT_DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -132,6 +132,56 @@ def _clean_completion_content(text: str) -> str:
   return out
 
 
+class StreamDetokenizer:
+  """Incremental detokenization for SSE streaming.
+
+  Decoding each token on its own and cleaning (strip) every piece dropped
+  all spaces and newlines from streamed answers ("Herearefivefruits:1.Banana"
+  instead of "Here are five fruits:\n\n1. Banana"). Instead: decode the whole
+  answer so far and emit only the new suffix; hold back while the text ends
+  in an incomplete UTF-8 sequence (U+FFFD); never strip trailing whitespace
+  mid-stream."""
+
+  def __init__(self, tokenizer):
+    self.tokenizer = tokenizer
+    self.ids: List[int] = []
+    self.sent = ""
+
+  def _decode(self) -> str:
+    try:
+      return self.tokenizer.decode(self.ids, skip_special_tokens=True)
+    except TypeError:
+      return self.tokenizer.decode(self.ids)
+
+  def push(self, ids) -> str:
+    self.ids.extend(int(t) for t in ids)
+    full = self._decode()
+    if full.endswith("\ufffd"):
+      return ""
+    text = full.lstrip()
+    cleaned = _clean_completion_content(text)
+    if cleaned != text.strip():  # a garbage pattern cut the answer here
+      text = cleaned
+    if not text.startswith(self.sent):
+      return ""  # normalization rewrote earlier text; never resend it
+    delta = text[len(self.sent):]
+    self.sent = text
+    return delta
+
+
+def stream_chunk(chat_request, request_id: str, content: str) -> dict:
+  """One chat.completion.chunk carrying `content` verbatim."""
+  return {
+    "id": f"chatcmpl-{request_id}",
+    "object": "chat.completion",
+    "created": int(time.time()),
+    "model": chat_request.model,
+    "system_fingerprint": f"synapse_{VERSION}",
+    "choices": [{"index": 0, "delta": {"role": "assistant", "content": content},
+                 "logprobs": None, "finish_reason": None}],
+  }
+
+
 def generate_completion(
   chat_request: ChatCompletionRequest,
   tokenizer,
@@ -178,6 +228,16 @@ def generate_completion(
     ValueError(f"Unsupported response type: {object_type}")
 
   return completion
+
+
+def _sampling_state(data) -> Optional[dict]:
+  """Per-request sampling knobs carried in inference_state (the node samples
+  with them; before this the request's temperature was ignored)."""
+  t = data.get("temperature") if isinstance(data, dict) else None
+  try:
+    return {"temperature": max(0.0, float(t))} if t is not None else None
+  except (TypeError, ValueError):
+    return None
 
 
 def build_prompt(tokenizer, messages: List[Message], tools: Optional[List[Dict]] = None):
@@ -387,16 +447,51 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/settings/save", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/cluster/resources", self.handle_get_cluster_resources), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/download/progress", self.handle_get_download_progress), {"*": cors_options})
-    # Static: PHẢI dùng prefix /_static/ (không dùng "/") vì add_static("/") match mọi path và chỉ cho GET/HEAD -> POST sẽ 405
-    # Root route + static assets are registered unconditionally so GET / always
-    # serves a real page even when the frontend dev server is not running.
-    self.static_dir = Path(__file__).parent.parent.parent.parent/"frontend"
-    self.static_dir.mkdir(parents=True, exist_ok=True)
+    # CLI-first (PLAN Part E): no web frontend. GET / is a built-in liveness
+    # page (status + topology), registered unconditionally.
     self.app.router.add_get("/", self.handle_root)
-    self.app.router.add_static("/_static/", self.static_dir, name="static")
       
     self.app.middlewares.append(self.timeout_middleware)
     self.app.middlewares.append(self.log_request)
+
+  def _apply_optimization_settings(self, opts: Dict[str, Any]) -> Optional[str]:
+    """Validate and apply optimization knobs; returns an error or None.
+
+    - lookahead_window (0..16): n-gram draft length, node-wide, immediate.
+    - load_quantization (auto|none|int8|int4): weight quant for layers the
+      engine loads from now on (already-loaded layers keep their format).
+    - transport_quantization (int8|none): hidden states on the wire, immediate.
+    - lacp_priority (throughput|latency): measured-placement objective,
+      used at the next placement."""
+    q_alias = {"8bit": "int8", "4bit": "int4", "off": "none"}
+    if "lookahead_window" in opts:
+      try:
+        lw = int(opts["lookahead_window"])
+      except (TypeError, ValueError):
+        return "lookahead_window must be an integer"
+      if not 0 <= lw <= 16:
+        return "lookahead_window must be 0..16"
+    if "load_quantization" in opts:
+      lq = q_alias.get(str(opts["load_quantization"]).lower(), str(opts["load_quantization"]).lower())
+      if lq not in ("auto", "none", "int8", "int4"):
+        return "load_quantization must be auto|none|int8|int4"
+    if "transport_quantization" in opts:
+      tq = str(opts["transport_quantization"]).lower()
+      if tq not in ("int8", "none", "fp32", "off"):
+        return "transport_quantization must be int8|none"
+    if "lacp_priority" in opts:
+      lp = str(opts["lacp_priority"]).lower()
+      if lp not in ("throughput", "latency"):
+        return "lacp_priority must be throughput|latency"
+    if "lookahead_window" in opts:
+      self.node.lookahead_window = lw
+    if "load_quantization" in opts:
+      os.environ["SYNAPSE_WEIGHT_QUANT"] = lq
+    if "transport_quantization" in opts:
+      os.environ["SYNAPSE_TRANSPORT_INT8"] = "1" if tq == "int8" else "0"
+    if "lacp_priority" in opts:
+      self.node.partition_objective = lp
+    return None
 
   def _load_settings(self) -> None:
     try:
@@ -411,6 +506,12 @@ class ChatGPTAPI:
           # belong to the launcher argv, not this file — documented).
           if "system_prompt" in data and isinstance(data["system_prompt"], str):
             self.system_prompt = data["system_prompt"]
+          opts = {k: data[k] for k in ("load_quantization", "lookahead_window",
+                                       "transport_quantization", "lacp_priority") if k in data}
+          if opts and getattr(self, "node", None) is not None:
+            err = self._apply_optimization_settings(opts)
+            if err and DEBUG >= 1:
+              print(f"settings.json: {err} (ignored)")
     except Exception:
       pass
 
@@ -438,6 +539,11 @@ class ChatGPTAPI:
         "default_model": self.default_model,
         "discovery_module": getattr(self, "discovery_module", "tailscale"),
         "system_prompt": getattr(self, "system_prompt", ""),
+        "load_quantization": os.getenv("SYNAPSE_WEIGHT_QUANT", "auto"),
+        "lookahead_window": getattr(getattr(self, "node", None), "lookahead_window", 3),
+        "transport_quantization": "int8" if os.getenv("SYNAPSE_TRANSPORT_INT8", "1") == "1" else "none",
+        "lacp_priority": getattr(getattr(self, "node", None), "partition_objective", None) or
+          os.getenv("SYNAPSE_PARTITION_OBJECTIVE", "throughput"),
       }
       with open(self._settings_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -546,23 +652,6 @@ class ChatGPTAPI:
     import os as _os
     if _os.getenv("SYNAPSE_HEADLESS", "0") == "1":
       return web.Response(status=204)
-    # Serve modular production dashboard (no-cache)
-    index_path = self.static_dir / "index.html"
-    dashboard_path = self.static_dir / "dashboard.html"
-    if index_path.exists():
-      resp = web.FileResponse(index_path)
-      resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-      resp.headers["Pragma"] = "no-cache"
-      resp.headers["Expires"] = "0"
-      return resp
-    if dashboard_path.exists():
-      resp = web.FileResponse(dashboard_path)
-      resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-      resp.headers["Pragma"] = "no-cache"
-      resp.headers["Expires"] = "0"
-      return resp
-    # No on-disk frontend (e.g. frontend dir was removed): serve the bundled
-    # fallback page so GET / still returns a real page.
     return web.Response(text=_DEFAULT_DASHBOARD_HTML, content_type="text/html")
 
   def _get_gpu_info(self) -> str:
@@ -714,7 +803,22 @@ class ChatGPTAPI:
         if entry.get("name"):
             all_names.add(entry["name"])
             
-    models_list = [{"id": name, "object": "model", "owned_by": "pytorch", "ready": True} for name in sorted(all_names)]
+    # "ready" = weights config present in the local HF cache (it used to be
+    # True for every listed model, including 34B ones never downloaded).
+    try:
+      from huggingface_hub import try_to_load_from_cache
+    except Exception:
+      try_to_load_from_cache = None
+
+    def _cached(name):
+      if try_to_load_from_cache is None:
+        return False
+      try:
+        return isinstance(try_to_load_from_cache(resolve_hf_id(name), "config.json"), str)
+      except Exception:
+        return False
+    models_list = [{"id": name, "object": "model", "owned_by": "pytorch", "ready": _cached(name)}
+                   for name in sorted(all_names)]
     return web.json_response({"object": "list", "data": models_list})
 
   async def handle_get_models_status(self, request):
@@ -1029,16 +1133,6 @@ class ChatGPTAPI:
       status=400,
     )
 
-  async def handle_get_download_progress(self, request):
-    progress_data = {}
-    for node_id, progress_event in self.node.node_download_progress.items():
-      if isinstance(progress_event, RepoProgressEvent):
-        if progress_event.status != "in_progress": continue
-        progress_data[node_id] = progress_event.to_dict()
-      else:
-        print(f"Unknown progress event type: {type(progress_event)}. {progress_event}")
-    return web.json_response(progress_data)
-
   async def handle_post_chat_completions(self, request):
     request_id = None
     print(f"[INFO] handle_post_chat_completions called: path={request.path}, remote={request.remote}")
@@ -1051,6 +1145,9 @@ class ChatGPTAPI:
       if not isinstance(max_tokens, int) or max_tokens <= 0:
         max_tokens = None
       model_from_request = data.get("model") or self.default_model
+      if str(model_from_request).strip().lower() == "default":
+        # `synapse benchmark` without --model sends "default": the server's model.
+        model_from_request = self.default_model
       if model_from_request and model_from_request.startswith("gpt-"):
         model_from_request = self.default_model
       # Tương thích client cũ: bỏ prefix "ollama/" nếu có
@@ -1111,8 +1208,10 @@ class ChatGPTAPI:
         has_system_message = any(msg.role == "system" for msg in chat_request.messages)
         
         if not has_system_message and self.system_prompt:
-          # TỐI GIẢN: Giảm tải context để tránh sập gRPC trên CPU yếu
-          system_content = "Bạn là trợ lý AI. Trả lời bằng tiếng Việt."
+          # The configured system prompt (settings / --system-prompt). It used
+          # to be replaced by a hardcoded "answer in Vietnamese" line, which
+          # derailed small English models into garbage.
+          system_content = self.system_prompt
           if tool_instructions:
             system_content += "\n\n" + tool_instructions
           chat_request.messages.insert(0, Message(role="system", content=system_content))
@@ -1130,7 +1229,7 @@ class ChatGPTAPI:
         if self.on_chat_completion_request:
           self.on_chat_completion_request(request_id, chat_request, prompt)
         process_task = asyncio.create_task(
-          self.node.process_prompt(base_shard, prompt, request_id=request_id, max_generate_tokens=max_tokens)
+          self.node.process_prompt(base_shard, prompt, request_id=request_id, max_generate_tokens=max_tokens, inference_state=_sampling_state(data))
         )
         try:
           if stream:
@@ -1142,6 +1241,7 @@ class ChatGPTAPI:
             await response.prepare(request)
             
             all_tokens_stream: List[int] = []
+            detok = StreamDetokenizer(tokenizer)
             is_real_streaming = False
             tool_call_detected = False
             process_done_at: Optional[float] = None
@@ -1176,7 +1276,14 @@ class ChatGPTAPI:
               all_tokens_stream.extend(tokens)
               
               # Decide whether to start streaming or buffer for tool detection
-              if not is_real_streaming and not tool_call_detected:
+              if not is_real_streaming and not tool_call_detected and not tool_instructions:
+                # No tools offered: nothing to detect, stream from the first
+                # token (holding 20 tokens back inflated TTFT for every chat).
+                is_real_streaming = True
+                delta = detok.push(all_tokens_stream)
+                if delta:
+                  await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
+              elif not is_real_streaming and not tool_call_detected:
                 decoded_so_far = tokenizer.decode(all_tokens_stream)
                 if "TOOL_CALL" in decoded_so_far:
                   tool_call_detected = True
@@ -1185,18 +1292,14 @@ class ChatGPTAPI:
                   # No tool call detected yet or response is short/finished, start real-time streaming
                   is_real_streaming = True
                   if DEBUG >= 2: print(f"[DEBUG] Starting real-time stream for {request_id}")
-                  for i in range(len(all_tokens_stream)):
-                    chunk = generate_completion(
-                      chat_request, tokenizer, prompt, request_id, all_tokens_stream[i : i + 1], True, None, "chat.completion"
-                    )
-                    await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                  delta = detok.push(all_tokens_stream)
+                  if delta:
+                    await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
               elif is_real_streaming:
-                # Already in real-time streaming mode, push new tokens immediately
-                for t in tokens:
-                  chunk = generate_completion(
-                    chat_request, tokenizer, prompt, request_id, [t], True, None, "chat.completion"
-                  )
-                  await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                # Already in real-time streaming mode, push new text immediately
+                delta = detok.push(tokens)
+                if delta:
+                  await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
               
               if is_finished:
                 break
@@ -1225,17 +1328,18 @@ class ChatGPTAPI:
                   new_prompt_s = build_prompt(tokenizer, new_messages_s, None)
                   request_id_s = str(uuid.uuid4())
                   self.token_queues[request_id_s] = asyncio.Queue()
-                  asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s, max_generate_tokens=max_tokens))
+                  asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s, max_generate_tokens=max_tokens, inference_state=_sampling_state(data)))
                   
                   # Stream the follow-up response in real-time
+                  detok_s = StreamDetokenizer(tokenizer)
                   while True:
                     try:
                       tk, fin = await asyncio.wait_for(self.token_queues[request_id_s].get(), timeout=float(self.response_timeout))
                     except asyncio.TimeoutError:
                       break
-                    for t in tk:
-                      chunk = generate_completion(chat_request, tokenizer, new_prompt_s, request_id, [t], True, None, "chat.completion")
-                      await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    delta = detok_s.push(tk)
+                    if delta:
+                      await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
                     if fin:
                       break
                   if request_id_s in self.token_queues:
@@ -1244,12 +1348,20 @@ class ChatGPTAPI:
                   if DEBUG >= 1: print(f"[ERROR] Tool execution failed in stream: {e}")
               else:
                 # False positive "TOOL_CALL" text or parsing failed, stream the buffered content
-                for i in range(len(all_tokens_stream)):
-                  chunk = generate_completion(chat_request, tokenizer, prompt, request_id, all_tokens_stream[i : i + 1], True, None, "chat.completion")
-                  await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                delta = StreamDetokenizer(tokenizer).push(all_tokens_stream)
+                if delta:
+                  await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
             
-            # Finalize the stream
-            await response.write(f"data: {json.dumps(generate_completion(chat_request, tokenizer, prompt, request_id, [], True, 'stop', 'chat.completion'))}\n\n".encode())
+            # Finalize the stream (with exact usage, OpenAI-style, so clients
+            # never have to estimate the token count from words)
+            final = generate_completion(chat_request, tokenizer, prompt, request_id, [], True, 'stop', 'chat.completion')
+            try:
+              n_prompt = len(tokenizer.encode(prompt))
+            except Exception:
+              n_prompt = 0
+            final["usage"] = {"prompt_tokens": n_prompt, "completion_tokens": len(all_tokens_stream),
+                              "total_tokens": n_prompt + len(all_tokens_stream)}
+            await response.write(f"data: {json.dumps(final)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
             return response
           else:
@@ -1304,7 +1416,7 @@ class ChatGPTAPI:
                 request_id_2 = str(uuid.uuid4())
                 self.token_queues[request_id_2] = asyncio.Queue()
                 process_task_2 = asyncio.create_task(
-                  self.node.process_prompt(base_shard, new_prompt, request_id=request_id_2, max_generate_tokens=max_tokens)
+                  self.node.process_prompt(base_shard, new_prompt, request_id=request_id_2, max_generate_tokens=max_tokens, inference_state=_sampling_state(data))
                 )
                 all_tokens_2 = []
                 while True:
@@ -1966,11 +2078,11 @@ class ChatGPTAPI:
     return web.json_response({
       "default_model": getattr(self, "default_model", ""),
       "discovery_module": getattr(self, "discovery_module", "tailscale"),
-      "lacp_priority": getattr(self.node, "_lacp_priority", "latency"),
-      "lacp_max_ping": getattr(self.node, "_lacp_max_ping", 100),
-      "load_quantization": getattr(self, "load_quantization", "auto"),
-      "lookahead_window": getattr(self, "lookahead_window", 3),
-      "transport_quantization": getattr(self, "transport_quantization", "int8")
+      "lacp_priority": getattr(self.node, "partition_objective", None) or
+        os.getenv("SYNAPSE_PARTITION_OBJECTIVE", "throughput"),
+      "load_quantization": os.getenv("SYNAPSE_WEIGHT_QUANT", "auto"),
+      "lookahead_window": getattr(self.node, "lookahead_window", 3),
+      "transport_quantization": "int8" if os.getenv("SYNAPSE_TRANSPORT_INT8", "1") == "1" else "none"
     })
 
   async def handle_post_settings(self, request):
@@ -1989,17 +2101,13 @@ class ChatGPTAPI:
         if old_module != discovery_module:
             requires_restart = True
             
-      # Optimization settings
-      self.load_quantization = body.get("load_quantization", "auto")
-      self.lookahead_window = int(body.get("lookahead_window", 3))
-      self.transport_quantization = body.get("transport_quantization", "int8")
-      
-      # Apply to node
-      if hasattr(self.node, "_lacp_priority"):
-        self.node._lacp_priority = body.get("lacp_priority", "latency")
-      if hasattr(self.node, "_lacp_max_ping"):
-        self.node._lacp_max_ping = int(body.get("lacp_max_ping", 100))
-        
+      # Optimization settings: validated, applied now, persisted. (They were
+      # stored but never reached the node / engine / router before.)
+      err = self._apply_optimization_settings({
+        k: body[k] for k in ("load_quantization", "lookahead_window",
+                             "transport_quantization", "lacp_priority") if k in body})
+      if err:
+        return web.json_response({"error": err}, status=400)
       self._save_settings()
       self.log_activity("Cài đặt đã lưu", "-", "success")
       
@@ -3126,7 +3234,7 @@ class ChatGPTAPI:
       print(f"[INFO] Available endpoints:")
       print(f"[INFO]   - POST http://{display_host}:{port}/v1/chat/completions")
       print(f"[INFO]   - GET  http://{display_host}:{port}/v1/models")
-      print(f"[INFO]   - GET  http://{display_host}:{port}/ (web UI)")
+      print(f"[INFO]   - GET  http://{display_host}:{port}/ (status page)")
       try:
         _, tailscale_ips = await get_self_tailscale_info()
         if tailscale_ips:
@@ -3134,19 +3242,19 @@ class ChatGPTAPI:
           for ip in tailscale_ips:
             print(f"[INFO]   - POST http://{ip}:{port}/v1/chat/completions")
             print(f"[INFO]   - GET  http://{ip}:{port}/v1/models")
-            print(f"[INFO]   - GET  http://{ip}:{port}/ (web UI)")
+            print(f"[INFO]   - GET  http://{ip}:{port}/ (status page)")
         else:
           lan_ips = [ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip and ip not in ("127.0.0.1", "::1", "localhost")]
           if lan_ips:
             print(f"[INFO]   (Tailscale chưa bật — máy khác truy cập qua LAN):")
             for ip in lan_ips:
-              print(f"[INFO]   - GET  http://{ip}:{port}/ (web UI)")
+              print(f"[INFO]   - GET  http://{ip}:{port}/ (status page)")
           else:
             print(f"[INFO]   (Tailscale): chưa bật — máy khác dùng IP LAN của máy này, port {port}")
       except Exception:
         lan_ips = [ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip and ip not in ("127.0.0.1", "::1", "localhost")]
         if lan_ips:
-          print(f"[INFO]   (Máy khác truy cập qua LAN): GET http://{lan_ips[0]}:{port}/ (web UI)")
+          print(f"[INFO]   (Máy khác truy cập qua LAN): GET http://{lan_ips[0]}:{port}/ (status page)")
         else:
           print(f"[INFO]   (Máy khác truy cập): dùng IP LAN máy này, port {port}")
       

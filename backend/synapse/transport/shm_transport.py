@@ -158,6 +158,16 @@ class SharedMemoryTransport:
         if pid:
             self._local_notify.pop(pid, None)
 
+    def can_deliver(self, addr: str) -> bool:
+        """True only when send_tensor can actually deliver to this peer: it
+        is registered AND lives in this process (in-process notifier)."""
+        pid = self._peer_ids.get(addr)
+        if pid is not None and pid not in self._local_notify:
+            peer_t = SharedMemoryTransport._local_registry.get(pid)
+            if peer_t is not None:
+                self._local_notify[pid] = peer_t._deliver
+        return pid is not None and pid in self._local_notify
+
     def is_local_peer(self, addr: str) -> bool:
         return addr in self._peer_ids
 

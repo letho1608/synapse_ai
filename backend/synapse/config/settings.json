@@ -1,5 +1,9 @@
 {
   "default_model": "qwen2.5:1.5b",
   "discovery_module": "tailscale",
-  "system_prompt": "Bạn là trợ lý Synapse AI. Hãy luôn trả lời bằng tiếng Việt một cách hữu ích và chính xác."
+  "system_prompt": "Bạn là trợ lý Synapse AI. Hãy luôn trả lời bằng tiếng Việt một cách hữu ích và chính xác.",
+  "load_quantization": "auto",
+  "lookahead_window": 3,
+  "transport_quantization": "int8",
+  "lacp_priority": "throughput"
 }

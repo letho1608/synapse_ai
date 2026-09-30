@@ -73,6 +73,14 @@ def run():
                     or len(sys.argv) > 2 and sys.argv[1] in (
                         "--port", "--log-format", "--headless")
                     and any(a in _cli_cmds for a in sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        # The launcher's own parser only knows --no-frontend; show the real
+        # CLI surface plus how the bare legacy passthrough behaves.
+        from synapse.cli import build_parser
+        build_parser().print_help()
+        print("\nWith no subcommand, main.py runs the backend directly and "
+              "forwards all arguments to backend/synapse/main.py.")
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--version":
         from synapse.helpers import VERSION
         print("synapse %s" % VERSION)
@@ -84,9 +92,9 @@ def run():
         # the legacy argv[1] check above on re-entry — no-op otherwise).
         sys.exit(cli_main(sys.argv[1:]))
     parser = argparse.ArgumentParser(description="Universal Synapse Launcher")
-    # Retained for CLI compatibility: the web UI is a backend-served static
-    # dashboard (no Node.js dev server), so this flag is a no-op.
-    parser.add_argument("--no-frontend", action="store_true", help="No-op: the web UI is served by the backend (no Node.js dependency)")
+    # Retained for CLI compatibility only (there is no web frontend any more);
+    # handled above as a deprecated alias of headless mode.
+    parser.add_argument("--no-frontend", action="store_true", help="Deprecated alias of headless mode (there is no web frontend)")
 
     # Parse known args, pass the rest to the backend core
     args, unknown_args = parser.parse_known_args()
@@ -101,7 +109,9 @@ def run():
             
             script_path = os.path.join(BACKEND_DIR, "synapse", "main.py")
             cmd = [sys.executable, script_path] + unknown_args
-            p = subprocess.Popen(cmd, env=dict(os.environ, PYTHONPATH=BACKEND_DIR))
+            # SYNAPSE_PARENT_PID: the backend exits if this launcher is killed.
+            p = subprocess.Popen(cmd, env=dict(os.environ, PYTHONPATH=BACKEND_DIR,
+                                               SYNAPSE_PARENT_PID=str(os.getpid())))
             p.wait()
             
             if p.returncode == 42:

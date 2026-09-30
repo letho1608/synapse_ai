@@ -636,6 +636,52 @@ async def shutdown(signal, loop, server):
   await server.stop()
 
 
+PARENT_PID_ENV = "SYNAPSE_PARENT_PID"
+
+
+def start_parent_watchdog(interval_s: float = 1.0, _exit=os._exit, _own_start=None):
+    """Exit this process once the launcher named by $SYNAPSE_PARENT_PID dies.
+
+    Launchers (main.py, `serve`, `console`) spawn the backend as a child; if
+    the launcher is killed (TerminateProcess on Windows, SIGKILL on POSIX) no
+    cleanup code runs and the orphaned backend keeps holding its ports. A
+    process with that PID created after us is a recycled PID, not the
+    launcher. Returns the thread, or None when the env var is unset/invalid.
+    A launcher that is already gone (killed while we were importing) makes
+    the thread exit the process on its first check.
+    """
+    import threading
+    import time as _time
+    raw = os.environ.get(PARENT_PID_ENV, "").strip()
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    own_start = _own_start
+    if own_start is None:
+        try:
+            own_start = psutil.Process().create_time()
+        except psutil.Error:
+            own_start = float("inf")
+
+    def _alive() -> bool:
+        try:
+            return psutil.Process(pid).create_time() <= own_start
+        except psutil.Error:
+            return False
+
+    def _watch():
+        while _alive():
+            _time.sleep(interval_s)
+        print("[synapse] launcher process %d exited -> stopping backend" % pid,
+              file=sys.stderr, flush=True)
+        _exit(0)
+
+    t = threading.Thread(target=_watch, name="parent-watchdog", daemon=True)
+    t.start()
+    return t
+
+
 def is_frozen():
   return getattr(sys, 'frozen', False) or os.path.basename(sys.executable) == "synapse" \
     or '__nuitka__' in globals() or getattr(sys, '__compiled__', False)

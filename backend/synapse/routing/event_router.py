@@ -67,7 +67,12 @@ class EventRouter:
                         logger.error(f"Error in sync callback for {topic}: {e}")
             
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # Never swallow handler failures silently: a crashing
+                # tensor/result handler looked exactly like a lost message.
+                for res in results:
+                    if isinstance(res, BaseException) and not isinstance(res, asyncio.CancelledError):
+                        logger.opt(exception=res).error(f"Handler for topic {topic} raised: {res!r}")
 
     async def start(self):
         """Initialize the router and prepare P2P mesh connection."""

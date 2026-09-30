@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
+from synapse.inference.inference_engine import SHARD_WEIGHTS_SUFFIX
 from synapse.inference.shard import Shard
 from synapse.transport.result_router import ResultRouter, RoutedResult
 from synapse.topology.partitioner import compute_partition
@@ -93,6 +94,8 @@ class DistributedPipelineExtension:
         # Per-model step counter used for the metadata checkpoints written
         # after each distributed training step (model_id -> steps completed).
         self._checkpoint_steps: Dict[str, int] = {}
+        # (model_id, start, end) -> (weights file, step it holds).
+        self._weights_saved: Dict[Tuple[str, int, int], Tuple[str, int]] = {}
 
     async def start(self) -> None:
         if not self._started:
@@ -131,6 +134,35 @@ class DistributedPipelineExtension:
                 result.append((partition.node_id, shards[i]))
         return result
 
+    def _maybe_save_shard_weights(
+        self, model_id: str, local: Shard, step: int
+    ) -> Tuple[Optional[str], Optional[int]]:
+        """Write the local shard's layer weights every N steps
+        (SYNAPSE_CKPT_WEIGHTS_EVERY, default 10; 0 disables) to one
+        overwritten file per node+model+range. Returns the newest weights
+        file and the step it holds, so metadata-only steps in between still
+        point recovery at real weights (possibly a few steps older)."""
+        import os
+        import re
+        try:
+            every = int(os.getenv("SYNAPSE_CKPT_WEIGHTS_EVERY", "10"))
+        except ValueError:
+            every = 10
+        key = (model_id, local.start_layer, local.end_layer)
+        last = self._weights_saved.get(key)
+        if every > 0 and (step == 1 or step % every == 0):
+            node = self._node
+            safe_model = re.sub(r"[^A-Za-z0-9._-]", "_", model_id)
+            path = os.path.join(
+                node.fault_tolerance.checkpoint_dir,
+                f"{node.id}_{safe_model}_L{local.start_layer}-{local.end_layer}"
+                f"{SHARD_WEIGHTS_SUFFIX}")
+            engine = node.inference_engine
+            if engine is not None and engine.save_shard_weights(local, path):
+                last = (path, step)
+                self._weights_saved[key] = last
+        return last if last else (None, None)
+
     def _save_shard_checkpoint(
         self, base_shard: Shard, shard: Optional[Shard] = None
     ) -> None:
@@ -143,7 +175,9 @@ class DistributedPipelineExtension:
         surviving node can recover the dead node's shard state via
         FaultToleranceManager.load_latest_checkpoint() after rebalancing.
 
-        Lightweight by design: metadata only (no kv_cache / optimizer state),
+        Metadata every step; the shard's layer weights every N steps (see
+        _maybe_save_shard_weights) so recovery can restore real weights. No
+        kv_cache / optimizer state.
         and exceptions are caught so a checkpoint write failure never aborts
         training — but they are logged at WARNING, not silently swallowed, so
         a failing checkpoint directory is observable in production.
@@ -158,12 +192,16 @@ class DistributedPipelineExtension:
                 return
             step = self._checkpoint_steps.get(base_shard.model_id, 0) + 1
             self._checkpoint_steps[base_shard.model_id] = step
+            weights_path, weights_step = self._maybe_save_shard_weights(
+                base_shard.model_id, local, step)
             node.fault_tolerance.save_checkpoint(
                 base_shard.model_id,
                 local.start_layer,
                 local.end_layer,
                 step=step,
                 kv_cache=None,
+                weights_path=weights_path,
+                weights_step=weights_step,
             )
         except Exception as e:
             _log.warning(
@@ -184,6 +222,7 @@ class DistributedPipelineExtension:
         request_id: Optional[str] = None,
         max_generate_tokens: Optional[int] = None,
         num_micro_batches: int = 1,
+        sampling_state: Optional[Dict[str, Any]] = None,
     ) -> List[int]:
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -219,7 +258,22 @@ class DistributedPipelineExtension:
             "broadcast_start",
         )
 
-        on_token_cb = self._node._on_token_received
+        node = self._node
+
+        def on_token_cb(rid, tokens, finished):
+            # Verified tokens only: feed the request buffer AND the stream
+            # callbacks (API / console) — the last stage's raw samples are
+            # never streamed.
+            node._on_token_received(rid, tokens, finished)
+            node.trigger_on_token_callbacks(rid, tokens, finished)
+
+        def replan(current, exclude):
+            fn = getattr(node, "_replan_excluding", None)
+            return fn(base_shard, current, exclude) if callable(fn) else None
+
+        alive = getattr(node, "_node_alive", None)
+        if not callable(alive):
+            alive = None
 
         tracer = getattr(self._node, "tracer", None)
         if tracer is not None:
@@ -236,6 +290,9 @@ class DistributedPipelineExtension:
                     max_generate_tokens=token_limit,
                     on_token_callback=on_token_cb,
                     num_micro_batches=num_micro_batches,
+                    sampling_state=sampling_state,
+                    replan_fn=replan,
+                    alive_fn=alive,
                 )
                 if span and all_tokens:
                     span.set_attribute("num_tokens", len(all_tokens))
@@ -249,6 +306,9 @@ class DistributedPipelineExtension:
                 max_generate_tokens=token_limit,
                 on_token_callback=on_token_cb,
                 num_micro_batches=num_micro_batches,
+                sampling_state=sampling_state,
+                replan_fn=replan,
+                alive_fn=alive,
             )
 
         self._node._schedule_task(

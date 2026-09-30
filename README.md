@@ -1,58 +1,61 @@
-# Synapse AI: True Distributed Supercomputing Platform
+# Synapse AI: LLM inference across your own machines
 
-**LACP — Latency-Aware Compute Pooling** — Run LLMs across a cluster of networked machines with genuine parallel acceleration. Every added node increases token generation speed and reduces training time.
+## What Synapse AI Does
 
-[![Repo](https://img.shields.io/badge/repo-github.com%2Fletho1608%2Fsynapse__ai-blue)](https://github.com/letho1608/synapse_ai)
+Synapse splits one language model across the machines on your network. Each node loads and runs only a contiguous range of layers, and hidden states flow node to node over TCP. You get two things from this:
+
+- **Capacity:** a model that fits in no single machine runs on several. A node holds only the layers it serves, plus the embedding on the first stage and the norm and head on the last. Weights are read straight from the safetensors checkpoint for that range. Weight-only int8 quantization shrinks every layer when memory is short.
+- **Throughput:** many requests run at once. Concurrent decode steps on a node share one batched forward (the weights are read once per batch), and different requests occupy different stages at the same time.
+
+**What it does not do:** it does not make a single request faster than running the model on one machine that can hold it. Every hop adds network latency, and a pipeline over separate machines must pass each token through every stage in turn. exo, Petals and llama.cpp RPC report the same limit, and `research/related-work.md` compares Synapse with these systems in detail. Speculative drafts verified in one pass (below) recover part of that cost when the text repeats itself.
+
+### How it works (per request)
+
+```
+ client ─▶ orchestrator (API node): tokenize, choose a stage plan, draft
+             │  step = [prompt + verified history + draft]            (token ids)
+             ▼
+          stage 1 ─▶ stage 2 ─▶ … ─▶ last stage                (hidden states, INT8 per row)
+          each stage: reuse its KV cache for the common prefix,
+          recompute only the new rows, forward only those rows (+ row_offset)
+             │
+             ▼  last stage samples one token per draft position (verify_n = draft + 1)
+          orchestrator keeps the longest verified prefix + 1 token, streams it,
+          and starts the next step
+```
+
+- **Measured placement.** Each node measures what one decoder layer costs it, in ms per decode step, taken from real forwards (or from a bandwidth probe before its first forward). It also computes how many layers fit in its memory. Both values ride capability gossip. The master then runs an exact dynamic program over contiguous ranges and node choice (EdgeShard-style), which minimizes either the slowest stage including its incoming hop (`throughput`, the default) or the end-to-end token time (`latency`). A new placement replaces the current one only when it is at least 10% cheaper. If any node has not reported yet, the older TFLOPS-proportional / LACP weighting applies.
+- **One-pass draft verification.** A prompt-lookup (n-gram) draft of up to `lookahead_window` tokens is appended to the context. One pipeline pass scores every draft position, and the orchestrator accepts guesses while they match what was sampled. With a deterministic draft, "sample, then accept on match" is exact speculative sampling, so greedy output is unchanged. After a rejection each stage crops its KV cache back to the common prefix. The last `verify_n` rows are always recomputed.
+- **Delta rows.** Non-last stages forward only the rows they recomputed, plus `row_offset`, instead of the hidden states for the whole context on every step. A stage that lacks the cached prefix (for example, one that just replaced a dead node) answers `kv_miss`, and the orchestrator resends that step with full hidden states.
+- **Failover mid-request.** While it waits for a step, the orchestrator polls stage liveness from the heartbeats. When a stage dies, the orchestrator patches the plan: it gives the dead range to a live node that already holds those layers (a replica, `SYNAPSE_REPLICAS=1`), or else to a neighbouring stage within its memory cap. It then resends the same step, and generation continues with the same tokens.
+- **Every request carries its own `partition_plan`,** so every hop runs exactly the layers it was sent and forwards to the owner of the next range.
+
+### Measured on this repository's test machine (CPU, SmolLM2-135M-Instruct)
+
+| What | Result | Test |
+|---|---|---|
+| Layer-range loading, 2 × 15 layers | each node holds its own layers only (a middle stage has no embedding or head) | `test_partial_load_and_quant.py` |
+| Weight-only int8 | top-1 agreement 100%, KL 0.006, decoder layers < 0.3× fp32 bytes (0.41× for the whole shard incl. the fp32 embedding) | `test_int8_weights_keep_answers_and_shrink_memory` |
+| Weight-only int4 (asymmetric, group 32) | top-1 51%, KL 0.63 on this 135M model; used only when int8 cannot fit | — |
+| Continuous batching, 4 / 8 concurrent requests | 12.8 → 23.3 tok/s / 12.3 → 35.0 tok/s (1.8× / 2.8×); a lone request unchanged (~15 tok/s) | `test_continuous_batching.py` (correctness), `scratchpad` benchmark |
+| Distributed decode protocol vs greedy | token-identical, 2–3 stages, INT8 wire, adversarial drafts | `test_verify_protocol_engine.py` |
+| 2 real processes | answer equals the single-process one | `test_live_multiprocess_split.py` |
+| 3 real processes, one killed while streaming | failover patches the plan and the streamed answer equals the healthy run | `test_live_failover.py` |
+| INT8 hidden states on the wire | top-1 100%, KL ≈ 5e-5, 3.6× smaller than fp32 | `test_int8_quality.py` |
+
+These runs use separate processes on one machine. Real-network latency and bandwidth numbers need the pending multi-machine run (C1).
+
+### Also in the box
+
+- Pipeline-parallel training (1F1B schedule, real inter-stage gradients; training loads the whole model on each node).
+- Versioned handshakes.
+- Optional TLS on the bridge and on the tensor path.
+- Shard-weight checkpoints.
+- The CLI/TUI console.
 
 ---
 
-## What Synapse AI Actually Does
-
-Synapse AI is a **true distributed supercomputing system** that pools ALL hardware resources across every machine in your network — GPU VRAM, TFLOPS, CPU cores, RAM, disk I/O, and network bandwidth — and uses them simultaneously to accelerate LLM inference and training.
-
-**The result:** A cluster pools its VRAM and compute so it can run models that no single machine can even load, and pipeline parallelism lets every node stay busy (see the scaling table below — wall-clock speedup is bounded by the slowest stage plus network overhead, not by node count).
-
-### How It's Different
-
-| What most "distributed" projects do | What Synapse AI LACP does |
-|---|---|
-| Split model layers across machines sequentially (Node A → Node B → wait) | **Pipeline parallelism with micro-batch overlapping**: Node B is already processing batch 1 while Node A loads batch 2 |
-| Only use VRAM as partition criteria | **Multi-resource LACP**: weighs VRAM + TFLOPS + CPU + RAM + disk I/O + bandwidth + power for every node — measured live via psutil/pynvml |
-| Ignore network topology | **Latency-aware clustering**: nodes with <1ms latency get adjacent shards; cross-region nodes get independent shards |
-| Serial tensor forwarding blocks the pipeline | **Async non-blocking forwarding**: tensor sent as soon as ready; next micro-batch starts immediately |
-| Training runs on a single node | **Distributed DDP + all-reduce**: every node computes gradients on its shard in parallel, then synchronizes |
-| Node failure kills the request | **Dynamic rebalancing**: failed node's shard reassigned live; dead node's JSON checkpoint (no pickle) is written and staged for the survivor — resume-from-checkpoint is pending (see Known Limitations) |
-| Same speed with 1 node or 100 nodes | **Pipeline-parallel speedup**: every added node increases capacity and keeps stages busy in parallel; wall-clock gains follow the scaling table below |
-
-**Verification:** All claims backed by real tests — 255 tests across 46 test modules covering fault tolerance, TCP_NODELAY, resource measurement (with disk-I/O metric caching), ILP partitioning (time-budgeted solve with observable LRM fallback on budget exhaustion), multi-resource election (dead-master demotion in a bounded window; stickiness prevents split brain), decode token verification, prompt-conditioned pipeline overlap, streaming fidelity, 1F1B training with real backward gradients and inter-stage handoff, binary tensor transport, real bandwidth probing (64 KiB transfer-time probe → latency matrix → resource scores), large-frame bridge handling (256 MiB cap + explicit error on oversize), cross-node checkpoint recovery, pre-request rebalancing, latency-matrix refresh on topology change, authoritative-partition broadcast wiring, mesh heartbeats, zero-copy shared memory (retained segments bounded by an LRU cap), micro-batch step propagation, and the web UI root route. A dedicated invariant test pins the scaling table to `benchmark_cluster_speedup.py` output. Coverage is behavioral: tests drive the shipped production code paths (hardware-dependent backends are stubbed where required) — no source-string assertion tests.
-
----
-
-## Architecture: LACP Pipeline
-
-```
-                   ┌─────────────────────────────────────────┐
-  User Request ──▶ │         Master Scheduler Node            │
-                   │  (Elected by multi-resource weight)     │
-                   └─────────────────────────────────────────┘
-                                      │
-                    ┌─────────────────┼─────────────────┐
-                    ▼                 ▼                  ▼
-             ┌──────────┐     ┌──────────┐       ┌──────────┐
-  Micro-batch│ Node 0   │     │ Node 1   │  ...  │ Node N-1 │
-  Flow:      │ L0-L7    │────▶│ L8-L15   │──────▶│ L16-L23  │──────▶
-             │ (2ms)    │     │ (3ms)    │       │ (1.5ms)  │       │
-             └──────────┘     └──────────┘       └──────────┘       │
-                  │                │                   │             │
-                  │    Batch 2     │    Batch 2        │    Batch 2  │
-                  │    L0-L7       │    L8-L15         │    L16-L23  │
-                  │    (2ms)       │    (3ms)          │    (1.5ms)  │
-                  ▼                ▼                   ▼             │
-            ═══════════════ PIPELINE BUBBLE-FREE ═══════════════     │
-            After warmup, every node is busy every step             │
-            Throughput = 1 / max(stage_time) ≈ 333 tokens/sec       │
-            (vs 143 tokens/sec for sequential 7ms total)            │
-```
+## Architecture details
 
 ### 1F1B Schedule (One-Forward-One-Backward)
 
@@ -72,7 +75,18 @@ Still **not** implemented: per-layer shard-cut backprop across nodes — stage *
 
 ## Key Components
 
-### LACP Partitioning Engine
+### Placement (which node runs which layers)
+
+**Default: measured placement** (`synapse/topology/dp_partition.py`, `layer_profile.py`). It applies as soon as every node has gossiped a layer profile for the model. The master solves an exact DP over contiguous ranges and node selection:
+- For ≤ 4 nodes it tries every chain order; above that it builds a nearest-neighbour chain.
+- It respects each node's memory cap.
+- Its objective is in milliseconds, built from measured ms/layer and the measured ping RTT (halved as the one-way hop cost; 2 ms if unmeasured).
+- It is checked against brute force on random small cases (`test_measured_placement.py`).
+- `SYNAPSE_PARTITION_OBJECTIVE=throughput|latency`; `SYNAPSE_PARTITIONER=legacy` turns it off.
+
+Until every profile has arrived, the legacy weighting below applies.
+
+#### Legacy LACP weighting (fallback)
 
 Partitioning supports two **methods**:
 - **`method="lrm"`** (default) — Largest Remainder Method: fast greedy proportional allocation, ideal for large clusters
@@ -118,14 +132,12 @@ Node receives ───────▶ deserialize → queue for inference engin
 
 - Tensors are encoded as **binary blobs** (not JSON) using the compact **SYNP** header format (`transport/codec.py`)
 - Same-machine nodes use **zero-copy shared memory**: tensor payloads travel through `multiprocessing.shared_memory` segments (no socket, no OS copy of the payload), and the receiving node hands its handler a zero-copy numpy view over the shared buffer — implemented in `shm_transport.py` and covered by behavioral tests that assert the payload bypasses TCP
-- Cross-machine tensor traffic currently rides the P2P event bridge: the binary SYNP payload is carried inside the bridge's JSON+hex framing, verified end to end by `test_p2p_bridge_binary.py`. A dedicated **TCP transport with Nagle disabled** (`TCP_NODELAY=1`, `tcp_transport.py`) is implemented, started on every node, and peer-registered for cross-machine links — covered by 3 dedicated tests — and is the high-performance path for network fabrics
+- Cross-machine tensor traffic uses the chunked binary **TCP transport** (`tcp_transport.py`, Nagle disabled, 1 MiB frames) on the port each peer advertises in its handshake. If that path fails, traffic falls back to the P2P event bridge (JSON + hex framing, 256 MiB cap). Hidden states travel as per-row INT8 to peers that negotiated `q8row1`, and only the recomputed rows are sent (`row_offset`)
 - **RDMA / InfiniBand transport is planned, not yet implemented** — zero-copy shared memory covers same-machine traffic today; extending zero-copy to the network fabric via RDMA is future work
 
-### Decode Pipeline Overlap
+### Decode: one pipeline pass per step
 
-During the autoregressive decode phase, the inference engine fires **multiple micro-batches** into the pipeline before collecting results — `num_decode_batches = max(2, lookahead_window)`. This ensures all pipeline stages stay busy simultaneously: Stage 1 processes batch N while Stage 0 loads batch N+1, eliminating the pipeline bubble for decode.
-
-Every decode micro-batch is **conditioned on the full true context** — the entire prompt plus the verified generation history — and extends it by a prefix of the n-gram lookahead guesses (batch 0 sees `[prompt … history]`, batch 1 adds guess 0, batch 2 adds guesses 0–1, …). A token is accepted only after every guess feeding its context has been verified by the previous batch's prediction, so no token predicted from a contaminated context can enter the output (`verify_speculative_tokens`).
+Each decode step sends `[prompt + verified history + n-gram draft]` as ONE pass (`DistributedPipelineController._run_step`). The last stage samples a token at every draft position. Position j is conditioned on the history plus `draft[:j]`, with the same repetition penalty as sequential decoding. The orchestrator keeps the longest verified prefix plus one token (`verify_speculative_tokens`) and streams only those tokens. The last stage's raw samples never reach the stream. The design this replaced fired one full-context micro-batch per guess prefix, which cost k+1 passes for k guesses and had no way to cancel the stale ones. Verified token-identical to greedy decoding through 2–3 real engine stages with INT8 transport and adversarial drafts (`test_verify_protocol_engine.py`), and against an oracle last stage (`test_decode_pipeline_overlap.py`).
 
 ### Result Routing
 
@@ -137,7 +149,7 @@ The master scheduler node is elected using the **LACP composite score** rather t
 
 ---
 
-## Multi-Node Scaling Characteristics
+## Multi-Node Scaling Characteristics (simulated timing model, not a measurement)
 
 The single authoritative scaling table — generated by `backend/tests/benchmark_cluster_speedup.py`. The two never contradict: `test_b6b7_cleanup.py` asserts the table below is exactly the benchmark's output (regenerate it from `python backend/tests/benchmark_cluster_speedup.py`):
 
@@ -159,19 +171,48 @@ Speedup is measured against the same workload on 1 node (pipeline-parallel infer
 
 ## Known Limitations
 
-- **TLS/mTLS between nodes is not implemented.** Intra-cluster tensor traffic (TCP) is unencrypted; run clusters on trusted networks (LAN/Tailscale). This is planned future work.
+- **TLS between nodes is opt-in.** `SYNAPSE_TLS=selfsigned|require` with `SYNAPSE_TLS_CERT`/`SYNAPSE_TLS_KEY` (optional `SYNAPSE_TLS_CA`) wraps both the event bridge and the chunked TCP tensor path (verified on loopback by `test_tls_interop.py` and `test_tcp_tls.py`; a plaintext client cannot inject into a TLS node); missing cert files fail loudly instead of downgrading. Default is plaintext, so run default clusters on trusted networks (LAN/Tailscale). TLS on real multi-host clusters has not been exercised yet.
 - **RDMA/InfiniBand transport is not implemented** — zero-copy shared memory currently covers same-machine nodes only (see Async Tensor Forwarding above).
-- **Checkpoint recovery is wired into distributed training and rebalancing.** Every distributed training step persists a JSON metadata checkpoint (model id, shard layer range, step) plus a sidecar manifest (`{node}_{model}.manifest.json`, sha256, last 10), and `check_fault_tolerance()` stages the dead node's recovered state for the surviving node. Survivors can now P2P-pull the checkpoint without a shared directory (`prefer_local_then_pull` + `transport/checkpoint_pull.py`, verified by `test_ckpt_p2p_pull.py` on separate dirs) — but **weight restore is metadata-only today**: `PyTorchHF.load_checkpoint` returns False (loudly) for non-weight paths and the rebalance is flagged degraded (`_last_recovery_degraded`) instead of silently resuming from scratch. Full weight restore and the shared-filesystem removal tripwire (delete only after a live 2-3-machine P2P demo) are pending.
-- **Wire transport is tiered.** The JSON event bridge (256 MiB cap, explicit `frame_too_large`) stays the default path; a chunked binary TCP path (1 MiB frames, any blob size, 4 GiB admission, 30 s reassembly timeout) and the TCP/SHM auto-router exist behind `SYNAPSE_CHUNKED_TCP=1` (verified by `test_tcp_chunked_transfer.py`, incl. a 130 MiB blob). Bridge sockets now set TCP_NODELAY both directions. Wire quantization is exact-dtype by default (INT8 only with `SYNAPSE_TRANSPORT_INT8=1`).
+- **Checkpoint recovery is wired into distributed training and rebalancing.** Every distributed training step persists a JSON metadata checkpoint (model id, shard layer range, step) plus a sidecar manifest (`{node}_{model}.manifest.json`, sha256, last 10); every `SYNAPSE_CKPT_WEIGHTS_EVERY` steps (default 10, 0 = off) the node also writes its shard's layer weights (`*.weights.pt`, only its own layers) and the JSON records `weights_path`/`weights_step`. On failover the survivor restores exactly the dead node's layer range from that file into its loaded model (verified by `test_shard_weights_restore.py`: layer hashes match, other layers untouched, partial coverage refused). Weights can be up to N-1 steps older than the metadata step. Survivors can P2P-pull the JSON metadata without a shared directory (`transport/checkpoint_pull.py`, `test_ckpt_p2p_pull.py`), but the weights file stays on the machine that wrote it — once that node is dead it is unreachable, so cross-machine weight restore needs a shared checkpoint directory or proactive replication to a peer (not implemented). Without either, the restore returns False and the rebalance is flagged degraded (`_last_recovery_degraded`) instead of silently resuming from scratch.
+- **Wire transport is tiered.** The chunked binary TCP path (1 MiB frames, any blob size, 4 GiB admission, 30 s reassembly timeout) and the TCP/SHM auto-router are on by default and fall back to the JSON event bridge (256 MiB cap, explicit `frame_too_large`) on any failure; `SYNAPSE_CHUNKED_TCP=0` restores bridge-only (verified by `test_tcp_chunked_transfer.py`, incl. a 130 MiB blob). Bridge sockets set TCP_NODELAY both directions. Inter-stage hidden states travel as INT8 by default: one scale per row plus the 8 largest-magnitude values per row carried exactly, sent only to peers whose handshake advertises `q8row1` (older peers get exact dtype); `SYNAPSE_TRANSPORT_INT8=0` restores exact transport. Quality gate on the default model (SmolLM2-135M-Instruct, 2- and 3-stage splits, 6 prompts, teacher-forced): top-1 next-token agreement 100%, KL ≈ 5e-5 (`test_int8_quality.py`); payload ≈ 3.6× smaller than fp32 at hidden size 576.
 - **Handshakes are versioned.** Bridges exchange `synapse_version`/`bridge_version`/`caps_hash`/`features`; major mismatch fails closed via `is_compatible()` (verified by `test_handshake_compat.py` both directions). Mixed-version pipeline refusal at the node layer and the `--version` CLI are wired; capability/demand gossip publishes advisory-only docs every ~5th heartbeat (tri-state fit, unknown rates excluded, never actuating).
-- **CLI-first terminal surface exists.** `python main.py serve|join|client|status|topology|models|benchmark [--json] [--port N]` (verified by `test_cli.py`); `--log-format json` for backend logs and the `GET /` liveness stub land with the API slice.
-- **Distributed decode re-feeds the full context rather than reusing a KV cache.** Each decode micro-batch is conditioned on the entire prompt plus verified history (prompt-conditioned end to end, verified by `test_decode_pipeline_overlap.py`), but every step re-runs the full context through the pipeline — incremental KV-cache reuse across decode steps is not yet implemented, so decode is correct at the cost of re-computation.
+- **CLI-first terminal surface exists.** `python main.py console|serve|join|client|status|topology|models|benchmark [--json] [--port N]` (verified by `test_cli.py`, `test_console.py`); `console` is the interactive TUI shell (see `UI.md`). `--log-format json` emits JSONL backend logs and `--headless` turns `GET /` into a 204 liveness stub. Launchers pass `SYNAPSE_PARENT_PID`, so the backend exits if its launcher is killed (no orphan holding ports).
+- **Decode reuses a per-request KV cache on every stage.**
+  - Each stage keeps a KV cache per request and shard range.
+  - Full-context calls reuse the longest common prefix with the previous input. The cache is cropped after a rejected draft, and the last `verify_n` rows are always recomputed.
+  - Non-last stages forward only the recomputed rows plus `row_offset` (`delta_rows`). A stage missing the prefix answers `kv_miss`, and the step is resent with full rows.
+  - Callers that send only the newest token pass back the returned `inference_state` (it carries `kv_len`).
+  - `SYNAPSE_SEQ_KV=0` disables full-context reuse.
+  - The engine is pinned to the HF reference: full-shard logits vs `model(...)`, and 1/2/3-stage greedy decode vs `model.generate`, for tiny GPT-2 and SmolLM2 (`test_engine_reference_parity.py`). The distributed protocol is pinned to greedy decoding (`test_verify_protocol_engine.py`).
+  - Sliding-window attention is not modelled: the engine applies a full causal mask.
 - **The P2P event bridge no longer silently drops legitimate large frames.** The per-frame cap is raised from a hardcoded 10 MiB to a configurable 256 MiB default (`max_frame_size`, settable on `P2PSocketBridge`/`Libp2pNode`); a frame that still exceeds the configured cap gets an explicit `error`/`frame_too_large` packet back to the sender (recorded in `bridge._last_errors[peer_id]`) instead of a silent disconnect — verified by `test_p2p_bridge_binary.py` (a 12 MB tensor ≈ 24 MB framed is delivered intact end to end).
 - **With the multi-resource LACP path enabled (`--no-tflops-proportional`), partitioning re-runs resource measurement and bandwidth probing on a cadence**: disk-I/O measurements are cached for 5 s (`_DISK_IO_CACHE_TTL`), so partition recomputes within that window reuse the last measurement instead of re-incurring the 0.5 s sampling sleep per node (verified by `test_resource_measurement.py`), and the bandwidth estimate is a transfer-time-based 64 KiB probe (5 samples averaged over request+echo round-trips) — a single-connection lower-bound proxy, not full link capacity (verified by `test_bandwidth_flow.py`).
-- **Multi-node behavior is verified with in-process simulated nodes** driving the real transport/partition/training code; a hardware multi-machine E2E benchmark run is deferred to future work.
-- **The web UI is a backend-served static dashboard** (no npm dependency) — `GET /` always returns a real page, served by the API process itself.
+- **Multi-process runs are verified on one machine, not yet across machines.**
+  - `test_live_multiprocess_split.py`: 2 real backend processes answer exactly like one process, each running one contiguous layer range, with hidden states over chunked TCP.
+  - `test_live_failover.py`: 3 processes. Once profiles are gossiped, measured placement runs. One stage process is killed while an answer streams; the orchestrator detects it from heartbeats, patches the plan, resends the step, and the streamed answer equals the healthy run.
+  - A hardware multi-machine run (C1) is still pending, so real-network latency, bandwidth and failover times are unmeasured.
+  - On Windows, check `netsh int ipv4 show excludedportrange protocol=tcp`: the default node port 50051 can fall inside a reserved range.
+- **Training loads the whole model on each node.** Layer-range loading applies to inference; `train`/`evaluate` switch the engine to the full HF model.
+- **A single request is not faster than one machine that can hold the model.** See "What it does not do" above.
+- **No web frontend (CLI-first).** The terminal CLI/console is the user interface; `GET /` is a small built-in status page served by the API process (a 204 stub under `--headless`).
 
 ---
+
+## Configuration (environment)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SYNAPSE_PARTIAL_LOAD` | `1` | Load only the served layer range (`0` = whole model on every node) |
+| `SYNAPSE_WEIGHT_QUANT` | `auto` | `none` / `int8` / `int4` / `auto`. `auto` quantizes only when fp weights would not fit |
+| `SYNAPSE_BATCH` | `1` | Continuous batching of concurrent decode steps |
+| `SYNAPSE_BATCH_WINDOW_MS` | `3` | How long to wait for batch company, only while >1 request is active |
+| `SYNAPSE_PARTITIONER` | `measured` | `legacy` = TFLOPS / LACP weighting only |
+| `SYNAPSE_PARTITION_OBJECTIVE` | `throughput` | or `latency` |
+| `SYNAPSE_REPLICAS` | `0` | `1` = also hold the next stage's layers (instant failover) |
+| `SYNAPSE_TRANSPORT_INT8` | `1` | Per-row INT8 hidden states on the wire |
+| `SYNAPSE_SEQ_KV` | `1` | Full-context KV reuse |
+| `SYNAPSE_CHUNKED_TCP` | `1` | Chunked binary TCP tensor path |
+| `SYNAPSE_TLS` | off | `selfsigned` / `require` |
 
 ## Installation
 
@@ -180,7 +221,7 @@ git clone https://github.com/letho1608/synapse_ai.git
 cd synapse_ai
 python -m venv .venv
 .venv\Scripts\activate   # Windows
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 ```
 
 ---
@@ -188,9 +229,12 @@ pip install -r requirements.txt
 ## Quick Start (Single Node)
 
 ```bash
-python main.py
-# Open http://127.0.0.1:52415
+python main.py console        # interactive TUI: boots a node + slash commands
+# or headless:
+python main.py serve          # then: python main.py status / client / benchmark
 ```
+
+The API listens on `http://127.0.0.1:52415` (`/v1/*`); `GET /` is only a built-in status page.
 
 ---
 
@@ -267,7 +311,9 @@ synapse_ai/
 ├── main.py                          # Entry point
 ├── backend/
 │   └── synapse/
-│       ├── main.py                  # CLI, wiring
+│       ├── main.py                  # Backend entry, wiring
+│       ├── cli.py                   # CLI subcommands (serve/status/...)
+│       ├── console.py / tui.py      # Interactive console + full-screen TUI
 │       ├── inference/               # Model execution
 │       │   ├── distributed_engine.py  # Distributed pipeline controller + decode overlap
 │       │   ├── inference_engine.py    # Base inference engine
@@ -281,7 +327,10 @@ synapse_ai/
 │       │   └── node_extension.py      # Node runtime extensions
 │       ├── transport/               # Data transport layer
 │       │   ├── codec.py               # Binary tensor encoding (SYNP header)
-│       │   ├── tcp_transport.py       # TCP server/client with TCP_NODELAY
+│       │   ├── router.py              # TCP/SHM/bridge route choice + quantization policy
+│       │   ├── tls_wrap.py            # TLS contexts, self-signed certs, pinning
+│       │   ├── checkpoint_pull.py     # P2P checkpoint metadata pull
+│       │   ├── tcp_transport.py       # Chunked TCP server/client (TCP_NODELAY, optional TLS)
 │       │   ├── shm_transport.py       # Zero-copy shared-memory transport (same-machine)
 │       │   └── result_router.py       # In-order result reassembly
 │       ├── topology/                 # LACP partitioning engine
@@ -296,7 +345,6 @@ synapse_ai/
 │       │   └── tracing.py            # Distributed tracing
 │       ├── networking/              # Peer discovery
 │       │   ├── discovery.py          # Base discovery interface
-│       │   ├── server.py             # P2P server
 │       │   ├── manual/               # Manual discovery (JSON config)
 │       │   ├── tailscale/            # Tailscale API discovery
 │       │   └── udp/                  # UDP broadcast discovery
@@ -321,7 +369,7 @@ synapse_ai/
 │       ├── test_1f1b_training_production.py # 4 tests: 1F1B training through real pipeline stages
 │       ├── test_multinode_lacp_flow.py     # 5 tests: multi-node LACP partition + SHM wiring
 │       ├── test_benchmark_exists.py        # 5 tests: benchmark speedup projections
-│       ├── test_api_endpoints.py           # 6 tests: API + web UI root route + distributed status
+│       ├── test_api_endpoints.py           # API routes + built-in `GET /` page + distributed status
 │       ├── test_p2p_bridge_binary.py       # 6 tests: binary tensor roundtrip + latency probe echo + large-frame handling (256 MiB cap, explicit error on oversize)
 │       ├── test_b3b4b5_wiring.py           # 6 tests: latency-cache refresh, authoritative-partition broadcast, mesh heartbeats, pending-rebalance consumption
 │       ├── test_b6b7_cleanup.py            # 4 tests: MicroBatch.step propagation, SHM active-segment bound, README↔benchmark scaling-table invariant

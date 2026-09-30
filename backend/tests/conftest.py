@@ -29,3 +29,11 @@ def _console_ready_immediately(request, monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(_C, "_wait_ready", lambda *a, **k: True)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_checkpoint_dir(tmp_path_factory, monkeypatch):
+    """Fault-tolerance checkpoints go to a per-test temp dir, never into the
+    user's home (they used to land in the HF hub cache root)."""
+    if "SYNAPSE_CHECKPOINT_DIR" not in os.environ:
+        monkeypatch.setenv("SYNAPSE_CHECKPOINT_DIR", str(tmp_path_factory.mktemp("ckpt")))

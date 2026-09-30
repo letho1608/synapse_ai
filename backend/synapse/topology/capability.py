@@ -49,8 +49,12 @@ def build_capability_doc(
     quant_ok=(),
     seq_max: Optional[int] = None,
     version: Optional[str] = None,
+    layer_profiles: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build our capability advertisement. Unknowns stay None (never 0)."""
+    """Build our capability advertisement. Unknowns stay None (never 0).
+
+    layer_profiles: {model_id: {ms_per_layer, max_layers, ...}} measured on
+    this node (synapse.topology.layer_profile), used by measured placement."""
     base = _caps_dict(caps)
     if tflops_fp16 is None:
         flops = base.get("flops") or {}
@@ -66,6 +70,7 @@ def build_capability_doc(
         "chip": base.get("chip"),
         "gpu_backend": base.get("gpu_backend"),
         "version": version,
+        "layer_profiles": dict(layer_profiles or {}),
         "ts": time.time(),
     }
     return doc

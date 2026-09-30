@@ -11,14 +11,14 @@ and the node layer stays a thin caller. Order (single function, first hit wins):
   3. tcp peer + chunking on    -> tcp-chunked (any blob size; 1 MiB frames)
   4. otherwise                 -> bridge (legacy JSON event mesh, 256 MiB cap)
 
-B4: wire quantization is exact-dtype by default. should_quantize() returns
-True only for floating tensors with explicit opt-in (env
-SYNAPSE_TRANSPORT_INT8=1 or a negotiated offer flag).
+Wire quantization: per-row INT8 for float activations by default, only
+toward peers that negotiated FEATURE_Q8ROW; SYNAPSE_TRANSPORT_INT8=0 opts
+out (exact dtype).
 """
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 ROUTE_IN_PROCESS = "in_process"
 ROUTE_SHM = "shm"
@@ -29,13 +29,45 @@ ROUTE_BRIDGE = "bridge"
 MAX_SHM_BYTES = 512 * 1024 * 1024
 
 
-def should_quantize(dtype_name: str, opt_in: Optional[bool] = None) -> bool:
-    """Exact-dtype default (B4): True only for float tensors with opt-in."""
+# Capability flag for per-row INT8 payloads (codec Q_MODE_INT8_ROW). A peer
+# that does not advertise it would decode the int8 bytes as raw data, so we
+# only quantize toward peers that negotiated it.
+FEATURE_Q8ROW = "q8row1"
+
+# sender node_id -> (peer_id -> negotiated features); registered by each node
+# once its bridge exists (keyed per sender so in-process multi-node setups
+# never consult another node's handshakes). No entry = no restriction.
+_peer_features_lookup: Dict[str, Callable[[str], List[str]]] = {}
+
+
+def set_peer_features_lookup(self_id: str,
+                             fn: Optional[Callable[[str], List[str]]]) -> None:
+    if fn is None:
+        _peer_features_lookup.pop(self_id, None)
+    else:
+        _peer_features_lookup[self_id] = fn
+
+
+def should_quantize(dtype_name: str, opt_in: Optional[bool] = None,
+                    target_id: Optional[str] = None,
+                    self_id: Optional[str] = None) -> bool:
+    """INT8 wire quantization for float activations.
+
+    Default ON (per-row INT8, quality-gated by test_int8_quality.py);
+    SYNAPSE_TRANSPORT_INT8=0 restores exact-dtype transport. Never for a
+    target peer that did not negotiate FEATURE_Q8ROW (mixed versions).
+    """
     if opt_in is None:
-        opt_in = os.getenv("SYNAPSE_TRANSPORT_INT8", "0") == "1"
-    if not opt_in:
+        opt_in = os.getenv("SYNAPSE_TRANSPORT_INT8", "1") == "1"
+    if not opt_in or dtype_name not in ("float32", "float64", "float16"):
         return False
-    return dtype_name in ("float32", "float64", "float16")
+    lookup = _peer_features_lookup.get(self_id) if self_id is not None else None
+    if target_id is not None and lookup is not None:
+        try:
+            return FEATURE_Q8ROW in (lookup(target_id) or [])
+        except Exception:
+            return False
+    return True
 
 
 def chunking_enabled(env: Optional[dict] = None) -> bool:
