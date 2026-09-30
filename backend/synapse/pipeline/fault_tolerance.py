@@ -157,9 +157,18 @@ class FaultToleranceManager:
         return [nid for nid, h in self._health.items()
                 if not h.is_alive and nid != self.node_id]
 
-    def is_node_alive(self, node_id: str) -> bool:
+    def is_node_alive(self, node_id: str, unknown: bool = False) -> bool:
+        """Heartbeat view, answered from timestamps (does not wait for the
+        monitor loop's next pass). Blacklisted = dead. `unknown` is the
+        answer for a node that never sent a heartbeat."""
+        if node_id == self.node_id:
+            return True
         h = self._health.get(node_id)
-        return h.is_alive if h else False
+        if h is None or not h.last_heartbeat:
+            return unknown
+        if h.is_blacklisted:
+            return False
+        return (time.time() - h.last_heartbeat) <= 3 * self.HEARTBEAT_INTERVAL + 1.0
 
     # ── Checkpointing ──────────────────────────────────────
 

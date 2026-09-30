@@ -114,10 +114,15 @@ def quantize_module(module: nn.Module, mode: str) -> int:
     return count
 
 
-def module_bytes(module: nn.Module) -> int:
-    """Bytes actually held by a module's parameters and buffers."""
+def module_bytes(module: nn.Module, seen: Optional[set] = None) -> int:
+    """Bytes actually held by a module's parameters and buffers. Pass the
+    same `seen` set across modules to count shared (tied) tensors once."""
+    seen = set() if seen is None else seen
     total = 0
     for t in list(module.parameters()) + list(module.buffers()):
+        if id(t) in seen:
+            continue
+        seen.add(id(t))
         total += t.numel() * t.element_size()
     return total
 

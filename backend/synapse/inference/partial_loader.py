@@ -261,16 +261,11 @@ class PartialModel:
         return freed
 
     def loaded_bytes(self) -> int:
+        from synapse.inference.weight_quant import module_bytes
         mods = list(self.layers.values()) + [m for m in (
             self.embed, self.pos_embed, self.final_norm, self.lm_head, self.rotary) if m is not None]
-        seen, total = set(), 0
-        for m in mods:
-            for t in list(m.parameters()) + list(m.buffers()):
-                if id(t) in seen:
-                    continue
-                seen.add(id(t))
-                total += t.numel() * t.element_size()
-        return total
+        seen: set = set()
+        return sum(module_bytes(m, seen) for m in mods)
 
     def layer_param_count(self) -> int:
         """Parameters in one decoder layer (from a meta skeleton, free)."""

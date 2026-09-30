@@ -169,3 +169,44 @@ def test_selfsigned_mode_generates_and_reuses_a_node_cert(tmp_path, monkeypatch)
     _, _, pin2 = tls_wrap.configure_from_env("node/a")
     assert pin1 == pin2 and len(pin1) == 64  # generated once, then reused
     assert sorted(p.name for p in tmp_path.iterdir()) == ["node_a.cert.pem", "node_a.key.pem"]
+
+
+@pytest.mark.asyncio
+async def test_ca_mode_is_mutual_tls(tmp_path):
+    """With a CA both ends authenticate: a client without a CA-signed
+    certificate is refused by the server (bridge)."""
+    from synapse.transport.tls_wrap import enable_mutual, cert_fingerprint_pem
+    cert_pem, key_pem = gen_self_signed_cert()
+    cert_f, key_f = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert_f.write_bytes(cert_pem)
+    key_f.write_bytes(key_pem)
+    pin = cert_fingerprint_pem(cert_pem)
+
+    def ctxs(with_client_cert=True):
+        srv = build_server_context(str(cert_f), str(key_f))
+        cli = build_client_context(cafile=str(cert_f))
+        if with_client_cert:
+            enable_mutual(srv, cli, str(cert_f), str(key_f), str(cert_f))
+        else:
+            enable_mutual(srv, build_client_context(cafile=str(cert_f)), str(cert_f), str(key_f), str(cert_f))
+        return srv, cli
+
+    srv_a, cli_a = ctxs()
+    srv_b, _ = ctxs()
+    _, a, ta = await _mk("mtls-a", 59516, srv_a, cli_a, pin)
+    _, b, tb = await _mk("mtls-b", 59517, srv_b, cli_a, pin)
+    try:
+        assert await a.connect_to_peer("mtls-b", "127.0.0.1:59517")
+    finally:
+        await _close(a, ta)
+        await _close(b, tb)
+
+    _, cli_nocert = ctxs(with_client_cert=False)
+    srv_c, _ = ctxs()
+    _, c, tc = await _mk("mtls-c", 59518, srv_c, cli_nocert, pin)
+    _, d, td = await _mk("mtls-d", 59519, srv_c, cli_nocert, pin)
+    try:
+        assert not await c.connect_to_peer("mtls-d", "127.0.0.1:59519")
+    finally:
+        await _close(c, tc)
+        await _close(d, td)

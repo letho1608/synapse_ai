@@ -154,6 +154,18 @@ def ensure_self_signed(node_id: str, directory: Optional[str] = None):
     return cert_path, key_path
 
 
+def enable_mutual(server_ctx: ssl.SSLContext, client_ctx: ssl.SSLContext,
+                  certfile: str, keyfile: str, cafile: str) -> None:
+    """Mutual TLS (CA mode): servers require a client certificate signed by
+    the cluster CA, and clients present theirs. Pins-only clusters cannot do
+    this with the stdlib (a server cannot demand a client cert while
+    skipping chain verification), so there the client side is authenticated
+    by the server pin only."""
+    server_ctx.verify_mode = ssl.CERT_REQUIRED
+    server_ctx.load_verify_locations(cafile)
+    client_ctx.load_cert_chain(certfile, keyfile)
+
+
 def configure_from_env(node_id: str):
     """(server_ctx, client_ctx, own_pin) from SYNAPSE_TLS*, or Nones when off.
 
@@ -161,6 +173,7 @@ def configure_from_env(node_id: str):
       cert; peers are authenticated by SYNAPSE_TLS_PINS (or a CA if set).
     - require: provisioned cert/key, and a CA or pins MUST be configured:
       TLS without either authenticates nobody, so it is refused loudly.
+    - With a CA, TLS is mutual: both ends prove a CA-signed certificate.
     Missing files always fail loud; nothing falls back to plaintext."""
     mode = tls_enabled()
     if mode == "off":
@@ -175,6 +188,8 @@ def configure_from_env(node_id: str):
                          "without either no peer is authenticated")
     server_ctx = build_server_context(cert, key)
     client_ctx = build_client_context(cafile=ca)
+    if ca:
+        enable_mutual(server_ctx, client_ctx, cert, key, ca)
     with open(cert, "rb") as f:
         own_pin = cert_fingerprint_pem(f.read())
     return server_ctx, client_ctx, own_pin

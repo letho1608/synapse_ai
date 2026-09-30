@@ -79,22 +79,6 @@ class LACPPartition:
                 return a
         return None
 
-    def get_pipeline_stages(self) -> List[List[ShardAssignment]]:
-        """
-        Return pipeline stages ordered by cluster. Each stage is a list
-        of ShardAssignments that run in parallel within the same pipeline slot.
-        For LACP, clusters represent pipeline stages.
-        """
-        stages: Dict[int, List[ShardAssignment]] = {}
-        for a in self.assignments:
-            stages.setdefault(a.cluster_id, []).append(a)
-
-        # Sort by cluster centroid latency (closest → first)
-        cluster_order = sorted(stages.keys(), key=lambda cid: (
-            self.clusters[cid].centroid_latency_ms if cid < len(self.clusters) else 999999
-        ))
-        return [stages[cid] for cid in cluster_order]
-
 
 def compute_partition_ilp(
     nodes: Dict[str, NodeResources],

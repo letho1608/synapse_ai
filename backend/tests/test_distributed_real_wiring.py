@@ -128,7 +128,8 @@ def test_handshake_advertises_tensor_port_and_serializes_pydantic():
 def test_peer_tensor_address_uses_advertised_port():
     from types import SimpleNamespace
     from synapse.orchestration.node import Node
-    bridge = SimpleNamespace(_peer_handshakes={"b": {"tcp_port": 53765}, "old": {}})
+    hs = {"b": {"tcp_port": 53765}, "old": {}}
+    bridge = SimpleNamespace(_peer_handshakes=hs, get_peer_handshake=lambda pid: hs.get(pid))
     fake = SimpleNamespace(libp2p_node=SimpleNamespace(_bridge=bridge))
     assert Node._peer_tcp_addr(fake, "b", "10.0.0.2:51062") == "10.0.0.2:53765"
     assert Node._peer_tcp_addr(fake, "old", "10.0.0.2:51062") is None  # bridge only
@@ -138,7 +139,7 @@ def test_shm_not_chosen_for_peer_in_another_process():
     from synapse.transport.shm_transport import SharedMemoryTransport
     t = SharedMemoryTransport(node_id="shm-a-test")
     t.register_peer("127.0.0.1:51062", "not-in-this-process")
-    assert t.is_local_peer("127.0.0.1:51062")
+    assert "127.0.0.1:51062" in t._peer_ids
     assert not t.can_deliver("127.0.0.1:51062")
 
 

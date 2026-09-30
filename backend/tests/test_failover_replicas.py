@@ -169,3 +169,35 @@ class TestLayerResidency:
                                           [Partition("A", 0.0, 0.5), Partition("B", 0.5, 1.0)])
         assert node.inference_engine.ensured == [(15, 29)]
         assert node.inference_engine.loaded == set(range(30))
+
+
+class TestSingleStagePlans:
+    """A plan with ONE stage (latency objective on a model that fits one
+    node, or every other peer excluded) used to run base_shard = (0, 0, n):
+    only layer 0. Local single stage now runs the full shard; a remote
+    single stage goes through the controller."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner", ["A", "B"])
+    async def test_single_stage_runs_the_whole_model(self, monkeypatch, owner):
+        from synapse.pipeline.node_extension import DistributedPipelineExtension
+        node = _placement.TestNodeWiring._node(monkeypatch, ("A", "B"))
+        ext = DistributedPipelineExtension(node)
+        full = Shard("m", 0, 29, 30)
+        ext._get_partition_assignments = lambda bs: [(owner, full)]
+        seen = {}
+
+        async def fake_single(shard, prompt, rid, limit):
+            seen["local"] = (shard.start_layer, shard.end_layer)
+            return [1]
+
+        async def fake_controller(**kw):
+            seen["controller"] = [(n, s.start_layer, s.end_layer) for n, s in kw["partition_assignments"]]
+            return [2]
+        ext._run_single_node = fake_single
+        ext._controller.process_distributed_prompt = fake_controller
+        out = await ext.process_prompt_distributed(Shard("m", 0, 0, 30), "hi", request_id="r")
+        if owner == "A":
+            assert seen == {"local": (0, 29)} and out == [1]
+        else:
+            assert seen == {"controller": [("B", 0, 29)]} and out == [2]

@@ -231,8 +231,17 @@ class DistributedPipelineExtension:
         partitions = self._get_partition_assignments(base_shard)
         num_stages = len(partitions)
 
-        if num_stages <= 1:
-            return await self._run_single_node(base_shard, prompt, request_id, token_limit)
+        if num_stages == 1 and partitions[0][0] == self._node.id:
+            # One stage and it is us: run the WHOLE model locally. (base_shard
+            # is (0, 0, n): running it ran layer 0 only.)
+            return await self._run_single_node(partitions[0][1], prompt, request_id, token_limit)
+        if num_stages == 0:
+            from synapse.models import build_full_shard
+            full = build_full_shard(base_shard.model_id, "PyTorchHFInferenceEngine") or \
+                Shard(base_shard.model_id, 0, base_shard.n_layers - 1, base_shard.n_layers)
+            return await self._run_single_node(full, prompt, request_id, token_limit)
+        # num_stages >= 1 with a remote stage: the controller drives it (a
+        # single remote stage is both first and last).
 
         self._node._schedule_task(
             self._node.broadcast_opaque_status(

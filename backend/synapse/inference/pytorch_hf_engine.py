@@ -727,7 +727,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         sh = ctx["shard"]
         if ctx["past_len"] <= 0 or ctx["hidden"].shape[1] > self.BATCH_MAX_NEW_ROWS:
             return  # prefill costs differently; decode is what pipelines run
-        n = sh.end_layer - sh.start_layer + 1
+        n = sh.get_layer_count()
         ms = seconds * 1000.0 / max(1, n)
         prev = self.layer_ms.get(sh.model_id)
         self.layer_ms[sh.model_id] = ms if prev is None else 0.8 * prev + 0.2 * ms
@@ -837,7 +837,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             def _build():
                 pm_ = PartialModel(hf_id, dtype, device, hw["attn_implementation"])
                 per_layer = pm_.layer_param_count() * torch.tensor([], dtype=dtype).element_size()
-                need = per_layer * (shard.end_layer - shard.start_layer + 1)
+                need = per_layer * shard.get_layer_count()
                 pm_.quant_mode = WQ.choose_mode(need, self._available_bytes(device),
                                                 WQ.requested_mode())
                 return pm_

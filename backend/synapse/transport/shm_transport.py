@@ -164,8 +164,6 @@ class SharedMemoryTransport:
                 self._local_notify[pid] = peer_t._deliver
         return pid is not None and pid in self._local_notify
 
-    def is_local_peer(self, addr: str) -> bool:
-        return addr in self._peer_ids
 
     # -- sending ---------------------------------------------------------
 

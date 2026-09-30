@@ -392,9 +392,6 @@ def test_lacp_full_integration():
     
     # Generate pipeline schedule from partition
     scheduler = PipelineScheduler(num_micro_batches=4)
-    stages = result.get_pipeline_stages()
-    assert len(stages) >= 1
-    
     schedule = scheduler.generate_inference_schedule(
         num_stages=len(result.assignments),
         num_micro_batches=4,

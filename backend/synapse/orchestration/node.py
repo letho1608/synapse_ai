@@ -751,9 +751,9 @@ class Node:
           # over the dead node's shard range, retrievable via
           # fault_tolerance.get_recovery_checkpoint(<target>).
           self._last_rebalance_result = rebalance_result
-          if rebalance_result.recovered_from_checkpoint and rebalance_result.recovery_checkpoint:
-            ckpt = rebalance_result.recovery_checkpoint
-            target = rebalance_result.recovery_target_node
+          target = rebalance_result.recovery_target_node
+          ckpt = self.fault_tolerance.get_recovery_checkpoint(target) if target else None
+          if rebalance_result.recovered_from_checkpoint and ckpt is not None:
             if DEBUG >= 1:
               print(
                 f"!!! [LACP_FAULT] Recovered checkpoint for {dead_id} "
@@ -1930,7 +1930,8 @@ class Node:
   def _peer_tcp_addr(self, peer_id: str, bridge_addr: Optional[str]) -> Optional[str]:
     """host:tcp_port of a peer's tensor transport (from its handshake)."""
     bridge = getattr(self.libp2p_node, "_bridge", None)
-    info = getattr(bridge, "_peer_handshakes", {}).get(peer_id) if bridge else None
+    getter = getattr(bridge, "get_peer_handshake", None) if bridge else None
+    info = getter(peer_id) if callable(getter) else None
     port = (info or {}).get("tcp_port")
     if not port or not bridge_addr or ":" not in bridge_addr:
       return None
@@ -2257,14 +2258,7 @@ class Node:
     if node_id == self.id:
       return True
     ft = getattr(self, "fault_tolerance", None)
-    health = getattr(ft, "_health", {}).get(node_id) if ft is not None else None
-    if health is None:
-      return True
-    if getattr(health, "is_blacklisted", False):
-      return False
-    last = getattr(health, "last_heartbeat", None)
-    interval = getattr(ft, "HEARTBEAT_INTERVAL", 2.0)
-    return not last or (time.time() - last) <= 3 * interval + 1.0
+    return True if ft is None else ft.is_node_alive(node_id, unknown=True)
 
   def _layers_held(self, node_id: str, model_id: str) -> set:
     """Decoder layers a node has in memory (own engine, or peer gossip)."""
@@ -2362,7 +2356,7 @@ class Node:
         if _os.getenv("SYNAPSE_REPLICAS", "0") == "1" and len(ids) > 1:
           succ = shards[(i + 1) % len(shards)]
           prof = self._local_layer_profile(base_shard.model_id) or {}
-          need = len(keep) + (succ.end_layer - succ.start_layer + 1)
+          need = len(keep) + succ.get_layer_count()
           if need <= int(prof.get("max_layers") or 0):
             await self.inference_engine.ensure_shard(succ)
             keep |= set(range(succ.start_layer, succ.end_layer + 1))

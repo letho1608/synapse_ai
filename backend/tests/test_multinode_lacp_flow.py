@@ -165,8 +165,8 @@ class TestSHMWiring:
         node._register_transport_peers()
 
         # Same-machine peer is reachable via shared memory; remote peer is not.
-        assert node.shm_transport.is_local_peer("127.0.0.1:60123")
-        assert not node.shm_transport.is_local_peer("10.9.9.9:60124")
+        assert "127.0.0.1:60123" in node.shm_transport._peer_ids
+        assert not "10.9.9.9:60124" in node.shm_transport._peer_ids
         # TCP registers the ADVERTISED tensor port, never the bridge port
         # (the bridge port was registered before, so chunked TCP could never
         # connect between real processes).

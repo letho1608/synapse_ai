@@ -1536,7 +1536,8 @@ class ChatGPTAPI:
             payload["peer_versions"] = {
               pid: {"bridge_version": h.get("bridge_version"),
                     "synapse_version": h.get("synapse_version")}
-              for pid, h in (getattr(bridge, "_peer_handshakes", {}) or {}).items()
+              for pid, h in ((pid, bridge.get_peer_handshake(pid) or {})
+                             for pid in list(getattr(bridge, "_peer_handshakes", {}) or {}))
             }
       except Exception:
         pass
@@ -1777,11 +1778,17 @@ class ChatGPTAPI:
               discovery_type = self.node.discovery.__class__.__name__.replace("Discovery", "").lower()
       except Exception:
           discovery_type = "Unknown"
+      try:
+        from synapse.inference.attn_backend import available_backends
+        info_attn = available_backends()
+      except Exception:
+        info_attn = []
       return web.json_response({
           "project": "Synapse AI",
           "version": VERSION,
           "hardware": hw,
-          "network_discovery": discovery_type
+          "network_discovery": discovery_type,
+          "attention_backends": info_attn,
       })
   
   

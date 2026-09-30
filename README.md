@@ -177,7 +177,7 @@ Speedup is measured against the same workload on 1 node (pipeline-parallel infer
   - `require` refuses to start without a CA or pins.
   - `selfsigned` generates a per-node cert in `~/.synapse/tls` when `SYNAPSE_TLS_CERT`/`KEY` are not given. Each node logs its pin for the peers' `SYNAPSE_TLS_PINS`.
   - Missing files fail loudly; nothing falls back to plaintext.
-  - Clients do not present certificates (no mutual TLS).
+  - With a CA, TLS is mutual: servers demand a CA-signed client certificate and clients present theirs (`test_ca_mode_is_mutual_tls`). Pins-only clusters authenticate the server side only: the stdlib cannot demand a client certificate while skipping chain verification.
   - Default is plaintext, so run default clusters on trusted networks (LAN/Tailscale).
   - TLS has not been exercised on real multi-host clusters yet.
 - **RDMA/InfiniBand transport is not implemented** — zero-copy shared memory currently covers same-machine nodes only (see Async Tensor Forwarding above).

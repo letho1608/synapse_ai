@@ -5,7 +5,7 @@ Thay thế model_cards cũ bằng hệ thống registry linh hoạt hơn
 """
 
 from synapse.inference.shard import Shard
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id
 
 
@@ -112,13 +112,6 @@ def get_repo(model_id: str, inference_engine_classname: str) -> Optional[str]:
     return model_id
 
 
-def get_pretty_name(model_id: str) -> Optional[str]:
-    """Lấy tên đẹp của mô hình"""
-    if model_id not in _MODEL_REGISTRY:
-        return None
-    return _MODEL_REGISTRY[model_id].get("pretty_name", model_id)
-
-
 def build_base_shard(model_id: str, inference_engine_classname: str) -> Optional[Shard]:
     """
     Tạo base shard cho mô hình
@@ -182,32 +175,6 @@ def build_full_shard(model_id: str, inference_engine_classname: str) -> Optional
     if base_shard is None:
         return None
     return Shard(base_shard.model_id, 0, base_shard.n_layers - 1, base_shard.n_layers)
-
-
-def list_models() -> List[str]:
-    """Liệt kê tất cả mô hình"""
-    models = set(_MODEL_REGISTRY.keys())
-    models.update(HF_MODELS.values())
-    return sorted(list(models))
-
-
-def get_model_info(model_id: str) -> Optional[Dict[str, Any]]:
-    """Lấy thông tin mô hình"""
-    if model_id in _MODEL_REGISTRY:
-        return _MODEL_REGISTRY[model_id]
-    
-    # Don't resolve dummy test strings
-    if model_id == "__none__":
-        return None
-        
-    resolved = resolve_hf_id(model_id)
-    if resolved in HF_MODELS.values() or resolved in HF_MODELS:
-        # Tạo info cơ bản cho model từ HF
-        return {
-            "layers": HF_MODEL_LAYERS.get(resolved, 0),
-            "pretty_name": resolved
-        }
-    return None
 
 
 # ============================================================================
