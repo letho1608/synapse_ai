@@ -14,7 +14,6 @@ from synapse.transport.tls_wrap import (
     build_client_context,
     build_server_context,
     fingerprint_bytes,
-    maybe_wrap_socket,
     tls_enabled,
 )
 
@@ -26,11 +25,6 @@ def test_default_off_and_invalid_modes(monkeypatch):
     assert tls_enabled() == "require"
     monkeypatch.setenv("SYNAPSE_TLS", "BOGUS")
     assert tls_enabled() == "off"
-
-
-def test_passthrough_returns_same_object():
-    sock = object()
-    assert maybe_wrap_socket(sock, None) is sock
 
 
 def test_builders_refuse_missing_files_loudly(tmp_path):

@@ -108,13 +108,6 @@ def get_monitor() -> RealtimeMonitor:
     return _monitor
 
 
-async def ensure_monitor() -> RealtimeMonitor:
-    m = get_monitor()
-    if not m._running:
-        await m.start()
-    return m
-
-
 # ── blocking sampler (runs in thread) ───────────────────────────
 
 def _sample_blocking() -> NodeMetrics:

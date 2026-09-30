@@ -7,8 +7,7 @@ Additive, version-tolerant JSON — old peers ignore these topics entirely:
 - synapse/cluster/demand: {node_id, model_id, req_per_min (None = unknown,
   never 0-as-unknown), queue_depth, in_flight, ts}. Autoscale inputs.
 
-Tri-state honesty: shard_fits() returns True / False / None (unknown).
-A None gate never excludes a node; it only marks the decision unmeasured.
+Fit is decided by measured placement (layer_profiles.max_layers).
 Phase 1 is advisory-only (hints for status/topology --json); nothing here
 actuates partition or autoscale by itself.
 """
@@ -20,8 +19,6 @@ from typing import Any, Dict, List, Optional
 CAPABILITIES_TOPIC = "synapse/cluster/capabilities"
 DEMAND_TOPIC = "synapse/cluster/demand"
 
-# mesh-llm solo-fit headroom borrowed as a SOFT gate (never exclusion).
-VRAM_HEADROOM = 1.1
 MAX_STORE = 256  # cap per peer-store dict (hygiene)
 
 
@@ -93,19 +90,6 @@ def build_demand_doc(
         "in_flight": int(in_flight),
         "ts": time.time(),
     }
-
-
-def shard_fits(cap_doc: Dict[str, Any], layer_bytes,
-               num_layers, headroom: float = VRAM_HEADROOM):
-    """Soft fit-gate: True / False / None (unknown inputs)."""
-    try:
-        free = cap_doc.get("vram_free_mb")
-        if free is None or layer_bytes is None or num_layers is None:
-            return None
-        need_mb = float(layer_bytes) * int(num_layers) / (1024 * 1024)
-        return float(free) >= need_mb * float(headroom)
-    except (TypeError, ValueError):
-        return None
 
 
 def aggregate_demand(docs: List[Any]) -> Dict[str, Dict[str, Any]]:

@@ -64,10 +64,6 @@ class HFShardDownloader:
                 print(f"[HFShardDownloader] ensure_shard {shard.model_id} -> {hf_id}: {e}")
             return Path(".")
 
-    async def get_shard_download_status(self, inference_engine_name: str):
-        return
-        yield
-
 
 class PyTorchHFInferenceEngine(InferenceEngine):
     """Engine: load model từ Hugging Face, chạy inference (full hoặc theo layer range cho phân tán).

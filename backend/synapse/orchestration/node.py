@@ -141,6 +141,7 @@ class Node:
     self.event_router.subscribe("synapse/cluster/cache/clear", self.on_p2p_clear_cache)
     self.event_router.subscribe("synapse/cluster/status", self.on_p2p_status)
     self.event_router.subscribe(f"synapse/inference/tensor/{self.id}", self.on_p2p_tensor)
+    self.event_router.subscribe(f"synapse/checkpoint/replica/{self.id}", self.on_p2p_ckpt_replica)
     self.event_router.subscribe(f"synapse/inference/prompt/{self.id}", self.on_p2p_prompt)
     # C-W4: peer-sent training examples + opaque status had publishers but no
     # subscribers (black holes). Route them into enqueue_example/on_node_status.
@@ -1794,18 +1795,18 @@ class Node:
           
       return None
 
-  def _transport_counter(self):
-    """Lazy transport_selected counters (B3 observability, no __init__ churn)."""
-    counts = getattr(self, "_transport_counts", None)
-    if counts is None:
-      counts = {}
-      self._transport_counts = counts
-    return counts
+  @property
+  def transport_stats(self):
+    """transport_selected counters (B3 observability): route -> count."""
+    stats = getattr(self, "_transport_stats", None)
+    if stats is None:
+      from synapse.transport.router import TransportStats
+      stats = self._transport_stats = TransportStats()
+    return stats
 
   def _record_transport(self, route: str) -> None:
     try:
-      counts = self._transport_counter()
-      counts[route] = counts.get(route, 0) + 1
+      self.transport_stats.record(route)
     except Exception:
       pass
 
@@ -1818,6 +1819,10 @@ class Node:
     """
     try:
       meta = msg.metadata or {}
+      if meta.get("kind") == "ckpt_replica":
+        self._record_transport(via + ":ckpt-replica")
+        self._store_ckpt_replica(meta, msg.tensor)
+        return
       shard_d = meta.get("shard")
       if not isinstance(shard_d, dict):
         self._record_transport(via + ":drop-no-shard")
@@ -2145,6 +2150,106 @@ class Node:
     except Exception:
       pass
 
+  def _peer_compatible(self, node_id: str) -> bool:
+    """Handshake view (bridge.is_compatible): False only for a peer whose
+    bridge major version differs from ours; unknown peers are compatible."""
+    if node_id == self.id:
+      return True
+    bridge = getattr(getattr(self, "libp2p_node", None), "_bridge", None)
+    fn = getattr(bridge, "is_compatible", None)
+    try:
+      return bool(fn(node_id)) if callable(fn) else True
+    except Exception:
+      return True
+
+  def _replica_target(self) -> Optional[str]:
+    """The node that keeps our checkpoint replica: our pipeline successor
+    (next node in the current placement), else any other topology node."""
+    parts = self._authoritative_partitions or []
+    ids = [p.node_id for p in parts]
+    if self.id in ids and len(ids) > 1:
+      i = ids.index(self.id)
+      for k in range(1, len(ids)):
+        cand = ids[(i + k) % len(ids)]
+        if cand != self.id:
+          return cand
+    others = [nid for nid in self.topology.nodes if nid != self.id]
+    return sorted(others)[0] if others else None
+
+  async def _replicate_checkpoint(self, ckpt_path: str) -> Optional[str]:
+    """Ship a checkpoint we just wrote (JSON + shard weights) to the replica
+    target, so recovery works after THIS machine dies. Chunked TCP when the
+    peer advertised it (any size), else the event bridge (256 MiB cap).
+    SYNAPSE_CKPT_REPLICATE=0 turns it off. Returns the target id."""
+    import os as _os
+    if _os.getenv("SYNAPSE_CKPT_REPLICATE", "1") == "0":
+      return None
+    ft = getattr(self, "fault_tolerance", None)
+    target = self._replica_target()
+    if ft is None or not target or not self._peer_compatible(target):
+      return None
+    try:
+      meta, weights = await asyncio.get_running_loop().run_in_executor(
+        None, ft.export_replica, ckpt_path)
+      blob = encode_tensor(np.frombuffer(weights or b"\0", dtype=np.uint8)[:len(weights)],
+                           metadata=meta)
+      sent = await self._send_blob_tcp(target, blob)
+      if not sent:
+        await self.event_router.publish(f"synapse/checkpoint/replica/{target}", {"bin": blob})
+      self._record_transport("ckpt-replica:" + ("tcp-chunked" if sent else "bridge"))
+      if DEBUG >= 1:
+        print(f"[CKPT] replicated {_os.path.basename(ckpt_path)} "
+              f"({len(weights)} weight bytes) -> {target}")
+      return target
+    except Exception as e:
+      if DEBUG >= 1: print(f"[CKPT] replication to {target} failed: {e}")
+      return None
+
+  async def _send_blob_tcp(self, target_id: str, blob: bytes) -> bool:
+    """Send an encoded SYNP blob over chunked TCP if the peer advertised a
+    tensor port; False means the caller falls back to the bridge."""
+    tcp = getattr(self, "tcp_transport", None)
+    if tcp is None:
+      return False
+    addr = None
+    for p in (self.peers or []):
+      try:
+        if p.id() == target_id:
+          addr = p.addr()
+          break
+      except Exception:
+        pass
+    tcp_addr = self._peer_tcp_addr(target_id, addr)
+    if not tcp_addr:
+      return False
+    if tcp_addr not in tcp._peer_map:
+      tcp.register_peer(tcp_addr, target_id)
+    try:
+      return bool(await tcp.send_blob_chunked(tcp_addr, blob))
+    except Exception:
+      return False
+
+  def _store_ckpt_replica(self, meta, tensor) -> Optional[str]:
+    ft = getattr(self, "fault_tolerance", None)
+    if ft is None:
+      self._lazy_init_fault_tolerance()
+      ft = getattr(self, "fault_tolerance", None)
+    if ft is None:
+      return None
+    arr = np.asarray(tensor, dtype=np.uint8).reshape(-1)
+    path = ft.import_replica(meta, arr.tobytes())
+    if DEBUG >= 1:
+      print(f"[CKPT] {'stored' if path else 'REJECTED'} replica {meta.get('ckpt_name')} "
+            f"from {meta.get('from_node')}")
+    return path
+
+  async def on_p2p_ckpt_replica(self, event: Event):
+    data = event.data
+    if isinstance(data, dict) and "bin" in data:
+      tensor, meta = decode_tensor(data["bin"])
+      if (meta or {}).get("kind") == "ckpt_replica":
+        self._store_ckpt_replica(meta, tensor)
+
   def _node_alive(self, node_id: str) -> bool:
     """Heartbeat view of a node (used to detect a dead stage mid-request).
 
@@ -2182,7 +2287,7 @@ class Node:
     the surviving nodes."""
     model_id, n = base_shard.model_id, base_shard.n_layers
     alive = [nid for nid in self.topology.nodes.keys()
-             if nid not in exclude and self._node_alive(nid)]
+             if nid not in exclude and self._node_alive(nid) and self._peer_compatible(nid)]
     if not alive:
       return None
     stages = [(nid, sh.start_layer, sh.end_layer) for nid, sh in current]
@@ -2361,6 +2466,22 @@ class Node:
     else TFLOPS-proportional (default) or LACP multi-resource scoring."""
     num_layers = base_shard.n_layers if base_shard and base_shard.n_layers > 0 else 32
     model_id = base_shard.model_id if base_shard else ""
+    incompatible = [nid for nid in self.topology.nodes if not self._peer_compatible(nid)]
+    if incompatible and not getattr(self, "_compat_filtering", False):
+      # Fail closed: a peer whose bridge major version differs never gets
+      # layers (its wire format may not match ours).
+      if DEBUG >= 1:
+        print(f"[COMPAT] excluding incompatible peers from placement: {incompatible}")
+      from synapse.topology.topology import Topology
+      saved, sub_topo = self.topology, Topology()
+      for nid, caps in saved.nodes.items():
+        if nid not in incompatible:
+          sub_topo.update_node(nid, caps)
+      self.topology, self._compat_filtering = sub_topo, True
+      try:
+        return self._compute_lacp_partition(base_shard)
+      finally:
+        self.topology, self._compat_filtering = saved, False
     try:
       measured = self._measured_placement(base_shard)
     except Exception as e:
@@ -2467,24 +2588,32 @@ class Node:
                 pass
               if DEBUG >= 1:
                 print(f"[latency] probed {peer.id()}: {latency_ms:.1f}ms")
-          # Bandwidth probe (best-effort): real TCP echo round-trips over the
-          # peer's address. The measured value lands in _measured_bandwidth and
-          # is injected into every matrix entry built from the cache, so
-          # partitioner/election resource scores reflect real link capacity.
-          try:
-            entry = await asyncio.wait_for(
-              self._latency_prober.probe(peer.id(), peer.addr(), timeout=2.0),
-              timeout=3.0,
-            )
-            if entry and entry.bandwidth_mbps > 0:
-              self._measured_bandwidth[peer.id()] = entry.bandwidth_mbps
-              if DEBUG >= 1:
-                print(f"[latency] bandwidth to {peer.id()}: {entry.bandwidth_mbps:.1f} Mbps")
-          except Exception:
-            pass
         except (asyncio.TimeoutError, Exception) as e:
           if DEBUG >= 2:
             print(f"[latency] probe failed for {peer.id()}: {e}")
+      # Bandwidth (best-effort): real TCP echo round-trips to every peer at
+      # once (was one after another, so N slow peers cost N timeouts). The
+      # values land in _measured_bandwidth and feed every matrix built from
+      # the cache, so partition/election scores reflect real link capacity.
+      try:
+        targets = {}
+        for peer in self.peers:
+          try:
+            targets[peer.id()] = peer.addr()
+          except Exception:
+            pass
+        if targets:
+          bw = await asyncio.wait_for(
+            self._latency_prober.probe_all(self.id, targets, timeout=2.0), timeout=4.0)
+          for pid in targets:
+            entry = bw.get(self.id, pid)
+            if entry and entry.bandwidth_mbps > 0:
+              self._measured_bandwidth[pid] = entry.bandwidth_mbps
+              if DEBUG >= 1:
+                print(f"[latency] bandwidth to {pid}: {entry.bandwidth_mbps:.1f} Mbps")
+      except Exception as e:
+        if DEBUG >= 2:
+          print(f"[latency] bandwidth probe failed: {e}")
 
     # Bandwidth/latency probing is gated to at most once per 10 s: the
     # election scorer and the LACP partition path can call

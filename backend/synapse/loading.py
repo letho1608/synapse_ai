@@ -58,10 +58,6 @@ class ShardDownloader(ABC):
     async def ensure_shard(self, shard: Shard, inference_engine_name: str) -> Path:
         pass
 
-    @abstractmethod
-    async def get_shard_download_status(self, inference_engine_name: str):
-        pass
-
 
 def get_models_dir():
     if os.environ.get("SYNAPSE_MODELS_DIR"):

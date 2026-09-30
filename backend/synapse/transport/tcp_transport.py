@@ -192,6 +192,13 @@ class TCPClientPool:
                     timeout=self._connect_timeout,
                 )
                 writer = writer[1]
+                if self._ssl_ctx is not None:
+                    from synapse.transport.tls_wrap import check_peer_pin
+                    try:
+                        check_peer_pin(writer)
+                    except Exception:
+                        writer.close()
+                        raise
                 try:
                     sock = writer.get_extra_info("socket")
                     if sock is not None:

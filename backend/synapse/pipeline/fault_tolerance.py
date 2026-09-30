@@ -447,13 +447,66 @@ class FaultToleranceManager:
         except (OSError, ValueError):
             return None
 
-    def latest_manifest_step(self, node_id: str, model_id: str) -> Optional[int]:
-        """Newest step in the manifest index (G5 monotonicity source)."""
-        manifest = self.get_checkpoint_manifest(node_id, model_id)
-        if not manifest:
+
+    # ── Replication to a peer ──────────────────────────────
+    # A checkpoint written only on its own machine dies with that machine.
+    # The node ships each new checkpoint (JSON + shard weights file) to its
+    # pipeline successor, which stores it under the ORIGINAL node's filename:
+    # load_latest_checkpoint(dead_node) on the survivor then finds it.
+
+    def export_replica(self, ckpt_path: str):
+        """(meta, weights_bytes) for a checkpoint this node wrote."""
+        import hashlib
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        data = json.loads(text)
+        weights = b""
+        wpath = data.get("weights_path")
+        if wpath and os.path.isfile(wpath):
+            with open(wpath, "rb") as f:
+                weights = f.read()
+        meta = {
+            "kind": "ckpt_replica",
+            "from_node": self.node_id,
+            "ckpt_name": os.path.basename(ckpt_path),
+            "ckpt_json": text,
+            "sha256": self._sha256_text(text),
+            "weights_name": os.path.basename(wpath) if weights else None,
+            "weights_sha256": hashlib.sha256(weights).hexdigest() if weights else None,
+        }
+        return meta, weights
+
+    def import_replica(self, meta: Dict[str, Any], weights: bytes) -> Optional[str]:
+        """Verify and store a peer's checkpoint replica; returns its path.
+
+        Both hashes must match, every write stays inside checkpoint_dir, and
+        the stored JSON points weights_path at the local copy. A replica
+        never claims to be ours: node_id stays the writer's."""
+        import hashlib
+        text = meta.get("ckpt_json") or ""
+        if not text or meta.get("sha256") != self._sha256_text(text):
             return None
-        steps = [e.get("step") for e in manifest.get("files", []) if isinstance(e.get("step"), int)]
-        return max(steps) if steps else None
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        if data.get("node_id") != meta.get("from_node") or data.get("node_id") == self.node_id:
+            return None
+        if weights:
+            if meta.get("weights_sha256") != hashlib.sha256(weights).hexdigest():
+                return None
+            wdest = self._confine(meta.get("weights_name") or "replica.weights.pt")
+            tmp = wdest + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(weights)
+            os.replace(tmp, wdest)
+            data["weights_path"] = wdest
+        else:
+            data["weights_path"] = None
+        dest = self._confine(meta.get("ckpt_name") or "replica.ckpt")
+        data["checkpoint_path"] = dest
+        self._json_serialize(data, dest)
+        return dest
 
     def get_recovery_checkpoint(self, node_id: str) -> Optional[ShardCheckpoint]:
         """Return the cross-node checkpoint staged for a node during the last

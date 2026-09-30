@@ -72,9 +72,6 @@ class LACPPartition:
     method_used: str = ""
     solver_status: str = ""
 
-    @property
-    def total_nodes(self) -> int:
-        return len(self.assignments)
 
     def get_assignment(self, node_id: str) -> Optional[ShardAssignment]:
         for a in self.assignments:

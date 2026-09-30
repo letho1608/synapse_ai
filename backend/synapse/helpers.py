@@ -2,9 +2,8 @@ import os
 import sys
 import asyncio
 import hashlib
-from typing import Callable, TypeVar, Optional, Dict, Generic, Tuple, List
+from typing import Callable, TypeVar, Optional, Dict, Generic, Tuple
 import socket
-import random
 import psutil
 from pathlib import Path
 import tempfile
@@ -416,48 +415,6 @@ def check_model_hardware_fit(model_name: str) -> None:
     print(f"{'='*55}\n")
 
 
-def find_available_port(host: str = "", min_port: int = 49152, max_port: int = 65535) -> int:
-  used_ports_file = os.path.join(tempfile.gettempdir(), "synapse_used_ports")
-
-  def read_used_ports():
-    if os.path.exists(used_ports_file):
-      with open(used_ports_file, "r") as f:
-        return [int(line.strip()) for line in f if line.strip().isdigit()]
-    return []
-
-  def write_used_port(port, used_ports):
-    with open(used_ports_file, "w") as f:
-      for p in used_ports[-19:] + [port]:
-        f.write(f"{p}\n")
-
-  used_ports = read_used_ports()
-  available_ports = set(range(min_port, max_port + 1)) - set(used_ports)
-
-  while available_ports:
-    port = random.choice(list(available_ports))
-    if DEBUG >= 2: print(f"Trying to find available port {port=}")
-    try:
-      with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((host, port))
-      write_used_port(port, used_ports)
-      return port
-    except socket.error:
-      available_ports.remove(port)
-
-  raise RuntimeError("No available ports in the specified range")
-
-
-def terminal_link(uri, label=None):
-  if label is None:
-    label = uri
-  parameters = ""
-
-  # OSC 8 ; params ; URI ST <name> OSC 8 ;; ST
-  escape_mask = "\033]8;{};{}\033\\{}\033]8;;\033\\"
-
-  return escape_mask.format(parameters, uri, label)
-
-
 T = TypeVar("T")
 K = TypeVar("K")
 
@@ -501,9 +458,6 @@ class AsyncCallbackSystem(Generic[K, T]):
     if name in self.callbacks:
       del self.callbacks[name]
 
-  def trigger(self, name: K, *args: T) -> None:
-    if name in self.callbacks:
-      self.callbacks[name].set(*args)
 
   def trigger_all(self, *args: T) -> None:
     for callback in self.callbacks.values():
@@ -520,9 +474,6 @@ class PrefixDict(Generic[K, V]):
 
   def add(self, key: K, value: V) -> None:
     self.items[key] = value
-
-  def find_prefix(self, argument: str) -> List[Tuple[K, V]]:
-    return [(key, value) for key, value in self.items.items() if argument.startswith(key)]
 
 
 def get_or_create_node_id(port: int = None):

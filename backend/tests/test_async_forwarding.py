@@ -137,47 +137,6 @@ class TestAsyncForwarder:
 
         asyncio.run(run())
 
-    def test_ordered_reassembly(self):
-        fw = AsyncTensorForwarder("node-0")
-
-        # Simulate receiving batches out of order: 2, 0, 1
-        # Batch 2 arrives first → buffered (next expected is 0)
-        # Batch 0 arrives → delivered, next expected is 1
-        # Batch 1 is already buffered → delivered immediately
-        for batch_id in [2, 0, 1]:
-            t = np.array([batch_id], dtype=np.int64)
-            data = encode_tensor(t, metadata={
-                "request_id": "req-order",
-                "orchestrator_id": "orch",
-                "micro_batch_id": batch_id,
-                "source_stage": 0,
-                "target_stage": 1,
-            })
-
-            result = fw.receive("req-order", 0, data)
-
-            if batch_id == 2:
-                assert result is None, f"Batch 2 should be buffered (next expected is 0)"
-            elif batch_id == 0:
-                assert result is not None, f"Batch 0 should be delivered"
-                assert result.micro_batch_id == 0
-                # After delivering batch 0, next expected is 1
-                # But batch 1 hasn't arrived yet (we're still processing batch_id==0)
-            elif batch_id == 1:
-                assert result is not None, f"Batch 1 should be delivered immediately (arrived and was buffered, next expected was 1)"
-                assert result.micro_batch_id == 1
-
-    def test_flush_cleanup(self):
-        fw = AsyncTensorForwarder("node-0")
-        fw.register_writer("req-flush", 1, lambda d: None)
-        fw._reassembly["req-flush"] = {0: "test"}
-        fw._next_batch_id["req-flush"] = 5
-
-        fw.flush_request("req-flush")
-        assert "req-flush" not in fw._reassembly
-        assert "req-flush" not in fw._next_batch_id
-        assert ("req-flush", 1) not in fw._writers
-
     def test_send_to_unregistered_writer(self):
         fw = AsyncTensorForwarder("node-0")
         t = np.ones((5,), dtype=np.float32)
@@ -196,7 +155,3 @@ class TestAsyncForwarder:
 
         asyncio.run(run())
 
-    def test_unknown_source_returns_none(self):
-        fw = AsyncTensorForwarder("node-0")
-        result = fw.receive("req-x", 99, b"\x00" * 100)
-        assert result is None

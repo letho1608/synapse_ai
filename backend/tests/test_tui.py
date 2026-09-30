@@ -2,8 +2,8 @@
 Behavioral tests for the full-screen TUI (display layer only, no app run).
 
 The engine (resolve/dispatch/shell/doctor/export) is tested in
-test_console*.py; here we test the TUI wiring: toolbar text, completer
-coverage, palette values, and the stdout tee that feeds /export.
+test_console*.py; here we test the TUI wiring: palette values, the
+overlay list and the stdout tee that feeds /export.
 """
 import io
 
@@ -18,19 +18,6 @@ def _ctx(**kw):
                 model_short="SmolLM2", modes="")
     base.update(kw)
     return C.ConsoleCtx(**base)
-
-
-def test_toolbar_dead_api_never_raises(capsys):
-    T._bar_cache.update(line="", ts=0.0)
-    line = T.toolbar_line(_ctx())
-    assert "peers ?" in line and len(line) <= 80
-
-
-def test_completer_covers_every_command():
-    comp = T.build_completer()
-    words = comp.completer.words
-    for name in C.COMMANDS:
-        assert ("/" + name) in words
 
 
 def test_palette_lists_every_command():
@@ -74,18 +61,16 @@ def test_overlay_list_filter_navigate_render():
     items = [(n, "/%-10s  %s" % (n, C.COMMANDS[n][1])) for n in C.COMMANDS]
     lst = T.OverlayList(items)
     assert lst.current() == "status"
-    lst.type_char("topo")
+    lst.filter = "topo"  # the TUI's filter box writes this (_on_filter)
     assert lst.current() == "topology"
     assert any(r.startswith(">") and "topology" in r for r in lst.render_rows())
-    lst.backspace()
-    assert lst.filter == "top"
     lst2 = T.OverlayList(items)
     lst2.move(1)
     assert lst2.current() == "topology"
     lst2.move(-1)
     assert lst2.current() == "status"
     lst3 = T.OverlayList(items)
-    lst3.type_char("zzz-no-match")
+    lst3.filter = "zzz-no-match"
     assert lst3.current() is None
     assert lst3.render_rows() == ["  (no match)"]
 
@@ -375,3 +360,10 @@ def test_want_tui_logic(monkeypatch):
     assert C._want_tui(args) is False
     monkeypatch.delenv("SYNAPSE_LINE")
     assert C._want_tui(args) is True  # TTY + prompt_toolkit present
+
+
+def test_exec_command_quiet_mode_writes_nothing_to_the_terminal(monkeypatch, capsys):
+    monkeypatch.setattr(C, "cmd_status", lambda ns: print("api=ok") or 0)
+    keep, rc, out = T.exec_command("status", [], {"port": 1}, _ctx(), echo=False)
+    assert (keep, rc) == (True, 0) and "api=ok" in out
+    assert capsys.readouterr().out == ""

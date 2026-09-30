@@ -19,8 +19,8 @@ from typing import Dict, List, Optional, Tuple, Any, Callable
 from synapse.inference.shard import Shard
 from synapse.inference.inference_engine import InferenceEngine
 from synapse.pipeline.stage import StageResult
-from synapse.transport.codec import encode_tensor, AsyncTensorForwarder
-from synapse.transport.result_router import ResultRouter, RoutedResult
+from synapse.transport.codec import encode_tensor
+from synapse.transport.result_router import RoutedResult
 from synapse.helpers import DEBUG
 
 
@@ -152,7 +152,7 @@ class DistributedPipelineController:
     3. Creates PipelineStage per node, chains via AsyncTensorForwarder
     4. Executes pipeline via PipelineExecutor for efficient multi-batch
     5. Collects results from the last-stage node
-    6. Routes results to the orchestrator via ResultRouter
+    6. Awaits each step's result (subscribe before send) and streams verified tokens
     """
 
     def __init__(
@@ -160,13 +160,10 @@ class DistributedPipelineController:
         node_id: str,
         inference_engine: InferenceEngine,
         event_router: Any,
-        forwarder: Optional[AsyncTensorForwarder] = None,
     ):
         self.node_id = node_id
         self.inference_engine = inference_engine
         self.event_router = event_router
-        self.forwarder = forwarder or AsyncTensorForwarder(node_id)
-        self.result_router = ResultRouter(node_id)
         self._sessions: Dict[str, DistributedInferenceSession] = {}
         # request_id -> [[node_id, start, end, n_layers], ...] in stage order.
         self._plans: Dict[str, List[List[Any]]] = {}
@@ -180,11 +177,9 @@ class DistributedPipelineController:
 
     async def start(self) -> None:
         self._running = True
-        await self.result_router.start()
 
     async def stop(self) -> None:
         self._running = False
-        await self.result_router.stop()
 
     async def process_distributed_prompt(
         self,
@@ -242,9 +237,6 @@ class DistributedPipelineController:
             [nid, int(sh.start_layer), int(sh.end_layer), int(sh.n_layers)]
             for nid, sh in partition_assignments
         ]
-
-        if on_token_callback:
-            self.result_router.register_token_callback(request_id, on_token_callback)
 
         all_generated_tokens: List[int] = []
 
@@ -347,7 +339,6 @@ class DistributedPipelineController:
             self._sessions.pop(request_id, None)
             self._plans.pop(request_id, None)
             self._sampling.pop(request_id, None)
-            self.result_router.unregister_token_callback(request_id)
             # Clear KV cache on all nodes
             await self.event_router.publish(
                 "synapse/cluster/cache/clear",

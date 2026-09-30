@@ -1,5 +1,4 @@
 #Dataset utilities for training
-import asyncio
 from pathlib import Path
 import numpy as np
 import json
@@ -63,23 +62,6 @@ class Dataset:
 
   def __len__(self):
     return len(self._data)
-
-  @classmethod
-  async def from_path_async(cls, path: Path, preprocess=lambda item: item, loadline=json.loads):
-    """Async version - loads file I/O in thread executor."""
-    loop = asyncio.get_event_loop()
-    def _load():
-      with open(path, "r") as fid:
-        data = [loadline(l) for l in fid]
-      maxlen = max(len(preprocess(x)) for x in data)
-      return data, maxlen
-    result = await loop.run_in_executor(None, _load)
-    data, maxlen = result
-    instance = cls.__new__(cls)
-    instance._data = data
-    instance.preprocess = preprocess
-    instance._maxlen = maxlen
-    return instance
 
 
 def load_dataset(data_path: str, preprocess=lambda i: i, loadline=json.loads):

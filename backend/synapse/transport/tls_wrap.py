@@ -52,8 +52,8 @@ def build_server_context(certfile: str, keyfile: str) -> ssl.SSLContext:
 
 
 def build_client_context(cafile: Optional[str] = None) -> ssl.SSLContext:
-    """TLS client context. Unverified only when cafile is None AND the
-    caller pins via fingerprint (enforced at the call site, not here)."""
+    """TLS client context. Without a CA the chain is not verified here; the
+    connection sites authenticate the server with check_peer_pin()."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     if cafile:
@@ -64,11 +64,6 @@ def build_client_context(cafile: Optional[str] = None) -> ssl.SSLContext:
     else:
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
-
-
-def maybe_wrap_socket(sock, ctx: Optional[ssl.SSLContext]):
-    """Pass-through when ctx is None (default-off byte-identical path)."""
-    return sock
 
 
 def gen_self_signed_cert(common_name: str = "localhost",
@@ -107,3 +102,79 @@ def gen_self_signed_cert(common_name: str = "localhost",
         serialization.PrivateFormat.TraditionalOpenSSL,
         serialization.NoEncryption())
     return cert_pem, key_pem
+
+
+# ── Wiring: pins, self-signed bring-up, startup config ───────────────────
+
+def cert_fingerprint_pem(cert_pem: bytes) -> str:
+    """Pin of a PEM cert, computed over its DER form: the same bytes a peer
+    sees in the TLS handshake (getpeercert(binary_form=True))."""
+    der = ssl.PEM_cert_to_DER_cert(cert_pem.decode("ascii"))
+    return fingerprint_bytes(der)
+
+
+def allowed_pins() -> set:
+    """SYNAPSE_TLS_PINS: comma-separated sha256 cert pins (hex)."""
+    raw = os.getenv("SYNAPSE_TLS_PINS", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+def check_peer_pin(writer, pins=None) -> str:
+    """Verify the server cert on a client TLS connection against the pins.
+
+    With no CA, a TLS client (CERT_NONE) encrypts but does not know WHO it
+    talks to; the pin is what authenticates the peer. No-op for plaintext
+    connections and when no pins are configured (CA mode). Raises
+    ssl.SSLError on a mismatch. Returns the peer fingerprint ("" if none)."""
+    pins = allowed_pins() if pins is None else pins
+    obj = writer.get_extra_info("ssl_object") if writer is not None else None
+    if obj is None:
+        return ""
+    der = obj.getpeercert(binary_form=True)
+    fp = fingerprint_bytes(der) if der else ""
+    if pins and fp not in pins:
+        raise ssl.SSLError("peer certificate %s... is not pinned (SYNAPSE_TLS_PINS)" % fp[:16])
+    return fp
+
+
+def ensure_self_signed(node_id: str, directory: Optional[str] = None):
+    """(cert_path, key_path) for SYNAPSE_TLS=selfsigned without provisioned
+    files: generated once per node id under ~/.synapse/tls and reused."""
+    directory = directory or os.path.join(os.path.expanduser("~"), ".synapse", "tls")
+    os.makedirs(directory, exist_ok=True)
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in node_id) or "node"
+    cert_path = os.path.join(directory, safe + ".cert.pem")
+    key_path = os.path.join(directory, safe + ".key.pem")
+    if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
+        cert_pem, key_pem = gen_self_signed_cert(common_name=safe)
+        with open(key_path, "wb") as f:
+            f.write(key_pem)
+        with open(cert_path, "wb") as f:
+            f.write(cert_pem)
+    return cert_path, key_path
+
+
+def configure_from_env(node_id: str):
+    """(server_ctx, client_ctx, own_pin) from SYNAPSE_TLS*, or Nones when off.
+
+    - selfsigned: SYNAPSE_TLS_CERT/KEY if given, else a generated per-node
+      cert; peers are authenticated by SYNAPSE_TLS_PINS (or a CA if set).
+    - require: provisioned cert/key, and a CA or pins MUST be configured:
+      TLS without either authenticates nobody, so it is refused loudly.
+    Missing files always fail loud; nothing falls back to plaintext."""
+    mode = tls_enabled()
+    if mode == "off":
+        return None, None, None
+    cert = os.getenv("SYNAPSE_TLS_CERT", "")
+    key = os.getenv("SYNAPSE_TLS_KEY", "")
+    ca = os.getenv("SYNAPSE_TLS_CA", "") or None
+    if mode == "selfsigned" and not (cert or key):
+        cert, key = ensure_self_signed(node_id)
+    if mode == "require" and not ca and not allowed_pins():
+        raise ValueError("SYNAPSE_TLS=require needs SYNAPSE_TLS_CA or SYNAPSE_TLS_PINS: "
+                         "without either no peer is authenticated")
+    server_ctx = build_server_context(cert, key)
+    client_ctx = build_client_context(cafile=ca)
+    with open(cert, "rb") as f:
+        own_pin = cert_fingerprint_pem(f.read())
+    return server_ctx, client_ctx, own_pin

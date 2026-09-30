@@ -23,9 +23,8 @@ import asyncio
 import struct
 import time
 import zlib
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 import numpy as np
 
 # ──────────────────────────────────────────────────────────
@@ -415,15 +414,9 @@ class AsyncTensorForwarder:
         # Outbound: write function per (request_id, target_stage)
         self._writers: Dict[Tuple[str, int], callable] = {}
 
-        # Inbound: queue per (request_id, source_stage)
-        self._queues: Dict[Tuple[str, int], Deque[TensorMessage]] = {}
-
         # Backpressure semaphores
         self._send_semaphore = asyncio.Semaphore(max_queue_depth)
 
-        # Ordered reassembly buffers
-        self._reassembly: Dict[str, Dict[int, TensorMessage]] = {}
-        self._next_batch_id: Dict[str, int] = {}
 
     def register_writer(
         self, request_id: str, stage_id: int,
@@ -431,8 +424,6 @@ class AsyncTensorForwarder:
     ):
         """Register a writer for sending tensors to a specific stage."""
         self._writers[(request_id, stage_id)] = writer_fn
-        if (request_id, stage_id) not in self._queues:
-            self._queues[(request_id, stage_id)] = deque()
 
 
     async def send(
@@ -507,56 +498,3 @@ class AsyncTensorForwarder:
             metadata=metadata,
         )
 
-    def receive(
-        self, request_id: str, source_stage: int, data: bytes,
-    ) -> Optional[TensorMessage]:
-        """
-        Process an incoming tensor packet. Returns a TensorMessage if
-        this is the next expected micro-batch in sequence, or None if
-        it was buffered for later reassembly.
-        """
-        try:
-            tensor, metadata = decode_tensor(data)
-        except (ValueError, struct.error):
-            return None
-
-        if not metadata:
-            return None
-
-        msg = TensorMessage(
-            request_id=metadata.get("request_id", request_id),
-            orchestrator_id=metadata.get("orchestrator_id", ""),
-            micro_batch_id=metadata.get("micro_batch_id", 0),
-            source_stage=metadata.get("source_stage", 0),
-            target_stage=metadata.get("target_stage", 0),
-            tensor=tensor,
-            metadata=metadata,
-        )
-
-        # Buffer for ordered reassembly
-        if request_id not in self._reassembly:
-            self._reassembly[request_id] = {}
-            self._next_batch_id[request_id] = 0
-
-        self._reassembly[request_id][msg.micro_batch_id] = msg
-
-        # Return the next in-order batch if available
-        next_id = self._next_batch_id[request_id]
-        if next_id in self._reassembly[request_id]:
-            result = self._reassembly[request_id].pop(next_id)
-            self._next_batch_id[request_id] = next_id + 1
-            return result
-
-        return None
-
-    def flush_request(self, request_id: str):
-        """Clean up all state for a completed request."""
-        self._reassembly.pop(request_id, None)
-        self._next_batch_id.pop(request_id, None)
-        # Clean up writer/queue registrations
-        keys_to_remove = [
-            k for k in self._writers if k[0] == request_id
-        ]
-        for k in keys_to_remove:
-            self._writers.pop(k, None)
-            self._queues.pop(k, None)

@@ -152,20 +152,11 @@ event_router = EventRouter()
 # Item 5: TLS activation (default OFF = plaintext, byte-identical).
 # SYNAPSE_TLS=require|selfsigned + SYNAPSE_TLS_CERT/KEY(/CA): contexts are
 # built here and fail LOUD on missing files (never silent plaintext).
-_tls_mode = os.getenv("SYNAPSE_TLS", "off").strip().lower()
-_tls_server_ctx = _tls_client_ctx = _tls_fp = None
-if _tls_mode in ("selfsigned", "require"):
-    from synapse.transport.tls_wrap import (
-        build_client_context, build_server_context, fingerprint_bytes)
-    _tls_cert = os.getenv("SYNAPSE_TLS_CERT", "")
-    _tls_key = os.getenv("SYNAPSE_TLS_KEY", "")
-    _tls_ca = os.getenv("SYNAPSE_TLS_CA", "")
-    _tls_server_ctx = build_server_context(_tls_cert, _tls_key)
-    _tls_client_ctx = build_client_context(cafile=_tls_ca or None)
-    with open(_tls_cert, "rb") as _f:
-        _tls_fp = fingerprint_bytes(_f.read())
-    if DEBUG >= 1:
-        print(f"[TLS] mode={_tls_mode} fp={(_tls_fp or '')[:16]}...")
+from synapse.transport.tls_wrap import configure_from_env as _tls_configure, tls_enabled as _tls_enabled
+_tls_mode = _tls_enabled()
+_tls_server_ctx, _tls_client_ctx, _tls_fp = _tls_configure(args.node_id)
+if _tls_fp and DEBUG >= 1:
+  print(f"[TLS] mode={_tls_mode} pin={_tls_fp} (share it in peers' SYNAPSE_TLS_PINS)")
 # C-W3: --node-host actually binds the P2P listener now (was parsed, ignored).
 libp2p_node = Libp2pNode(args.node_id, args.node_port or 5678, event_router,
                          host=args.node_host or "0.0.0.0",

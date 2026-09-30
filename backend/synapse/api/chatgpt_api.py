@@ -19,7 +19,7 @@ import signal
 from synapse import DEBUG, VERSION
 from synapse.terminal_log import get_lines as get_terminal_log_lines
 from synapse.helpers import PrefixDict, shutdown, get_all_ip_addresses_and_interfaces
-from synapse.networking.tailscale.tailscale_helpers import get_synapse_api_urls_from_node_list, get_self_tailscale_info
+from synapse.networking.tailscale.tailscale_helpers import get_self_tailscale_info
 from synapse.orchestration import Node
 from synapse.model_list import HF_MODELS, HF_MODEL_PARAMS, resolve_hf_id  # Danh sách + metadata cho web UI
 from typing import Callable
@@ -624,20 +624,6 @@ class ChatGPTAPI:
 
     return middleware
 
-  async def _safe_write(self, response, data: bytes) -> bool:
-    """
-    Safely write data to response stream, handling client disconnections.
-    Returns True if write was successful, False if client disconnected.
-    """
-    try:
-      await response.write(data)
-      return True
-    except (ClientConnectionResetError, ConnectionResetError, OSError, TypeError) as e:
-      if DEBUG >= 2: print(f"Client disconnected during write: {e}")
-      return False
-    except Exception as e:
-      if DEBUG >= 2: print(f"Unexpected error during write: {e}")
-      return False
 
   async def handle_root(self, request):
     # T2.1 --headless (via SYNAPSE_HEADLESS=1, set by `synapse serve
@@ -727,31 +713,6 @@ class ChatGPTAPI:
       payload["inference_ready"] = False
       payload["model_loaded"] = False
     return web.json_response(payload)
-
-
-  async def _get_synapse_api_urls(self) -> List[str]:
-    """Danh sách Synapse API URL của các node khác (để training phân tán). Loại trừ máy này."""
-    self_ips: Set[str] = set()
-    try:
-      for ip, _ in get_all_ip_addresses_and_interfaces():
-        if ip:
-          self_ips.add(ip.strip())
-      self_ips.add("127.0.0.1")
-      self_ips.add("localhost")
-    except Exception:
-      pass
-    try:
-      nodes: List[Dict] = await self.node.get_tailscale_nodes()
-      return get_synapse_api_urls_from_node_list(
-        nodes,
-        api_port=self.chatgpt_api_port,
-        only_synapse_nodes=True,
-        exclude_ips=self_ips,
-      )
-    except Exception as e:
-      if DEBUG >= 1:
-        print(f"_get_synapse_api_urls: {e}")
-    return []
 
 
   async def handle_get_models(self, request):
@@ -1557,9 +1518,10 @@ class ChatGPTAPI:
           hints = getattr(node, "_last_autoscale_hints", None)
           if hints:
             payload["autoscale_hints"] = hints
-          counts = getattr(node, "_transport_counts", None)
+          stats = getattr(node, "transport_stats", None)
+          counts = stats.snapshot() if stats is not None else {}
           if counts:
-            payload["transport_counts"] = dict(counts)
+            payload["transport_counts"] = counts
           eng = getattr(node, "inference_engine", None)
           prof = getattr(eng, "_hw_profile", None)
           if isinstance(prof, dict):

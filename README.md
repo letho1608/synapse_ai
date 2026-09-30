@@ -171,11 +171,27 @@ Speedup is measured against the same workload on 1 node (pipeline-parallel infer
 
 ## Known Limitations
 
-- **TLS between nodes is opt-in.** `SYNAPSE_TLS=selfsigned|require` with `SYNAPSE_TLS_CERT`/`SYNAPSE_TLS_KEY` (optional `SYNAPSE_TLS_CA`) wraps both the event bridge and the chunked TCP tensor path (verified on loopback by `test_tls_interop.py` and `test_tcp_tls.py`; a plaintext client cannot inject into a TLS node); missing cert files fail loudly instead of downgrading. Default is plaintext, so run default clusters on trusted networks (LAN/Tailscale). TLS on real multi-host clusters has not been exercised yet.
+- **TLS between nodes is opt-in, and authenticated.** Setting `SYNAPSE_TLS=selfsigned|require` wraps both the event bridge and the chunked TCP tensor path.
+  - Peers are authenticated by a CA (`SYNAPSE_TLS_CA`) or by sha256 certificate pins (`SYNAPSE_TLS_PINS`). With pins, every client connection checks the server certificate against them, on the bridge and on the tensor path (`test_tls_interop.py`).
+  - Without a CA, the old code encrypted to whoever answered: the advertised `tls_fp` was never checked.
+  - `require` refuses to start without a CA or pins.
+  - `selfsigned` generates a per-node cert in `~/.synapse/tls` when `SYNAPSE_TLS_CERT`/`KEY` are not given. Each node logs its pin for the peers' `SYNAPSE_TLS_PINS`.
+  - Missing files fail loudly; nothing falls back to plaintext.
+  - Clients do not present certificates (no mutual TLS).
+  - Default is plaintext, so run default clusters on trusted networks (LAN/Tailscale).
+  - TLS has not been exercised on real multi-host clusters yet.
 - **RDMA/InfiniBand transport is not implemented** — zero-copy shared memory currently covers same-machine nodes only (see Async Tensor Forwarding above).
-- **Checkpoint recovery is wired into distributed training and rebalancing.** Every distributed training step persists a JSON metadata checkpoint (model id, shard layer range, step) plus a sidecar manifest (`{node}_{model}.manifest.json`, sha256, last 10); every `SYNAPSE_CKPT_WEIGHTS_EVERY` steps (default 10, 0 = off) the node also writes its shard's layer weights (`*.weights.pt`, only its own layers) and the JSON records `weights_path`/`weights_step`. On failover the survivor restores exactly the dead node's layer range from that file into its loaded model (verified by `test_shard_weights_restore.py`: layer hashes match, other layers untouched, partial coverage refused). Weights can be up to N-1 steps older than the metadata step. Checkpoints (JSON metadata and weights) stay on the machine that wrote them, in `~/.synapse/checkpoints` or `SYNAPSE_CHECKPOINT_DIR`. Once that node is dead they are unreachable, so cross-machine restore needs `SYNAPSE_CHECKPOINT_DIR` on shared storage. Proactive replication to a peer is not implemented; the earlier "pull from the dead node" path could never work and was removed. Inference does not depend on this: any node reloads layers from the model checkpoint (see failover). Without either, the restore returns False and the rebalance is flagged degraded (`_last_recovery_degraded`) instead of silently resuming from scratch.
+- **Checkpoint recovery is wired into distributed training and rebalancing, and survives the loss of the writing machine.**
+  - Every distributed training step writes a JSON metadata checkpoint plus a sha256 manifest.
+  - Every `SYNAPSE_CKPT_WEIGHTS_EVERY` steps (default 10) it also writes the shard's layer weights.
+  - Each new checkpoint (JSON + weights) is replicated to the node's pipeline successor, over chunked TCP when the peer advertises it, else over the bridge (`SYNAPSE_CKPT_REPLICATE=0` turns this off).
+  - The receiver verifies both hashes, confines the writes to its checkpoint dir, and stores the replica under the writer's name. After the writer dies, `load_latest_checkpoint(dead)` on the survivor finds it and the survivor restores that layer range (`test_wiring_compat_replica.py`, `test_shard_weights_restore.py`).
+  - Checkpoints live in `~/.synapse/checkpoints` or `SYNAPSE_CHECKPOINT_DIR`.
+  - Weights can be up to N-1 steps older than the metadata step.
 - **Wire transport is tiered.** The chunked binary TCP path (1 MiB frames, any blob size, 4 GiB admission, 30 s reassembly timeout) and the TCP/SHM auto-router are on by default and fall back to the JSON event bridge (256 MiB cap, explicit `frame_too_large`) on any failure; `SYNAPSE_CHUNKED_TCP=0` restores bridge-only (verified by `test_tcp_chunked_transfer.py`, incl. a 130 MiB blob). Bridge sockets set TCP_NODELAY both directions. Inter-stage hidden states travel as INT8 by default: one scale per row plus the 8 largest-magnitude values per row carried exactly, sent only to peers whose handshake advertises `q8row1` (older peers get exact dtype); `SYNAPSE_TRANSPORT_INT8=0` restores exact transport. Quality gate on the default model (SmolLM2-135M-Instruct, 2- and 3-stage splits, 6 prompts, teacher-forced): top-1 next-token agreement 100%, KL ≈ 5e-5 (`test_int8_quality.py`); payload ≈ 3.6× smaller than fp32 at hidden size 576.
-- **Handshakes are versioned.** Bridges exchange `synapse_version`/`bridge_version`/`caps_hash`/`features`; major mismatch fails closed via `is_compatible()` (verified by `test_handshake_compat.py` both directions). Mixed-version pipeline refusal at the node layer and the `--version` CLI are wired; capability/demand gossip publishes advisory-only docs every ~5th heartbeat (tri-state fit, unknown rates excluded, never actuating).
+- **Handshakes are versioned and enforced.** Bridges exchange `synapse_version`, `bridge_version`, `caps_hash` and `features`.
+  - A peer whose bridge major version differs from ours is excluded from placement, from failover plans and from checkpoint replication (`_peer_compatible` → `bridge.is_compatible`; `test_wiring_compat_replica.py`, `test_handshake_compat.py`).
+  - Capability/demand gossip also carries layer profiles and loaded layers.
 - **CLI-first terminal surface exists.** `python main.py console|serve|join|client|status|topology|models|benchmark [--json] [--port N]` (verified by `test_cli.py`, `test_console.py`); `console` is the interactive TUI shell (see `UI.md`). `--log-format json` emits JSONL backend logs and `--headless` turns `GET /` into a 204 liveness stub. Launchers pass `SYNAPSE_PARENT_PID`, so the backend exits if its launcher is killed (no orphan holding ports).
 - **Decode reuses a per-request KV cache on every stage.**
   - Each stage keeps a KV cache per request and shard range.
@@ -213,6 +229,9 @@ Speedup is measured against the same workload on 1 node (pipeline-parallel infer
 | `SYNAPSE_SEQ_KV` | `1` | Full-context KV reuse |
 | `SYNAPSE_CHUNKED_TCP` | `1` | Chunked binary TCP tensor path |
 | `SYNAPSE_TLS` | off | `selfsigned` / `require` |
+| `SYNAPSE_TLS_PINS` | — | Comma-separated sha256 cert pins that authenticate peers |
+| `SYNAPSE_CKPT_REPLICATE` | `1` | Replicate training checkpoints to the pipeline successor |
+| `SYNAPSE_CHECKPOINT_DIR` | `~/.synapse/checkpoints` | Where checkpoints and replicas are stored |
 
 ## Installation
 

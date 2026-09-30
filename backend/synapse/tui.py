@@ -72,15 +72,6 @@ def _bar_data(ctx):
         return ctx.node_label, "?"
 
 
-def toolbar_line(ctx) -> str:
-    """Pinned bottom-bar text. Never raises."""
-    try:
-        node, peers = _bar_data(ctx)
-        return C.build_bar_line(node, peers, ctx.model_short, ctx.modes)
-    except Exception:
-        return "node | peers ?"
-
-
 def _panel_text(ctx, state, log_tail=8, width=38):
     """Right ops panel content (pure, tested). Lines fit the panel width."""
     node, peers = _bar_data(ctx)
@@ -221,14 +212,6 @@ def menu_fragments(rows, index, name_width=11, max_rows=10, more_hint="keep typi
     elif out:
         out.pop()
     return out
-
-
-def build_completer():
-    """Fuzzy /slash completer with one-line descriptions."""
-    from prompt_toolkit.completion import FuzzyCompleter, WordCompleter
-    words = ["/" + n for n in C.COMMANDS]
-    meta = {"/" + n: desc for n, (_, desc) in C.COMMANDS.items()}
-    return FuzzyCompleter(WordCompleter(words, meta_dict=meta))
 
 
 def pick_values():
@@ -505,12 +488,13 @@ class _NullWriter:
         return False
 
 
-def exec_command(name, argv, defaults, ctx):
+def exec_command(name, argv, defaults, ctx, echo=True):
     """Run one dispatch with output teed. Returns (keep, rc, text).
 
-    KeyboardInterrupt (Ctrl+C during the command) keeps the session.
-    """
-    tee = Tee(sys.stdout)
+    echo=False keeps everything off the real terminal (the full-screen TUI
+    renders the text itself). KeyboardInterrupt (Ctrl+C during the command)
+    keeps the session."""
+    tee = Tee(sys.stdout if echo else _NullWriter())
     old = sys.stdout
     sys.stdout = tee
     try:
@@ -518,21 +502,6 @@ def exec_command(name, argv, defaults, ctx):
     except KeyboardInterrupt:
         keep, rc = True, 130
         print("\n(interrupted — session kept, /quit to leave)")
-    finally:
-        sys.stdout = old
-    return keep, rc, tee.text
-
-
-def exec_quiet(name, argv, defaults, ctx):
-    """Same as exec_command but nothing reaches the real terminal."""
-    tee = Tee(_NullWriter())
-    old = sys.stdout
-    sys.stdout = tee
-    try:
-        keep, rc = C.dispatch(name, argv, defaults, ctx)
-    except KeyboardInterrupt:
-        keep, rc = True, 130
-        tee.write("\n(interrupted — session kept, /quit to leave)\n")
     finally:
         sys.stdout = old
     return keep, rc, tee.text
@@ -558,14 +527,6 @@ class OverlayList:
     def move(self, delta):
         n = max(1, len(self.filtered()))
         self.index = (self.index + delta) % n
-
-    def type_char(self, ch):
-        self.filter += ch
-        self.index = 0
-
-    def backspace(self):
-        self.filter = self.filter[:-1]
-        self.index = 0
 
     def current(self):
         rows = self.filtered()
@@ -861,7 +822,7 @@ def _build_ui(args, ctx, proc, log_q, loop=None, app_input=None, app_output=None
         C.confirm = tui_confirm
         try:
             keep, rc, out = await loop.run_in_executor(
-                None, partial(exec_quiet, name, argv, defaults, ctx))
+                None, partial(exec_command, name, argv, defaults, ctx, echo=False))
         except _Cancelled:
             keep, rc, out = True, 130, "(ngắt — phiên còn)"
         except Exception as e:

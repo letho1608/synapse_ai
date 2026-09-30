@@ -3,7 +3,6 @@ Model Merging - Hợp nhất nhiều mô hình/LoRA adapters.
 Hỗ trợ Linear Merging, SLERP, và Ties-Merging.
 """
 
-import os
 import time
 import torch
 from typing import List, Dict, Optional, Any
@@ -93,64 +92,3 @@ def merge_lora_adapters(
             "error": str(e)
         }
 
-def merge_models_checkpoints(
-    model_paths: List[str],
-    output_path: str,
-    weights: Optional[List[float]] = None
-) -> Dict[str, Any]:
-    """
-    Hợp nhất các full model checkpoints bằng cách trung bình trọng số (Weight Averaging).
-    """
-    start_time = time.time()
-    try:
-        if not model_paths:
-            return {"success": False, "error": "No models to merge"}
-            
-        if weights is None:
-            weights = [1.0 / len(model_paths)] * len(model_paths)
-            
-        print(f"[Merging] Merging {len(model_paths)} models...")
-        
-        # Load first model state dict
-        first_sd = torch.load(os.path.join(model_paths[0], "pytorch_model.bin"), map_location="cpu")
-        merged_sd = {k: v * weights[0] for k, v in first_sd.items()}
-        del first_sd
-        
-        for i in range(1, len(model_paths)):
-            print(f"[Merging] Processing model {i+1}...")
-            sd = torch.load(os.path.join(model_paths[i], "pytorch_model.bin"), map_location="cpu")
-            for k, v in sd.items():
-                if k in merged_sd:
-                    merged_sd[k] += v * weights[i]
-            del sd
-            
-        # Save merged state dict
-        os.makedirs(output_path, exist_ok=True)
-        torch.save(merged_sd, os.path.join(output_path, "pytorch_model.bin"))
-        
-        # Copy config files from first model
-        import shutil
-        for item in os.listdir(model_paths[0]):
-            if item != "pytorch_model.bin":
-                s = os.path.join(model_paths[0], item)
-                d = os.path.join(output_path, item)
-                if os.path.isdir(s):
-                    shutil.copytree(s, d, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(s, d)
-                    
-        duration = time.time() - start_time
-        return {
-            "success": True,
-            "output_path": output_path,
-            "duration_sec": round(duration, 2),
-            "message": f"Successfully merged {len(model_paths)} full models in {duration:.1f}s"
-        }
-    except Exception as e:
-        if DEBUG >= 1:
-            import traceback
-            traceback.print_exc()
-        return {
-            "success": False,
-            "error": str(e)
-        }

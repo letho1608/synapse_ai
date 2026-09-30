@@ -182,7 +182,7 @@ class DistributedPipelineExtension:
             self._checkpoint_steps[base_shard.model_id] = step
             weights_path, weights_step = self._maybe_save_shard_weights(
                 base_shard.model_id, local, step)
-            node.fault_tolerance.save_checkpoint(
+            ckpt_path = node.fault_tolerance.save_checkpoint(
                 base_shard.model_id,
                 local.start_layer,
                 local.end_layer,
@@ -191,6 +191,10 @@ class DistributedPipelineExtension:
                 weights_path=weights_path,
                 weights_step=weights_step,
             )
+            replicate = getattr(node, "_replicate_checkpoint", None)
+            if callable(replicate) and ckpt_path:
+                # Survives the loss of THIS machine: a copy on the successor.
+                node._schedule_task(replicate(ckpt_path), "ckpt_replicate")
         except Exception as e:
             _log.warning(
                 "checkpoint write failed for %s (step %s): %s",

@@ -4,7 +4,7 @@ Test LACP — Distributed Pipeline Integration
 Validates:
 1. PipelineStage executes forward passes correctly
 2. PipelineExecutor orchestrates multi-stage inference
-3. ResultRouter delivers out-of-order results in order
+3. (ResultRouter removed: results are awaited per step, see TestResultWaiter)
 4. DistributedPipelineController coordinates inter-node inference
 5. DistributedPipelineExtension integrates with Node class
 6. Node._build_latency_matrix produces real matrix from peers
@@ -15,7 +15,6 @@ import pytest
 import sys
 import os
 import asyncio
-import time
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,17 +22,10 @@ from synapse.pipeline.stage import (
     PipelineStage,
     PipelineExecutor,
     StageResult,
-    StageStats,
 )
 from synapse.pipeline.scheduler import (
-    PipelineScheduler,
     MicroBatch,
-    MicroBatchOp,
-    PipelineSlot,
-    PipelineSchedule,
 )
-from synapse.transport.result_router import ResultRouter, RoutedResult, ResultBuffer
-from synapse.transport.codec import encode_tensor, decode_tensor, TensorMessage
 from synapse.routing.event_router import EventRouter
 
 
@@ -212,129 +204,6 @@ class TestPipelineExecutor:
         )
         assert len(results) == 1
         assert np.array_equal(results[0], np.array([1.0, 2.0]))
-
-
-class TestResultRouter:
-    @pytest.mark.asyncio
-    async def test_in_order_delivery(self):
-        router = ResultRouter("node-0")
-        await router.start()
-        try:
-            delivered = []
-            def on_token(rid, tokens, finished):
-                if tokens or finished:
-                    delivered.append((tokens, finished))
-
-            router.register_token_callback("req-1", on_token)
-
-            r0 = RoutedResult(
-                request_id="req-1", orchestrator_id="node-0", micro_batch_id=0,
-                source_stage_id=0, tokens=[1, 2, 3], is_finished=False,
-            )
-            r1 = RoutedResult(
-                request_id="req-1", orchestrator_id="node-0", micro_batch_id=1,
-                source_stage_id=0, tokens=[4, 5, 6], is_finished=True,
-            )
-
-            router.receive_result(r0)
-            router.receive_result(r1)
-
-            assert len(delivered) == 2
-            assert delivered[0][0] == [1, 2, 3]
-            assert delivered[0][1] is False
-            assert delivered[1][0] == [4, 5, 6]
-            assert delivered[1][1] is True
-        finally:
-            await router.stop()
-
-    @pytest.mark.asyncio
-    async def test_out_of_order_reassembly(self):
-        router = ResultRouter("node-0")
-        await router.start()
-        try:
-            delivered = []
-            def on_token(rid, tokens, finished):
-                delivered.append(tokens)
-
-            router.register_token_callback("req-reorder", on_token)
-
-            r2 = RoutedResult(
-                request_id="req-reorder", orchestrator_id="node-0",
-                micro_batch_id=2, source_stage_id=0, tokens=[7, 8], is_finished=False,
-            )
-            router.receive_result(r2)
-            assert len(delivered) == 0
-
-            r0 = RoutedResult(
-                request_id="req-reorder", orchestrator_id="node-0",
-                micro_batch_id=0, source_stage_id=0, tokens=[1, 2], is_finished=False,
-            )
-            router.receive_result(r0)
-            assert len(delivered) == 1
-            assert delivered[0] == [1, 2]
-
-            r1 = RoutedResult(
-                request_id="req-reorder", orchestrator_id="node-0",
-                micro_batch_id=1, source_stage_id=0, tokens=[4, 5, 6], is_finished=False,
-            )
-            router.receive_result(r1)
-            assert len(delivered) == 3
-            assert delivered == [[1, 2], [4, 5, 6], [7, 8]]
-        finally:
-            await router.stop()
-
-    @pytest.mark.asyncio
-    async def test_gc_removes_stale_buffers(self):
-        router = ResultRouter("node-0")
-        await router.start()
-        try:
-            # Manually shorten TTL for testing
-            router.TTL = 0.01
-            router.GC_INTERVAL = 0.05
-
-            r0 = RoutedResult(
-                request_id="req-stale", orchestrator_id="node-0",
-                micro_batch_id=0, source_stage_id=0, tokens=[1], is_finished=False,
-            )
-            router.receive_result(r0)
-
-            await asyncio.sleep(0.2)
-
-            assert "req-stale" not in router._buffers
-        finally:
-            await router.stop()
-
-    def test_result_buffer_in_order(self):
-        buf = ResultBuffer()
-
-        r0 = RoutedResult("r", "o", 0, 0, [1], False)
-        r1 = RoutedResult("r", "o", 1, 0, [2], False)
-        r2 = RoutedResult("r", "o", 2, 0, [3], True)
-
-        delivered = buf.insert(r0)
-        assert len(delivered) == 1
-        assert delivered[0].tokens == [1]
-
-        delivered = buf.insert(r1)
-        assert len(delivered) == 1
-        assert delivered[0].tokens == [2]
-
-        delivered = buf.insert(r2)
-        assert len(delivered) == 1
-        assert delivered[0].tokens == [3]
-
-    def test_result_buffer_out_of_order(self):
-        buf = ResultBuffer()
-
-        r1 = RoutedResult("r", "o", 1, 0, [2], False)
-        delivered = buf.insert(r1)
-        assert len(delivered) == 0
-
-        r0 = RoutedResult("r", "o", 0, 0, [1], False)
-        delivered = buf.insert(r0)
-        assert len(delivered) == 2
-        assert delivered[0].tokens == [1]
-        assert delivered[1].tokens == [2]
 
 
 class TestLatencyMatrixIntegration:

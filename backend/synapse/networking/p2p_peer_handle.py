@@ -1,7 +1,7 @@
 import asyncio
 import time
 import uuid
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, Dict, Any, Set
 import numpy as np
 from synapse.networking.peer_handle import PeerHandle
 from synapse.inference.shard import Shard
@@ -78,28 +78,6 @@ class P2PPeerHandle(PeerHandle):
             if DEBUG >= 2: print(f"Health check error for {self._id}: {type(e).__name__}: {e}")
             return False
 
-    async def send_prompt(self, shard: Shard, prompt: str, request_id: Optional[str] = None) -> bool:
-        ack_topic = f"synapse/inference/ack/{self._id}/{uuid.uuid4()}"
-        payload = {
-            "shard": shard.to_dict(),
-            "prompt": prompt,
-            "request_id": request_id,
-            "_ack_topic": ack_topic
-        }
-        future = asyncio.get_event_loop().create_future()
-        def on_ack(event: Event):
-            if not future.done():
-                future.set_result(True)
-        self.event_router.subscribe(ack_topic, on_ack)
-        try:
-            await self.event_router.publish(f"synapse/inference/prompt/{self._id}", payload)
-            await asyncio.wait_for(future, timeout=5.0)
-            return True
-        except asyncio.TimeoutError:
-            if DEBUG >= 1: print(f"send_prompt to {self._id}: ack timeout")
-            return False
-        finally:
-            self.event_router.unsubscribe(ack_topic, on_ack)
 
     async def send_tensor(self, shard: Shard, tensor: np.ndarray, request_id: Optional[str] = None) -> bool:
         ack_topic = f"synapse/inference/ack/{self._id}/{uuid.uuid4()}"
@@ -184,13 +162,6 @@ class P2PPeerHandle(PeerHandle):
         }
         await self.event_router.publish(f"synapse/inference/status/{self._id}", payload)
 
-    async def send_result(self, request_id: str, result: List[int], is_finished: bool) -> None:
-        payload = {
-            "request_id": request_id,
-            "result": result,
-            "is_finished": is_finished
-        }
-        await self.event_router.publish(f"synapse/inference/result/{self._id}", payload)
 
     async def collect_topology(self, visited: Set[str], max_depth: int) -> Topology:
         payload = {

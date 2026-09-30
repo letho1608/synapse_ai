@@ -189,6 +189,14 @@ class P2PSocketBridge:
                                         ssl=self._ssl_client_ctx),
                 timeout=timeout
             )
+            if self._ssl_client_ctx is not None:
+                from synapse.transport.tls_wrap import check_peer_pin
+                try:
+                    check_peer_pin(writer)
+                except Exception as e:
+                    logger.error(f"TLS pin check failed for {peer_id} at {address}: {e}")
+                    self._close_writer(writer)
+                    return False
             self._enable_nodelay(writer)
 
             await self._send_handshake(writer, PACKET_TYPE_HANDSHAKE)

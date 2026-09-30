@@ -2,7 +2,7 @@
 Behavioral tests: capability + demand gossip docs (T3.3 / C7, P3).
 
 Pure-function tests (no node, no network): builders keep unknowns as None
-(never 0-as-unknown), shard_fits is tri-state, aggregation excludes unknown
+(never 0-as-unknown), aggregation excludes unknown
 rates, stores are hygiene-capped.
 """
 import time
@@ -13,7 +13,6 @@ from synapse.topology.capability import (
     aggregate_demand,
     build_capability_doc,
     build_demand_doc,
-    shard_fits,
     store_bounded,
 )
 
@@ -35,17 +34,6 @@ def test_capability_doc_reads_caps_dict():
     assert doc["tflops_fp16"] == 60.0
     assert doc["chip"] == "X"
     assert doc["model_ids"] == ["m"]
-
-
-def test_shard_fits_tristate():
-    assert shard_fits({"vram_free_mb": 8000.0}, layer_bytes=100 * 1024 * 1024,
-                      num_layers=32) is True
-    assert shard_fits({"vram_free_mb": 100.0}, layer_bytes=100 * 1024 * 1024,
-                      num_layers=32) is False
-    # Unknown inputs -> None (never exclude on ignorance).
-    assert shard_fits({}, layer_bytes=100.0, num_layers=32) is None
-    assert shard_fits({"vram_free_mb": 8000.0}, layer_bytes=None,
-                      num_layers=32) is None
 
 
 def test_demand_unknown_rate_excluded_not_zero():
