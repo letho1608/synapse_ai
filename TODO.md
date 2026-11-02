@@ -24,7 +24,7 @@ Mọi việc không phục vụ 4 điểm trên là **phụ**: không làm thêm
 | Tự phát hiện thiết bị | Có | UDP, Tailscale, file cấu hình tay |
 | Tự chia model theo tài nguyên | Có | Chia theo dải layer, trọng số theo bộ nhớ / tốc độ đo được |
 | Mỗi node chỉ giữ layer của mình trong RAM | Có | `partial_loader` |
-| **Mỗi node chỉ tải phần trọng số nó cần** | **Chưa** | Mỗi node tải cả repo: `pytorch_hf_engine.py:61` gọi `snapshot_download`, `partial_loader.checkpoint_index` tải mọi file trong `weight_map`. Model 70B → mỗi máy tải ~140 GB |
+| Mỗi node chỉ tải phần trọng số nó cần | Có | Checkpoint chia nhiều file: chỉ tải file chứa tensor của node, lúc cần (`partial_loader`). Model một file thì vẫn phải tải cả file |
 | API tương thích ChatGPT | Có | `/v1/chat/completions`, cổng 52415 |
 | Giao diện chat | Một phần | Có TUI console; chưa có web chat |
 | Nhiều loại máy / GPU | Một phần | PyTorch CPU (CUDA chưa kiểm kỹ); chưa có MLX cho Mac |
@@ -43,12 +43,12 @@ Mọi việc không phục vụ 4 điểm trên là **phụ**: không làm thêm
 - [ ] Harness phải chặn loopback giả làm nhiều máy.
 
 ### 2. Model lớn hơn một máy
-- [ ] **Mỗi máy chỉ tải phần trọng số nó cần** (giống exo):
-  - [ ] Từ `model.safetensors.index.json` suy ra file nào chứa layer của shard; chỉ tải các file đó
-        (+ config, tokenizer; embed ở stage đầu, norm/head ở stage cuối).
-  - [ ] Bỏ `snapshot_download` cả repo trong `HFShardDownloader.ensure_shard`; `checkpoint_index` chỉ resolve file cần.
-  - [ ] Khi chia lại layer (failover / re-plan), tải thêm đúng phần còn thiếu.
-  - [ ] Test: shard giữa của model nhiều file chỉ tải các file chứa layer của nó.
+- [x] **Mỗi máy chỉ tải phần trọng số nó cần** (2026-11-02):
+  - [x] `checkpoint_index` chỉ đọc `model.safetensors.index.json`; file shard tải lúc lần đầu cần tensor trong đó.
+  - [x] Bỏ `HFShardDownloader.ensure_shard` (tải cả repo, không còn ai gọi).
+  - [x] Chia lại layer → chỉ tải thêm file còn thiếu.
+  - [x] Test `test_sharded_checkpoint_fetches_only_needed_files`.
+  - [ ] `/v1/models/pull` vẫn tải cả repo (lệnh tải tay); cân nhắc chỉ tải phần của node.
 - [ ] Chạy một model ~7–8B chia cho 2–3 máy mà một máy không chứa nổi ở fp16.
 - [ ] Đo int8 / int4 trên model lớn (trên SmolLM2 int8 chưa nhanh hơn fp32 vì ma trận quá nhỏ).
 

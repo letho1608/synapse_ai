@@ -248,3 +248,48 @@ def test_quantized_kernels_match_dequantized_math():
             ref = torch.nn.functional.linear(x, q.dequantize(), q.bias)
             got = q(x)
             assert torch.allclose(got, ref, atol=1e-4), (mode, rows, float((got - ref).abs().max()))
+
+
+def test_sharded_checkpoint_fetches_only_needed_files(tmp_path, monkeypatch):
+    """A node fetches only the safetensors files that hold its tensors, when
+    it first needs them; a later range fetches just what is missing."""
+    import json
+    from transformers import AutoModelForCausalLM
+    from synapse.inference import partial_loader
+    from synapse.inference.partial_loader import PartialModel
+    ref = AutoModelForCausalLM.from_pretrained(TINY[0])
+    ref.save_pretrained(tmp_path, max_shard_size="20KB", safe_serialization=True)
+    weight_map = json.loads((tmp_path / "model.safetensors.index.json").read_text())["weight_map"]
+    assert len(set(weight_map.values())) > 6, "checkpoint not sharded enough for the test"
+
+    fetched = []
+    real = partial_loader._hub_file
+
+    def spy(repo_id, filename):
+        fetched.append(filename)
+        return real(repo_id, filename)
+
+    monkeypatch.setattr(partial_loader, "_hub_file", spy)
+
+    def files_for(pred):
+        return {f for k, f in weight_map.items() if pred(k)}
+
+    def layer(i):
+        return lambda k: k.startswith(f"transformer.h.{i}.")
+
+    pm = PartialModel(str(tmp_path), torch.float32, "cpu")
+    assert [f for f in fetched if f.endswith(".safetensors")] == [], "shards fetched before any layer was asked for"
+
+    pm.ensure(2, 2, first=False, last=False)  # middle stage
+    assert set(pm.files) == files_for(layer(2))
+    got = dict(pm.layers[2].named_parameters())
+    want = dict(ref.transformer.h[2].named_parameters())
+    assert all(torch.equal(got[n], want[n]) for n in want)
+
+    before = set(pm.files)
+    pm.ensure(3, 4, first=False, last=True)  # re-plan: this node now ends the pipeline
+    need = files_for(lambda k: layer(3)(k) or layer(4)(k) or k.startswith("transformer.ln_f.")
+                     or k.startswith("transformer.wte."))  # tied head reads the embedding
+    assert set(pm.files) == before | need
+    assert len(set(pm.files)) < len(set(weight_map.values()))
+    assert sorted(f for f in fetched if f.endswith(".safetensors")) == sorted(pm.files)  # each file once

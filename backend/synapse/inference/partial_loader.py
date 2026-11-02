@@ -14,6 +14,10 @@ allocated and filled from the checkpoint's safetensors files:
 Layers are added on demand (`ensure`), so the same holder serves a new
 range after a re-partition or a replica request, and `release` frees layers
 the node no longer serves.
+
+Downloads follow the same rule: for a sharded checkpoint only the
+safetensors files that hold this node's tensors are fetched, when they are
+first needed (a new range after a re-plan fetches just what is missing).
 """
 from __future__ import annotations
 
@@ -50,26 +54,18 @@ def _hub_file(repo_id: str, filename: str) -> Optional[str]:
 
 
 def checkpoint_index(repo_id: str) -> Optional[Dict[str, str]]:
-    """tensor name -> local safetensors file, or None (no safetensors)."""
+    """tensor name -> checkpoint file name (relative to the repo), or None
+    (no safetensors). Reads only the index; shard files are not fetched."""
     idx = _hub_file(repo_id, "model.safetensors.index.json")
     if idx:
         with open(idx, encoding="utf-8") as f:
-            weight_map = json.load(f).get("weight_map", {})
-        out: Dict[str, str] = {}
-        paths: Dict[str, Optional[str]] = {}
-        for name, fn in weight_map.items():
-            if fn not in paths:
-                paths[fn] = _hub_file(repo_id, fn)
-            if paths[fn] is None:
-                return None
-            out[name] = paths[fn]
-        return out
+            return dict(json.load(f).get("weight_map", {}))
     single = _hub_file(repo_id, "model.safetensors")
     if not single:
         return None
     from safetensors import safe_open
     with safe_open(single, "pt") as f:
-        return {k: single for k in f.keys()}
+        return {k: "model.safetensors" for k in f.keys()}
 
 
 class PartialModel:
@@ -91,6 +87,8 @@ class PartialModel:
         self.index = checkpoint_index(repo_id)
         if self.index is None:
             raise FileNotFoundError(f"{repo_id}: no safetensors checkpoint")
+        # checkpoint file name -> local path, for the files fetched so far
+        self.files: Dict[str, str] = {}
         self.layers: Dict[int, nn.Module] = {}
         self.embed: Optional[nn.Module] = None
         self.pos_embed: Optional[nn.Module] = None
@@ -142,6 +140,16 @@ class PartialModel:
             return prefix + "." + name
         return None
 
+    def _file(self, name: str) -> str:
+        """Local path of one checkpoint file, fetched on first use."""
+        path = self.files.get(name)
+        if path is None:
+            path = _hub_file(self.repo_id, name)
+            if path is None:
+                raise FileNotFoundError(f"{self.repo_id}: cannot fetch {name}")
+            self.files[name] = path
+        return path
+
     def _load(self, module: nn.Module, module_path: str, rename=None) -> None:
         """to_empty + fill every parameter/persistent buffer from the checkpoint."""
         from safetensors import safe_open
@@ -157,8 +165,8 @@ class PartialModel:
             if ck is None:
                 raise KeyError(f"{self.repo_id}: tensor {full!r} not in checkpoint")
             by_file.setdefault(self.index[ck], []).append((local, ck))
-        for path, pairs in by_file.items():
-            with safe_open(path, "pt") as f:
+        for name, pairs in by_file.items():
+            with safe_open(self._file(name), "pt") as f:
                 for local, ck in pairs:
                     state[local] = f.get_tensor(ck)
         ref = module.state_dict()

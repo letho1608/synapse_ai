@@ -7,7 +7,6 @@ import asyncio
 import numpy as np
 import inspect
 import os
-from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
 from synapse.helpers import DEBUG
@@ -37,7 +36,8 @@ def register_pytorch_models() -> None:
 
 
 class HFShardDownloader:
-    """Tải model từ Hugging Face (cache local). Không tải theo shard file; shard = layer range khi chạy."""
+    """Download progress hub. Weights are fetched by PartialModel, only the
+    checkpoint files that hold the layers a node serves."""
 
     def __init__(self):
         self._on_progress = None  # optional AsyncCallbackSystem
@@ -48,17 +48,6 @@ class HFShardDownloader:
             from synapse.helpers import AsyncCallbackSystem
             self._on_progress = AsyncCallbackSystem()
         return self._on_progress
-
-    async def ensure_shard(self, shard: Shard, inference_engine_name: str) -> Path:
-        hf_id = resolve_hf_id(shard.model_id)
-        try:
-            from huggingface_hub import snapshot_download
-            path = snapshot_download(repo_id=hf_id)
-            return Path(path)
-        except Exception as e:
-            if DEBUG >= 1:
-                print(f"[HFShardDownloader] ensure_shard {shard.model_id} -> {hf_id}: {e}")
-            return Path(".")
 
 
 _FORWARD_PARAMS: Dict[type, Any] = {}
