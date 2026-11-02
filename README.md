@@ -4,7 +4,7 @@
 
 Synapse splits one language model across the machines on your network. Each node loads and runs only a contiguous range of layers, and hidden states flow node to node over TCP. You get two things from this:
 
-- **Capacity:** a model that fits in no single machine runs on several. A node holds only the layers it serves, plus the embedding on the first stage and the norm and head on the last. Weights are read straight from the safetensors checkpoint for that range, and for a sharded checkpoint a node downloads only the files that hold its tensors (a new range after a re-plan fetches just what is missing). Weight-only int8 / int4 quantization shrinks every layer when memory is short (int4 is mixed precision: the tensors it hurts most stay int8).
+- **Capacity:** a model that fits in no single machine runs on several. A node holds only the layers it serves, plus the embedding on the first stage and the norm and head on the last. Weights are read straight from the safetensors checkpoint for that range, and for a sharded checkpoint a node downloads only the files that hold its tensors (a new range after a re-plan fetches just what is missing). A single-file checkpoint that is not cached is read with HTTP range requests: the header, then only the bytes of the node's tensors. Weight-only int8 / int4 quantization shrinks every layer when memory is short (int4 is mixed precision: the tensors it hurts most stay int8).
 - **Throughput:** many requests run at once. Concurrent decode steps on a node share one batched forward (the weights are read once per batch), and different requests occupy different stages at the same time.
 
 **What it does not do:** it does not make a single request faster than running the model on one machine that can hold it. Every hop adds network latency, and a pipeline over separate machines must pass each token through every stage in turn. exo, Petals and llama.cpp RPC report the same limit, and `research/related-work.md` compares Synapse with these systems in detail. Speculative drafts verified in one pass (below) recover part of that cost when the text repeats itself.
@@ -48,11 +48,12 @@ These runs use separate processes on one machine. Real-network latency and bandw
 
 ### Also in the box
 
-- Pipeline-parallel training: each node trains only the layers it serves; activations go forward and gradients go back between nodes.
+- Pipeline-parallel training: each node trains only the layers it serves; activations go forward and gradients go back between nodes. LoRA works the same way (adapters on each node's own layers, also over int8/int4 weights).
+- Pairing: `synapse pair` gives a cluster one code; machines that share it talk mutual TLS, machines without it cannot connect.
+- Autoscale: under load the master re-places layers for throughput (spreading them over idle nodes), and back when idle.
 - Versioned handshakes.
-- Optional TLS on the bridge and on the tensor path.
-- Shard-weight checkpoints.
-- The CLI/TUI console.
+- Shard-weight checkpoints, replicated to a peer.
+- The CLI/TUI console; any OpenAI-compatible chat UI works against the API (see "Chat UI").
 
 ---
 
@@ -71,7 +72,7 @@ One step for a plan `[(node, shard), …]`:
 
 Messages go over the chunked TCP tensor path, falling back to the event bridge. `train_step_distributed(schedule="1f1b")` (used by the training API for multi-node jobs) runs this; `schedule="ddp"` is data parallelism and keeps a full replica on every node by definition. Verified against the full HF model: one 3-stage step equals one full-model step (same micro-batch averaging, clipping and AdamW) to < 1e-5 per parameter on SmolLM2-135M and tiny-GPT2 (`test_pipeline_training.py`, which also drives two real `Node`s through their transport handlers).
 
-Scope: quantized weights cannot be trained (the step refuses; use `SYNAPSE_WEIGHT_QUANT=none`), and LoRA still wraps a whole-model copy.
+**LoRA** (`training/stage_lora.py`, `use_lora` in the training API) uses the same pipeline: every stage wraps the target linears of its own layers (`q_proj,k_proj,v_proj,o_proj` by default, GPT-2's `c_attn`) and trains only the adapters; base weights and embeddings stay frozen. The settings travel with each step, so remote stages set up the same adapters. A 3-stage LoRA step equals a 1-node step on the same adapters, and LoRA over int8 weights trains (QLoRA-style: the gradient flows through the frozen quantized layers on the torch path) (`test_stage_lora.py`). Adapters are part of the layers' checkpoint, so a survivor restores them; `stage_lora_merge` folds them into the weights. Full fine-tuning of quantized weights is refused (train LoRA instead or set `SYNAPSE_WEIGHT_QUANT=none`).
 
 ---
 
@@ -141,15 +142,18 @@ The master scheduler node is elected using the **LACP composite score** rather t
 
 ## Known Limitations
 
-- **TLS between nodes is opt-in, and authenticated.** Setting `SYNAPSE_TLS=selfsigned|require` wraps both the event bridge and the chunked TCP tensor path.
+- **TLS between nodes: pairing code, or manual certificates.**
+  - `synapse pair` creates a code (160 random bits); `synapse pair --code <code>` on every other machine. Each machine derives the same cluster CA key from the code, issues its own node certificate, and runs mutual TLS on the event bridge and the tensor path. A node with another code, or none, cannot handshake in either direction (`test_tls_pairing.py`). With a saved code TLS is on by default (`SYNAPSE_TLS=off` overrides); `synapse pair --forget` removes it.
+  - Manual mode: `SYNAPSE_TLS=selfsigned|require` wraps both the event bridge and the chunked TCP tensor path.
   - Peers are authenticated by a CA (`SYNAPSE_TLS_CA`) or by sha256 certificate pins (`SYNAPSE_TLS_PINS`). With pins, every client connection checks the server certificate against them, on the bridge and on the tensor path (`test_tls_interop.py`).
   - Without a CA, the old code encrypted to whoever answered: the advertised `tls_fp` was never checked.
   - `require` refuses to start without a CA or pins.
   - `selfsigned` generates a per-node cert in `~/.synapse/tls` when `SYNAPSE_TLS_CERT`/`KEY` are not given. Each node logs its pin for the peers' `SYNAPSE_TLS_PINS`.
   - Missing files fail loudly; nothing falls back to plaintext.
   - With a CA, TLS is mutual: servers demand a CA-signed client certificate and clients present theirs (`test_ca_mode_is_mutual_tls`). Pins-only clusters authenticate the server side only: the stdlib cannot demand a client certificate while skipping chain verification.
-  - Default is plaintext, so run default clusters on trusted networks (LAN/Tailscale).
+  - Without a pairing code the default is plaintext, so run unpaired clusters on trusted networks (LAN/Tailscale).
   - TLS has not been exercised on real multi-host clusters yet.
+- **API access.** Chat and read-only status routes are open to the network; admin routes (`/quit`, settings, model pull/delete/merge, datasets, training, logs) answer only to the local machine. With `SYNAPSE_API_KEY` set, every route except `GET /` and `/healthcheck` needs `Authorization: Bearer <key>` (`test_api_access.py`).
 - **RDMA/InfiniBand transport is not implemented** — zero-copy shared memory currently covers same-machine nodes only (see Async Tensor Forwarding above).
 - **Checkpoint recovery is wired into distributed training and rebalancing, and survives the loss of the writing machine.**
   - Every distributed training step writes a JSON metadata checkpoint plus a sha256 manifest.
@@ -178,9 +182,10 @@ The master scheduler node is elected using the **LACP composite score** rather t
   - `test_live_failover.py`: 3 processes. Once profiles are gossiped, measured placement runs. One stage process is killed while an answer streams; the orchestrator detects it from heartbeats, patches the plan, resends the step, and the streamed answer equals the healthy run.
   - A hardware multi-machine run (C1) is still pending, so real-network latency, bandwidth and failover times are unmeasured.
   - The default node port is 46051, below the dynamic range (49152+) where Windows reserves port blocks (Hyper-V/WSL; this test machine reserves 50000–50059). If a port still fails to bind, check `netsh int ipv4 show excludedportrange protocol=tcp` and pass `--node-port`.
-- **Training uses the served layers.** A single node trains its full-range shard in place; several nodes train as a pipeline (each its own range, see above). LoRA fine-tuning still loads a whole-model copy.
+- **Training uses the served layers.** A single node trains its full-range shard in place; several nodes train as a pipeline (each its own range, see above), full fine-tuning or LoRA.
 - **A single request is not faster than one machine that can hold the model.** See "What it does not do" above.
-- **No web frontend (CLI-first).** The terminal CLI/console is the user interface; `GET /` is a small built-in status page served by the API process (a 204 stub under `--headless`).
+- **No built-in web chat (CLI-first).** The terminal CLI/console is the user interface; `GET /` is a small built-in status page served by the API process (a 204 stub under `--headless`). For a browser chat, point any OpenAI-compatible UI at the API (see "Chat UI").
+- **The master dies.** Survivors ignore a broadcast partition that names a dead node and place layers over the live ones until a new master is elected (`test_master_death.py`); a request whose stage dies mid-generation is patched by the failover loop. A request whose *orchestrator* (the node the client talks to) dies ends with that connection: the client retries on another node.
 
 ---
 
@@ -202,8 +207,12 @@ The master scheduler node is elected using the **LACP composite score** rather t
 | `SYNAPSE_INT4_KEEP` | `v_proj,down_proj,mlp.c_proj` | Linears kept int8 in int4 mode (`none` = pure int4) |
 | `OMP_WAIT_POLICY` | `PASSIVE` | Set by the package before torch loads (spinning OpenMP threads starved the numba kernels); an explicit value wins |
 | `SYNAPSE_CHUNKED_TCP` | `1` | Chunked binary TCP tensor path |
-| `SYNAPSE_TLS` | off | `selfsigned` / `require` |
-| `SYNAPSE_TLS_PINS` | — | Comma-separated sha256 cert pins that authenticate peers |
+| `SYNAPSE_TLS` | `cluster` if paired, else off | `off` / `cluster` / `selfsigned` / `require` |
+| `SYNAPSE_CLUSTER_CODE` | — | Pairing code (else `~/.synapse/cluster_code`, written by `synapse pair`) |
+| `SYNAPSE_TLS_PINS` | — | Comma-separated sha256 cert pins that authenticate peers (manual mode) |
+| `SYNAPSE_API_KEY` | — | Bearer key required on every API route; unset = chat open, admin routes local-only |
+| `SYNAPSE_AUTOSCALE` | `on` | `on` = act on hints (master), `advise` = log only, `off` |
+| `SYNAPSE_RANGE_FETCH` | `1` | Read uncached single-file checkpoints by HTTP range (`0` = download whole files) |
 | `SYNAPSE_CKPT_REPLICATE` | `1` | Replicate training checkpoints to the pipeline successor |
 | `SYNAPSE_CHECKPOINT_DIR` | `~/.synapse/checkpoints` | Where checkpoints and replicas are stored |
 
@@ -212,9 +221,8 @@ The master scheduler node is elected using the **LACP composite score** rather t
 ```bash
 git clone https://github.com/letho1608/synapse_ai.git
 cd synapse_ai
-python -m venv .venv
-.venv\Scripts\activate   # Windows
-pip install -r backend/requirements.txt
+install.bat        # Windows  (creates .venv, installs backend/requirements.txt)
+sh install.sh      # Linux / macOS
 ```
 
 ---
@@ -237,7 +245,13 @@ The API listens on `http://127.0.0.1:52415` (`/v1/*`); `GET /` is only a built-i
 
 1. All nodes must be on the same network (LAN) or connected via Tailscale
 2. Each node needs `python main.py` running with the same discovery config
-3. A shared `cluster_config.json` file or Tailscale API access
+3. A shared `cluster_config.json` file or Tailscale API access (UDP discovery on a LAN needs neither)
+4. Optional but recommended: pair the machines once, so they talk mutual TLS:
+
+```bash
+python main.py pair                  # on the first machine: prints a code
+python main.py pair --code <code>    # on every other machine
+```
 
 ### Cluster Config Example
 
@@ -274,11 +288,22 @@ The cluster self-organizes:
 |--------|----------|-------------|
 | POST | `/v1/chat/completions` | Chat completion (OpenAI-compatible, streaming supported) |
 | GET | `/v1/models` | Available models |
-| POST | `/v1/models/pull` | Download model to all nodes |
+| POST | `/v1/models/pull` | Download this node's part of a model (its layers' checkpoint files; `{"full": true}` = whole repo) |
 | GET | `/v1/cluster/resources` | Per-node resource usage, throughput, shard assignment |
 | GET | `/v1/topology` | Cluster topology (nodes, links, latency matrix) |
 | GET | `/v1/distributed/status` | Distributed pipeline status |
 | POST | `/v1/training/start` | Start distributed training job |
+
+### Chat UI
+
+The API speaks the OpenAI chat format, so existing chat apps work as the browser front end. Open WebUI, for example:
+
+```bash
+docker run -d -p 3000:8080 -e OPENAI_API_BASE_URL=http://<node-ip>:52415/v1 \
+  -e OPENAI_API_KEY=${SYNAPSE_API_KEY:-none} ghcr.io/open-webui/open-webui:main
+```
+
+Then open `http://localhost:3000` and pick the model. LibreChat, Chatbox and other clients that take an OpenAI base URL work the same way: base URL `http://<node-ip>:52415/v1`, any key (or the value of `SYNAPSE_API_KEY` when set).
 
 ---
 
@@ -349,7 +374,7 @@ synapse_ai/
 │       │   └── udp/                  # UDP broadcast discovery
 │       ├── api/                      # REST API
 │       ├── routing/                  # Event router
-│       └── training/                 # Finetuning (LoRA)
+│       └── training/                 # Datasets, LoRA on served layers (stage_lora.py)
 ├── backend/
 │   ├── synapse/                      # (see above)
 │   └── tests/

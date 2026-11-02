@@ -15,7 +15,7 @@ Cập nhật: 2026-11-02 · nhánh `distributed-v2`. Chi tiết kỹ thuật và
 3. **Dễ dùng.** Cài một lệnh, API tương thích ChatGPT, có giao diện chat.
 4. **Chịu lỗi.** Một máy rời cụm thì cụm tự chia lại và vẫn trả lời.
 
-Mọi việc không phục vụ 4 điểm trên là **phụ**: không làm thêm cho đến khi điểm 1 có số đo.
+Ưu tiên điểm 1 trước: đa số việc khác (kể cả các tính năng hỗ trợ bên dưới) chỉ kiểm được khi đã có cụm thật.
 
 ## Hiện trạng so với mục tiêu
 
@@ -35,6 +35,7 @@ Mọi việc không phục vụ 4 điểm trên là **phụ**: không làm thêm
 ## Việc cần làm (theo thứ tự)
 
 ### 1. Chạy thật trên nhiều máy — chặn mọi thứ khác
+Các bước từng bước: `MULTI_MACHINE.md`.
 - [ ] Chạy 2 máy cùng LAN với SmolLM2-135M: tự thấy nhau, chia layer, chat được.
 - [ ] Rồi 3 máy, rồi qua Tailscale.
 - [ ] Đo TTFT, tok/s; so với chạy một máy.
@@ -48,32 +49,84 @@ Mọi việc không phục vụ 4 điểm trên là **phụ**: không làm thêm
   - [x] Bỏ `HFShardDownloader.ensure_shard` (tải cả repo, không còn ai gọi).
   - [x] Chia lại layer → chỉ tải thêm file còn thiếu.
   - [x] Test `test_sharded_checkpoint_fetches_only_needed_files`.
-  - [ ] `/v1/models/pull` vẫn tải cả repo (lệnh tải tay); cân nhắc chỉ tải phần của node.
+  - [x] `/v1/models/pull` chỉ tải config/tokenizer + file trọng số của dải layer node đang giữ (`{"full": true}` = cả repo).
+  - [x] Model một file safetensors chưa có trong cache: đọc header + đúng các đoạn byte của tensor node cần bằng HTTP Range
+        (`RangeFile`), không tải cả file (`SYNAPSE_RANGE_FETCH=0` để tắt).
 - [ ] Chạy một model ~7–8B chia cho 2–3 máy mà một máy không chứa nổi ở fp16.
 - [ ] Đo int8 / int4 trên model lớn (trên SmolLM2 int8 chưa nhanh hơn fp32 vì ma trận quá nhỏ).
 
 ### 3. Dễ dùng
-- [ ] Cài một lệnh (`install.sh` / `install.bat`) chạy được trên máy sạch.
-- [ ] Web chat tối giản dùng API sẵn có.
-- [ ] Kiểm CUDA; cân nhắc MLX cho Mac.
+- [x] Cài một lệnh: requirements thiếu `msgpack` (gossip trạng thái cụm hỏng im lặng trên máy sạch), `lz4`, `cryptography`
+      → đã thêm; bỏ 7 gói không ai import. Đã cài thật vào venv sạch và chạy toàn bộ test (xem "Đã làm").
+      Còn: thử trên một máy khác hẳn (Linux/macOS).
+- [x] Giao diện chat: CLI/console có sẵn; trình duyệt dùng Open WebUI / LibreChat / Chatbox trỏ vào API (README "Chat UI").
+      Không tự viết web chat.
+- [ ] Kiểm CUDA (cần máy NVIDIA); MLX cho Mac (cần máy Mac).
 
 ### 4. Chịu lỗi trên mạng thật
 - [ ] Failover khi một máy rời cụm (đã có, chỉ mới kiểm trên một máy).
-- [ ] Checkpoint không phụ thuộc thư mục dùng chung (C2).
+- [x] Checkpoint không phụ thuộc thư mục dùng chung (C2): bản sao gửi sang node kế tiếp. Còn phải thử trên máy thật.
 
 ### Việc vặt đang mở
-- [ ] Một lượt chạy toàn bộ test sạch (lượt cuối dừng vì hết RAM; lượt trước 547/549, 2 test hỏng đã sửa).
+- [ ] Một lượt chạy toàn bộ test sạch sau đợt hoàn thiện (xem "Đã làm").
 
-## Tính năng ngoài lõi
+## Tính năng hỗ trợ mục tiêu nhưng chưa hoàn thiện
 
-Giữ lại (không bắt buộc giống exo): huấn luyện (pipeline, LoRA, DDP),
-autoscale (advisory), TLS hai chiều, bầu master, ba bộ chia layer (chuỗi dự phòng: đo thật → TFLOPS / LACP),
-lượng tử hoá + kernel. Ưu tiên vẫn là mục 1, nhưng không gỡ các phần này.
+Không phải phần phụ: mỗi tính năng phục vụ một tiêu chí ở trên, nhưng mới làm được một nửa.
+Làm sau mục 1 vì đa số cần cụm thật mới kiểm được.
 
-Trùng lặp còn lại, để gộp khi làm giao diện: ba giao diện terminal (`tui.py`, `console.py`, `cli.py`)
-+ `viz/topology_viz.py`.
+### Bầu master (phục vụ 1, 4)
+- [ ] Chưa thử trên mạng thật: mất gói, hai nhóm máy mất liên lạc với nhau (có thể sinh hai master).
+- [x] Master chết: node còn sống bỏ bảng chia layer có node chết và tự chia lại trên node sống ngay (trước đây mọi request
+      dồn vào node chết, chờ timeout failover cho tới khi có master mới); request đang chạy được vá bằng vòng failover sẵn có.
+      Node nhận request (orchestrator) chết thì kết nối đó kết thúc, client gửi lại sang node khác (`test_master_death.py`).
+
+### Autoscale (phục vụ 2, 4)
+- [x] Tự hành động (`SYNAPSE_AUTOSCALE=on`, mặc định): tải cao + có máy rảnh vừa bộ nhớ → master chia layer theo throughput
+      (trải ra nhiều máy hơn); rảnh → về objective cấu hình. Có cooldown 60 s chống dao động. `advise` = chỉ log.
+- [ ] Đo trên cụm thật (ngưỡng rpm, cooldown) khi mục 1 xong.
+
+### TLS (phục vụ 3: dùng an toàn qua Tailscale / LAN lạ)
+- [x] Ghép máy bằng mã: `synapse pair` sinh mã 160 bit; `synapse pair --code <mã>` trên máy khác. Mọi máy dẫn xuất cùng
+      CA cụm từ mã, tự cấp cert riêng, mutual TLS; máy khác mã / không mã không bắt tay được. Có mã thì TLS bật mặc định.
+- [ ] Chưa chạy TLS giữa hai máy thật.
+
+### Huấn luyện (phục vụ 2: train model lớn hơn một máy)
+- [x] LoRA trên dải layer của từng node (`training/stage_lora.py`), không nạp cả model; 3 stage == 1 node; adapter nằm
+      trong checkpoint nên node thay thế phục hồi được; `stage_lora_merge` gộp vào trọng số.
+- [x] LoRA trên trọng số int8/int4 (kiểu QLoRA). Full fine-tune trọng số lượng tử vẫn bị từ chối (có hướng dẫn).
+- [ ] Train pipeline mới khớp trên một máy, chưa chạy qua mạng thật.
+
+### Checkpoint khi train (phục vụ 4)
+- [x] Đã gửi bản sao checkpoint sang node kế tiếp (`_replicate_checkpoint`), không cần thư mục chung.
+- [ ] Chưa thử rút máy thật rồi phục hồi từ bản sao; node giữ bản sao chết cùng lúc thì mất checkpoint.
+
+### Lượng tử hoá (phục vụ 2)
+- [ ] int8 chưa nhanh hơn fp32 trên model nhỏ; cần đo trên model 7–8B (trùng mục 2).
+
+Ba bộ chia layer giữ nguyên: là chuỗi dự phòng (đo thật → TFLOPS / LACP), không trùng nhau.
+
+Giao diện terminal: `cli.py` (lệnh không tương tác), `console.py` (REPL + engine lệnh), `tui.py` (giao diện toàn màn hình
+của console) là ba lớp khác nhau, không trùng. `viz/topology_viz.py` (bảng topology thứ hai, chỉ có với `serve --tui`)
+trùng với `/topology` của console → đã gỡ.
 
 ## Đã làm
+
+### Đợt hoàn thiện (2026-11-02, chưa commit)
+- Bảo mật API: không có `SYNAPSE_API_KEY` thì chat + trạng thái mở cho LAN, route quản trị (quit, settings, pull/xoá model,
+  dataset, training, log) chỉ nhận từ máy local; có key thì mọi route trừ `/` và `/healthcheck` cần Bearer (so sánh hằng thời gian).
+  Trước đây ai cùng mạng cũng gọi được `/quit` và xoá model; `/quit` không được bảo vệ kể cả khi có key.
+- `/v1/models/pull` chỉ tải phần của node; đọc model một file bằng HTTP Range.
+- LoRA theo dải layer + QLoRA; ghép máy bằng mã (mutual TLS); autoscale tự hành động; master chết không làm request treo.
+- Gỡ `viz/topology_viz.py` và cờ `serve --tui`.
+- requirements: thêm `msgpack`, `lz4`, `cryptography`; bỏ 7 gói không dùng.
+- Cài sạch thật (venv mới, torch 2.14.1 / transformers 5.20.2 / huggingface_hub 2.4.0) tìm ra 2 lỗi chặn:
+  - `torch-directml` (mặc định trên Windows) ghim torch 2.4.1 < 2.6 mà transformers 5 cần → bỏ khỏi bộ cài mặc định
+    (`requirements-windows.txt` thành tuỳ chọn có cảnh báo), thêm `torch>=2.6`.
+  - transformers 5.20 không nhận `cache.crop(<độ dài dương>)` nữa → KV cache cắt sai, decode/verify hỏng.
+    `_crop_kv` gửi số âm chỉ cho các layer stage đã ghi (chạy được cả bản cũ lẫn mới).
+  - `install.bat` gợi ý khi gặp giới hạn 260 ký tự đường dẫn của Windows.
+- `test_tcp_tls.py` dùng cổng OS cấp (cổng cố định 59421 bị tiến trình khác chiếm).
 
 ### Nền tảng (các commit trước)
 - Chia dải layer thật; verify draft một lượt; batching; đặt layer theo tài nguyên đo được; failover.
