@@ -1,14 +1,17 @@
 # Base node install: inference + cluster core only.
-# Platform extras : requirements-windows.txt (pywin32, torch-directml)
+# Optional extra   : requirements-windows.txt (DirectML; pins an old torch, separate env)
 # Packaging/dev   : requirements-dev.txt
-aiofiles
 aiohttp
 aiohttp-cors
+# cluster-state gossip (msgpack), tensor frame compression (lz4: a peer that
+# compresses needs every peer able to decompress), pairing/TLS certificates
+msgpack
+lz4
+cryptography
 jinja2
 numpy
 nvidia-ml-py
 opentelemetry-api
-prometheus-client
 protobuf
 psutil
 pydantic
@@ -20,16 +23,13 @@ prompt_toolkit
 setuptools
 tqdm
 transformers
-torch
+# transformers 5 needs torch >= 2.6 (fast_decoder's SDPA enable_gqa needs >= 2.5)
+torch>=2.6
 # CPU kernels for int8/int4 weights (inference/qkernels.py); optional, torch fallback without it
 numba>=0.59
 peft
-datasets
+# device_map="auto" for bitsandbytes-quantized loads
 accelerate
-anyio
 loguru
 bitsandbytes
 pulp>=2.7.0
-scipy>=1.10.0
-scikit-learn>=1.3.0
-diskcache>=5.6.0

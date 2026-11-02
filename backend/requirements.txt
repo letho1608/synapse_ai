@@ -3,4 +3,3 @@
 #   Packaging/dev       : backend/requirements-dev.txt
 -r requirements-base.txt
 pywin32; sys_platform == 'win32'
-torch-directml; sys_platform == 'win32'  # DirectML GPU path is Windows-only

@@ -1,10 +1,9 @@
-# Windows-only node extras — POINTER FILE, installs nothing by itself.
+# Optional Windows extra: DirectML GPU path (AMD/Intel GPUs on Windows).
 #
-# The real lines live in backend/requirements.txt with pip markers:
-#   pywin32; sys_platform == 'win32'
-#   torch-directml; sys_platform == 'win32'
-# Install with: pip install -r backend/requirements.txt   (correct on all OS)
-# Or explicitly: pip install -r backend/requirements-windows.txt
+# NOT part of the default install: torch-directml pins an old torch (2.4.x),
+# older than transformers 5 accepts (torch >= 2.6), so installing it
+# downgrades torch and breaks model loading. Install only into a separate
+# environment with a transformers version that supports that torch.
 -r requirements-base.txt
 pywin32
 torch-directml

@@ -22,6 +22,8 @@ echo [INFO] pip install -r backend\requirements.txt ...
 .venv\Scripts\python.exe -m pip install -r backend\requirements.txt
 if errorlevel 1 (
   echo [FAIL] pip install failed. See output above.
+  echo        "No such file or directory" under torch\include = Windows 260-char path limit:
+  echo        enable long paths ^(https://pip.pypa.io/warnings/enable-long-paths^) or clone to a shorter folder.
   exit /b 1
 )
 
@@ -35,4 +37,5 @@ echo   python main.py
 echo.
 echo Optional extras:
 echo   .venv\Scripts\python.exe -m pip install -r backend\requirements-dev.txt     ^(packaging/dev^)
+echo   DirectML GPU: see backend\requirements-windows.txt ^(separate env only^)
 endlocal
