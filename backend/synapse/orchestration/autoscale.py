@@ -8,10 +8,10 @@ mesh-llm's proxy request counters become synapse's gossip demand aggregate
 (topology/capability.aggregate_demand); queue backstop uses gossip
 queue_depth instead of proxy counters.
 
-Phase 1 is ADVISORY: evaluate() returns 'wanted' hints (mesh-llm
-/api/model-targets semantics). Nothing here repartitions, promotes, or
-demotes — actuating needs the C1 live gate (PLAN.md). Unknown fit (None)
-never promotes; unknown demand never demotes.
+evaluate() only returns hints (mesh-llm /api/model-targets semantics);
+the master acts on them in Node._actuate_autoscale (placement objective,
+with a cooldown). Unknown fit (None) never promotes; unknown demand never
+demotes.
 """
 from __future__ import annotations
 

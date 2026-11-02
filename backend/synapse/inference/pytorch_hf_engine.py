@@ -201,6 +201,30 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
         from transformers import DynamicCache
         return DynamicCache()
 
+    @classmethod
+    def _crop_kv(cls, cache, keep: int, length: int) -> None:
+        """Keep the first `keep` of `length` cached positions. PagedSequence
+        takes the length to keep; an HF Cache gets the (negative) number of
+        positions to drop, the one form every transformers version accepts
+        (5.20 rejects a positive length, older ones read negatives the same).
+        `length` comes from the caller: cache.get_seq_length() reads layer 0,
+        which a later pipeline stage never fills."""
+        if cls._is_paged(cache):
+            cache.crop(keep)
+            return
+        drop = int(length) - int(keep)
+        if drop <= 0:
+            return
+        layers = getattr(cache, "layers", None)
+        if layers is None:
+            cache.crop(-drop)
+            return
+        # Only the layers this stage filled: the others (absolute indices of
+        # other stages) are empty and a negative crop fails on them.
+        for layer in layers:
+            if getattr(layer, "keys", None) is not None:
+                layer.crop(-drop)
+
     @staticmethod
     def _is_paged(cache) -> bool:
         from synapse.inference.fast_decoder import PagedSequence
@@ -521,7 +545,7 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
                                   f"{int(stored.get('length', 0)) if isinstance(stored, dict) else 0}")
             past_len, cache = row_offset, stored["cache"]
             if int(stored["length"]) > row_offset:
-                cache.crop(row_offset)
+                self._crop_kv(cache, row_offset, int(stored["length"]))
             hidden_states = hidden_states_full
             all_rows = np.concatenate([stored["ids"][:row_offset],
                                        new_rows.astype(stored["ids"].dtype)])
@@ -554,7 +578,7 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
                 if past_len > 0:
                     cache = prev["cache"]
                     if int(prev.get("length", 0)) > past_len:
-                        cache.crop(past_len)  # drop rows after the divergence
+                        self._crop_kv(cache, past_len, int(prev["length"]))  # drop rows after the divergence
                     hidden_states = hidden_states_full[:, past_len:, :]
                     mode = "reuse"
                     if DEBUG >= 2: print(f"[Cache] SeqHit! Reusing prefix length {past_len}")
@@ -1275,6 +1299,9 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
                 "model_id": shard.model_id,
                 "start_layer": shard.start_layer,
                 "end_layer": shard.end_layer,
+                # adapters are part of the layers' state; the restoring node
+                # re-creates them from this before loading
+                "lora": self._lora_cfg,
                 "layers": {
                     i: {k: v.detach().to("cpu").clone() for k, v in layers[i].state_dict().items()}
                     for i in range(shard.start_layer, shard.end_layer + 1)
@@ -1311,6 +1338,14 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
             print(f"[PyTorchHF] load_checkpoint: {path!r} lacks layers {missing} "
                   f"-> restore refused (degraded)")
             return False
+        lora = payload.get("lora")
+        if lora:
+            from synapse.training import stage_lora
+            for i in wanted:
+                stage_lora.inject(layers[i], lora)
+            if self._fast_dec is not None:
+                self._fast_dec.forget()
+            self._lora_cfg = lora
         with torch.no_grad():
             for i in wanted:
                 layers[i].load_state_dict(saved[i], strict=True)
@@ -1453,9 +1488,13 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
         backgrad: Optional[np.ndarray] = None,
         loss: str = "forward",
         sync_gradients: bool = False,
+        lora: Optional[dict] = None,
     ) -> Tuple[Optional[float], Optional[np.ndarray]]:
         if self._model is None and self._partial_enabled() and loss != "back_gradient":
-            return await self._train_served(request_id, shard, example, target, sync_gradients)
+            return await self._train_served(request_id, shard, example, target, sync_gradients, lora)
+        if lora:
+            raise RuntimeError("LoRA trains on the served layers: needs layer-range loading "
+                               "(SYNAPSE_PARTIAL_LOAD=1)")
         # Whole-model path: a model already loaded in full (LoRA wraps
         # _model), SYNAPSE_PARTIAL_LOAD=0, or the legacy back_gradient call.
         await self._ensure_full(shard)
@@ -1517,7 +1556,8 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
     TRAIN_MAX_GRAD_NORM = 1.0
 
     async def _train_served(self, request_id, shard: Shard, example, target,
-                            sync_gradients: bool) -> Tuple[Optional[float], Optional[dict]]:
+                            sync_gradients: bool, lora: Optional[dict] = None
+                            ) -> Tuple[Optional[float], Optional[dict]]:
         """One step on a node that holds the whole model, using the same
         layer-range weights it serves (no second, full copy). A shard that
         covers only part of the model trains through the pipeline
@@ -1526,7 +1566,7 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
             raise RuntimeError(
                 f"shard {shard.start_layer}-{shard.end_layer}/{shard.n_layers} is one pipeline "
                 "stage: train it with PipelineTrainer, not train()")
-        await self.stage_train_prepare(shard)
+        await self.stage_train_prepare(shard, lora=lora)
         res = await self.stage_forward((request_id, 0, 0), shard, example, target)
         loss = res["loss"]
         if sync_gradients:

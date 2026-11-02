@@ -18,6 +18,9 @@ the node no longer serves.
 Downloads follow the same rule: for a sharded checkpoint only the
 safetensors files that hold this node's tensors are fetched, when they are
 first needed (a new range after a re-plan fetches just what is missing).
+A single-file checkpoint that is not cached yet is read with HTTP range
+requests: the header, then only the byte ranges of this node's tensors
+(RangeFile). SYNAPSE_RANGE_FETCH=0 downloads whole files instead.
 """
 from __future__ import annotations
 
@@ -53,13 +56,119 @@ def _hub_file(repo_id: str, filename: str) -> Optional[str]:
         return None
 
 
-def checkpoint_index(repo_id: str) -> Optional[Dict[str, str]]:
+# safetensors dtype tag -> torch dtype
+_ST_DTYPES = {
+    "F64": torch.float64, "F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16,
+    "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8,
+    "U8": torch.uint8, "BOOL": torch.bool,
+}
+# Ranges closer than this are fetched in one request (fewer round trips).
+_RANGE_MERGE_GAP = 1 << 20
+
+
+def _remote_url(repo_id: str, filename: str) -> str:
+    from huggingface_hub import hf_hub_url
+    return hf_hub_url(repo_id, filename)
+
+
+class RangeFile:
+    """A remote safetensors file read with HTTP range requests.
+
+    Only the header and the byte ranges of requested tensors cross the
+    network; nothing is written to disk (the node keeps the tensors it
+    loads in memory, a re-plan fetches the new range again)."""
+
+    def __init__(self, url: str, headers: Optional[Dict[str, str]] = None):
+        self.url = url
+        self.headers = dict(headers or {})
+        self.bytes_fetched = 0
+        head = self._get(0, 7)
+        n = int.from_bytes(head, "little")
+        meta = json.loads(self._get(8, 8 + n - 1))
+        meta.pop("__metadata__", None)
+        self.base = 8 + n
+        self.meta = meta  # name -> {dtype, shape, data_offsets}
+
+    def _get(self, start: int, end: int) -> bytes:
+        import requests
+        r = requests.get(self.url, headers={**self.headers, "Range": f"bytes={start}-{end}"},
+                         timeout=60, allow_redirects=True)
+        r.raise_for_status()
+        if r.status_code != 206:
+            raise IOError(f"{self.url}: server ignored the range request")
+        data = r.content
+        if len(data) != end - start + 1:
+            raise IOError(f"{self.url}: short range read {len(data)} != {end - start + 1}")
+        self.bytes_fetched += len(data)
+        return data
+
+    def keys(self) -> List[str]:
+        return list(self.meta)
+
+    def get_tensors(self, names: List[str]) -> Dict[str, torch.Tensor]:
+        """Fetch several tensors, merging nearby ranges into one request."""
+        spans = sorted((self.meta[n]["data_offsets"][0], self.meta[n]["data_offsets"][1], n)
+                       for n in names)
+        out: Dict[str, torch.Tensor] = {}
+        i = 0
+        while i < len(spans):
+            a, b, _ = spans[i]
+            j = i
+            while j + 1 < len(spans) and spans[j + 1][0] - b <= _RANGE_MERGE_GAP:
+                j += 1
+                b = max(b, spans[j][1])
+            blob = self._get(self.base + a, self.base + b - 1) if b > a else b""
+            for sa, sb, name in spans[i:j + 1]:
+                info = self.meta[name]
+                dtype = _ST_DTYPES[info["dtype"]]
+                raw = bytearray(blob[sa - a:sb - a])
+                t = torch.frombuffer(raw, dtype=dtype) if raw else torch.empty(0, dtype=dtype)
+                out[name] = t.reshape(info["shape"]).clone()
+            i = j + 1
+        return out
+
+
+def _range_file(repo_id: str, filename: str) -> Optional[RangeFile]:
+    """RangeFile for a hub file that is not cached locally, or None (local
+    dir, cached, offline, disabled, or the server cannot serve ranges)."""
+    if os.path.isdir(repo_id) or os.getenv("HF_HUB_OFFLINE") == "1" \
+            or os.getenv("SYNAPSE_RANGE_FETCH", "1") == "0":
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(repo_id, filename, local_files_only=True)
+        return None  # already cached: read it from disk
+    except Exception:
+        pass
+    try:
+        try:
+            from huggingface_hub.utils import build_hf_headers
+            headers = build_hf_headers()
+        except Exception:
+            headers = {}
+        return RangeFile(_remote_url(repo_id, filename), headers)
+    except Exception as e:
+        if DEBUG >= 1:
+            print(f"[PartialModel] range reads unavailable for {repo_id}/{filename} ({e}); "
+                  "downloading the whole file")
+        return None
+
+
+def checkpoint_index(repo_id: str, remote: Optional[Dict[str, "RangeFile"]] = None
+                     ) -> Optional[Dict[str, str]]:
     """tensor name -> checkpoint file name (relative to the repo), or None
-    (no safetensors). Reads only the index; shard files are not fetched."""
+    (no safetensors). Reads only the index; shard files are not fetched.
+    A single uncached file is opened for range reads (stored in `remote`)
+    instead of being downloaded just to list its tensors."""
     idx = _hub_file(repo_id, "model.safetensors.index.json")
     if idx:
         with open(idx, encoding="utf-8") as f:
             return dict(json.load(f).get("weight_map", {}))
+    rf = _range_file(repo_id, "model.safetensors")
+    if rf is not None:
+        if remote is not None:
+            remote["model.safetensors"] = rf
+        return {k: "model.safetensors" for k in rf.keys()}
     single = _hub_file(repo_id, "model.safetensors")
     if not single:
         return None
@@ -84,7 +193,9 @@ class PartialModel:
         except Exception:
             pass
         self.n_layers = int(self.config.num_hidden_layers)
-        self.index = checkpoint_index(repo_id)
+        # checkpoint file name -> RangeFile, for files read over HTTP ranges
+        self.remote: Dict[str, RangeFile] = {}
+        self.index = checkpoint_index(repo_id, self.remote)
         if self.index is None:
             raise FileNotFoundError(f"{repo_id}: no safetensors checkpoint")
         # checkpoint file name -> local path, for the files fetched so far
@@ -166,6 +277,12 @@ class PartialModel:
                 raise KeyError(f"{self.repo_id}: tensor {full!r} not in checkpoint")
             by_file.setdefault(self.index[ck], []).append((local, ck))
         for name, pairs in by_file.items():
+            rf = self.remote.get(name)
+            if rf is not None:
+                got = rf.get_tensors([ck for _, ck in pairs])
+                for local, ck in pairs:
+                    state[local] = got[ck]
+                continue
             with safe_open(self._file(name), "pt") as f:
                 for local, ck in pairs:
                     state[local] = f.get_tensor(ck)
@@ -253,6 +370,41 @@ class PartialModel:
             else:
                 self._load(head, head_path)
             self.lm_head = head
+
+    def files_for(self, start: int, end: int, first: bool, last: bool) -> List[str]:
+        """Checkpoint files holding a shard's tensors, without loading any."""
+        sk = self._skeleton
+        lp = self._layers_path
+        names: List[str] = []
+        layer0 = self._sub(sk, lp)[0]
+        for i in range(start, end + 1):
+            names += [f"{lp}.{i}.{k}" for k in layer0.state_dict().keys()]
+        mods = []
+        if first:
+            mods.append(sk.get_input_embeddings())
+            wpe = getattr(getattr(sk, "transformer", None), "wpe", None)
+            if wpe is not None:
+                mods.append(wpe)
+        if last:
+            norm = self._final_norm_module(sk)
+            if norm is not None:
+                mods.append(norm)
+            # a tied head reads the input embedding
+            mods.append(sk.get_input_embeddings() if self.head_tied else sk.get_output_embeddings())
+        for mod in mods:
+            path = self._path_of(sk, mod)
+            names += [f"{path}.{k}" for k in mod.state_dict().keys()]
+        files = {self.index[ck] for ck in map(self._ckpt_name, names) if ck is not None}
+        return sorted(files)
+
+    def prefetch(self, start: int, end: int, first: bool, last: bool) -> List[str]:
+        """Download (into the HF cache) only the files a shard needs. Files
+        read over HTTP ranges are skipped: their bytes are fetched at load."""
+        files = self.files_for(start, end, first, last)
+        for name in files:
+            if name not in self.remote:
+                self._file(name)
+        return files
 
     @staticmethod
     def _final_norm_module(sk):

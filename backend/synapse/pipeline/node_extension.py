@@ -397,6 +397,7 @@ class DistributedPipelineExtension:
         request_id: Optional[str] = None,
         learning_rate: float = 1e-4,
         schedule: str = "ddp",
+        lora: Optional[dict] = None,
     ) -> float:
         """Distributed training step.
 
@@ -410,8 +411,11 @@ class DistributedPipelineExtension:
         if schedule in ("pipeline", "1f1b"):
             return await self.train_step_pipeline(
                 base_shard, input_ids, labels,
-                request_id=request_id, learning_rate=learning_rate,
+                request_id=request_id, learning_rate=learning_rate, lora=lora,
             )
+        if lora:
+            raise ValueError("LoRA runs on the pipeline schedule (each node trains "
+                             "adapters on its own layers), not ddp")
         if request_id is None:
             request_id = str(uuid.uuid4())
 
@@ -552,6 +556,7 @@ class DistributedPipelineExtension:
         request_id: Optional[str] = None,
         learning_rate: float = 1e-4,
         num_micro_batches: Optional[int] = None,
+        lora: Optional[dict] = None,
     ) -> float:
         """Pipeline-parallel step over the current partition: every node
         trains exactly the layer range it serves (no whole-model load) and
@@ -568,13 +573,14 @@ class DistributedPipelineExtension:
                 # recover from, and the write would be per-step disk chatter.
                 shard = node.get_current_shard(base_shard)
                 length = np.ones(max(1, input_ids.shape[0] if input_ids.ndim >= 1 else 1))
+                extra = {"lora": lora} if lora else {}
                 loss, _ = await node.inference_engine.train(
-                    request_id, shard, input_ids, labels, length, sync_gradients=False,
+                    request_id, shard, input_ids, labels, length, sync_gradients=False, **extra,
                 )
                 return float(loss) if loss is not None else 0.0
             return await self.pp_trainer.train_step(
                 plan, input_ids, labels, lr=learning_rate,
-                num_micro_batches=num_micro_batches,
+                num_micro_batches=num_micro_batches, lora=lora,
             )
         finally:
             node.outstanding_requests.pop(request_id, None)

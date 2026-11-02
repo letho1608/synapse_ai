@@ -67,12 +67,14 @@ class PipelineTrainer:
                   tensor: Optional[np.ndarray] = None, **extra) -> None:
         m = {"kind": KIND, "op": op, "job": meta["job"], "plan": meta["plan"],
              "model": meta["model"], "orch": meta["orch"], **extra}
+        if meta.get("lora"):
+            m["lora"] = meta["lora"]
         await self.send(target, _EMPTY if tensor is None else tensor, m)
 
-    async def _prepare(self, shard: Shard) -> None:
-        key = (shard.model_id, shard.start_layer, shard.end_layer)
+    async def _prepare(self, shard: Shard, lora: Optional[Dict[str, Any]] = None) -> None:
+        key = (shard.model_id, shard.start_layer, shard.end_layer, repr(lora))
         if not self._prepared.get(key):
-            await self.engine.stage_train_prepare(shard)
+            await self.engine.stage_train_prepare(shard, lora=lora)
             self._prepared[key] = True
 
     # ---------------------------------------------------------- stage worker
@@ -107,7 +109,7 @@ class PipelineTrainer:
     async def _on_fwd(self, tensor, meta) -> None:
         stage, mb = int(meta["stage"]), int(meta["mb"])
         _, shard = self._shard(meta, stage)
-        await self._prepare(shard)
+        await self._prepare(shard, meta.get("lora"))
         labels = None
         if shard.is_last_layer():
             labels = np.asarray(meta["labels"], dtype=np.int64).reshape(meta["labels_shape"])
@@ -205,8 +207,10 @@ class PipelineTrainer:
     async def train_step(self, plan: List[Tuple[str, Shard]], input_ids: np.ndarray,
                          labels: np.ndarray, lr: float = 1e-5,
                          num_micro_batches: Optional[int] = None,
-                         max_grad_norm: float = 1.0) -> float:
-        """Run one optimizer step of the pipeline; returns the mean loss."""
+                         max_grad_norm: float = 1.0,
+                         lora: Optional[Dict[str, Any]] = None) -> float:
+        """Run one optimizer step of the pipeline; returns the mean loss.
+        `lora` (stage_lora settings) trains adapters instead of the weights."""
         if not plan:
             raise ValueError("empty plan")
         ids = np.asarray(input_ids)
@@ -227,6 +231,8 @@ class PipelineTrainer:
         self._jobs[job_id] = job
         meta = {"job": job_id, "plan": _plan_to_wire(plan), "model": plan[0][1].model_id,
                 "orch": self.node_id}
+        if lora:
+            meta["lora"] = lora
         first = plan[0][0]
         try:
             for i, idx in enumerate(chunks):

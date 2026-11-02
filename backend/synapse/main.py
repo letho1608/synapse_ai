@@ -22,12 +22,11 @@ from synapse.routing.libp2p_node import Libp2pNode
 from synapse.api import ChatGPTAPI
 # REFACTORED IMPORTS
 from synapse.loading import ShardDownloader, RepoProgressEvent, get_models_dir
-from synapse.helpers import DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, check_model_hardware_fit
+from synapse.helpers import DEBUG, get_system_info, get_or_create_node_id, check_model_hardware_fit
 from synapse.inference.shard import Shard
 from synapse.inference.inference_engine import get_inference_engine
 from synapse.inference.tokenizers import resolve_tokenizer
 from synapse.models import build_base_shard, get_repo
-from synapse.viz.topology_viz import TopologyViz
 from synapse.networking.udp.udp_discovery import UDPDiscovery
 from synapse.networking.tailscale.tailscale_discovery import TailscaleDiscovery
 from synapse.networking.manual.manual_discovery import ManualDiscovery
@@ -73,7 +72,8 @@ parser.add_argument("--chatgpt-api-port", type=int, default=52415, help="ChatGPT
 parser.add_argument("--chatgpt-api-response-timeout", type=int, default=600, help="ChatGPT API response timeout in seconds")
 parser.add_argument("--max-generate-tokens", type=int, default=10000, help="Max tokens to generate in each request")
 parser.add_argument("--inference-engine", type=str, default="pytorch", help="Inference engine (pytorch)")
-parser.add_argument("--disable-tui", action=argparse.BooleanOptionalAction, default=True, help="Disable TUI (default: on)")
+# Accepted for old scripts; the topology TUI was folded into `synapse console`.
+parser.add_argument("--disable-tui", action=argparse.BooleanOptionalAction, default=True, help=argparse.SUPPRESS)
 parser.add_argument("--run-model", type=str, help="Specify a model to run directly")
 parser.add_argument("--prompt", type=str, help="Prompt for the model when using --run-model", default="")
 parser.add_argument("--default-temp", type=float, help="Default token sampling temperature", default=0.7)
@@ -141,8 +141,6 @@ shard_downloader: ShardDownloader = inference_engine.shard_downloader
 if DEBUG >= 1: print(f"Using node port: {args.node_port}")
 
 args.node_id = args.node_id or get_or_create_node_id(args.node_port or 5678)
-chatgpt_api_endpoints = [f"http://{ip}:{args.chatgpt_api_port}/v1/chat/completions" for ip, _ in get_all_ip_addresses_and_interfaces()]
-web_chat_urls = [f"http://{ip}:{args.chatgpt_api_port}" for ip, _ in get_all_ip_addresses_and_interfaces()]
 
 # Convert node-id-filter and interface-type-filter to lists if provided
 allowed_node_ids = args.node_id_filter.split(',') if args.node_id_filter else None
@@ -156,7 +154,9 @@ event_router = EventRouter()
 from synapse.transport.tls_wrap import configure_from_env as _tls_configure, tls_enabled as _tls_enabled
 _tls_mode = _tls_enabled()
 _tls_server_ctx, _tls_client_ctx, _tls_fp = _tls_configure(args.node_id)
-if _tls_fp and DEBUG >= 1:
+if _tls_mode == "cluster":
+  print("[TLS] paired: mutual TLS with machines that share this pairing code")
+elif _tls_fp and DEBUG >= 1:
   print(f"[TLS] mode={_tls_mode} pin={_tls_fp} (share it in peers' SYNAPSE_TLS_PINS)")
 # C-W3: --node-host actually binds the P2P listener now (was parsed, ignored).
 libp2p_node = Libp2pNode(args.node_id, args.node_port or 5678, event_router,
@@ -164,7 +164,6 @@ libp2p_node = Libp2pNode(args.node_id, args.node_port or 5678, event_router,
                          ssl_server_ctx=_tls_server_ctx,
                          ssl_client_ctx=_tls_client_ctx, tls_fp=_tls_fp)
 
-topology_viz = TopologyViz(chatgpt_api_endpoints=chatgpt_api_endpoints, web_chat_urls=web_chat_urls) if not args.disable_tui else None
 # LACP multi-resource partitioning is built into Node via compute_partition()
 if DEBUG >= 1: print("Using LACP (Multi-Resource + Latency Clustering) partitioning strategy")
 
@@ -221,7 +220,6 @@ node = Node(
     inference_engine,
     shard_downloader,
     max_generate_tokens=args.max_generate_tokens,
-    topology_viz=topology_viz,
     default_sample_temperature=args.default_temp,
     partition_method=args.partition_method,
     tflops_proportional=not args.no_tflops_proportional,
@@ -234,7 +232,6 @@ api = ChatGPTAPI(
   node,
   node.inference_engine.__class__.__name__,
   response_timeout=args.chatgpt_api_response_timeout,
-  on_chat_completion_request=lambda req_id, __, prompt: topology_viz.update_prompt(req_id, prompt) if topology_viz else None,
   default_model=default_model,
   system_prompt=args.system_prompt,
   chatgpt_api_port=args.chatgpt_api_port,
@@ -243,48 +240,6 @@ if args.default_model:
   # An explicit --default-model wins over config/settings.json (which the
   # API loads in its constructor); settings only fill in when none is given.
   api.default_model = args.default_model
-buffered_token_output = {}
-def update_topology_viz(req_id, tokens, is_finished):
-  if not topology_viz: return
-  if not node.inference_engine.shard: return
-  # CRITICAL FIX: Always update buffer, even with empty tokens
-  if req_id in buffered_token_output: 
-    buffered_token_output[req_id].extend(tokens)
-  else: 
-    buffered_token_output[req_id] = list(tokens) if tokens else []
-  
-  # CRITICAL FIX: Decode and update output, even if tokens are empty
-  # This ensures terminal shows output even if generation finished with no tokens
-  try:
-    if buffered_token_output[req_id]:
-      decoded = node.inference_engine.tokenizer.decode(buffered_token_output[req_id])
-    else:
-      # If no tokens, show empty string (or a message if finished)
-      decoded = "" if not is_finished else "(no output generated)"
-    topology_viz.update_prompt_output(req_id, decoded)
-    if DEBUG >= 2:
-      print(f"[update_topology_viz] req_id={req_id}, tokens={tokens}, is_finished={is_finished}, decoded={decoded[:50] if decoded else 'empty'}")
-  except Exception as e:
-    if DEBUG >= 1:
-      print(f"[update_topology_viz] Error decoding tokens: {e}")
-      import traceback
-      traceback.print_exc()
-    # Still update with empty string to show something
-    topology_viz.update_prompt_output(req_id, "")
-# Subscribe UI updates to P2P events
-event_router.subscribe(f"synapse/inference/result/{node.id}", lambda ev: update_topology_viz(ev.data.get("request_id"), ev.data.get("tokens"), ev.data.get("is_finished")))
-def update_prompt_viz(request_id, opaque_status: str):
-  if not topology_viz: return
-  try:
-    status = json.loads(opaque_status)
-    if status.get("type") != "node_status" or status.get("status") != "start_process_prompt": return
-    topology_viz.update_prompt(request_id, status.get("prompt", "corrupted prompt (this should never happen)"))
-  except Exception as e:
-    if DEBUG >= 2:
-      print(f"Failed to update prompt viz: {e}")
-      traceback.print_exc()
-event_router.subscribe("synapse/cluster/status", lambda ev: update_prompt_viz("", ev.data))
-
 def preemptively_load_shard(request_id: str, opaque_status: str):
   try:
     status = json.loads(opaque_status)
@@ -319,9 +274,6 @@ async def run_model_cli(node: Node, model_name: str, prompt: str):
   tokenizer = await resolve_tokenizer(get_repo(shard.model_id, inference_class))
   request_id = str(uuid.uuid4())
   
-  if topology_viz:
-    topology_viz.update_prompt(request_id, prompt)
-    
   try:
     if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
       prompt = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)

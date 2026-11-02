@@ -7,7 +7,7 @@ TensorTCPTransport takes the same server/client contexts: a TLS client
 delivers bit-exact over TLS, and a plaintext client cannot inject frames
 into a TLS server.
 
-Port 59421/59422: unused by any other test module.
+Ports come from the OS (fixed numbers collided with other processes).
 """
 import asyncio
 
@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from synapse.transport.codec import encode_tensor
+from test_tls_interop import _free_port
 from synapse.transport.tcp_transport import TensorTCPTransport
 from synapse.transport.tls_wrap import (
     build_client_context,
@@ -51,14 +52,15 @@ async def _wait(received, n=1):
 @pytest.mark.asyncio
 async def test_chunked_tensor_over_tls(tmp_path):
     srv_ctx, cli_ctx = _ctxs(tmp_path)
-    srv = TensorTCPTransport("srv", port=59421, ssl_server_ctx=srv_ctx)
+    port = _free_port()
+    srv = TensorTCPTransport("srv", port=port, ssl_server_ctx=srv_ctx)
     cli = TensorTCPTransport("cli", ssl_client_ctx=cli_ctx)
     received = []
     srv.set_tensor_handler(received.append)
     await srv.start()
     try:
         arr = np.arange(3 * 1024 * 1024, dtype=np.float32).reshape(3, 1024, 1024)
-        assert await cli.send_blob_chunked("127.0.0.1:59421", _blob(arr, "r-tls"))
+        assert await cli.send_blob_chunked(f"127.0.0.1:{port}", _blob(arr, "r-tls"))
         await _wait(received)
         assert received and np.array_equal(received[0].tensor, arr)
         writer, _ = next(iter(cli.client_pool._conns.values()))
@@ -71,14 +73,15 @@ async def test_chunked_tensor_over_tls(tmp_path):
 @pytest.mark.asyncio
 async def test_plaintext_client_cannot_inject_into_tls_server(tmp_path):
     srv_ctx, _ = _ctxs(tmp_path)
-    srv = TensorTCPTransport("srv", port=59422, ssl_server_ctx=srv_ctx)
+    port = _free_port()
+    srv = TensorTCPTransport("srv", port=port, ssl_server_ctx=srv_ctx)
     plain = TensorTCPTransport("plain")
     received = []
     srv.set_tensor_handler(received.append)
     await srv.start()
     try:
         arr = np.ones((4, 4), dtype=np.float32)
-        await plain.send_blob_chunked("127.0.0.1:59422", _blob(arr, "r-plain"))
+        await plain.send_blob_chunked(f"127.0.0.1:{port}", _blob(arr, "r-plain"))
         await asyncio.sleep(1.0)
         assert received == []
     finally:

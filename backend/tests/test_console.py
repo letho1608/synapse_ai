@@ -173,7 +173,7 @@ def test_console_main_parses_flags(monkeypatch):
     code = C.main(["--model", "m1", "--chat-port", "5555", "--headless"])
     assert code == 7
     assert called["model"] == "m1" and called["chat_port"] == 5555
-    assert called["headless"] is True and called["no_tui"] is True
+    assert called["headless"] is True
     # cli + root dispatch reach the console entry
     seen = {}
 

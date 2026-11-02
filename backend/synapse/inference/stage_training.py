@@ -41,8 +41,14 @@ class StageTrainingMixin:
         """(name, parameter) for everything this node trains for `shard`.
         Names are stable across nodes ("layers.7.mlp.up_proj.weight",
         "embed.weight", "head.weight", "norm.weight"); a tensor shared by
-        two modules (head tied to embed on the same node) is listed once."""
+        two modules (head tied to embed on the same node) is listed once.
+        With LoRA on, only the adapters of the served layers are trained."""
         pm = self._pm
+        if self._lora_cfg is not None:
+            from synapse.training.stage_lora import lora_parameters
+            return [(f"layers.{i}.{n}", p)
+                    for i in range(shard.start_layer, shard.end_layer + 1)
+                    for n, p in lora_parameters(pm.layers[i])]
         out: List[Tuple[str, Any]] = []
         seen = set()
 
@@ -69,6 +75,8 @@ class StageTrainingMixin:
         the input embedding on a first-only stage, the head on a last-only
         stage. None when not tied or when one stage holds both ends."""
         pm = self._pm
+        if self._lora_cfg is not None:
+            return None  # embeddings are frozen under LoRA
         if not getattr(pm, "head_tied", False) or (shard.is_first_layer() and shard.is_last_layer()):
             return None
         if shard.is_first_layer():
@@ -77,17 +85,61 @@ class StageTrainingMixin:
             return pm.lm_head.weight
         return None
 
-    async def stage_train_prepare(self, shard) -> None:
-        """Load the served range (no whole-model load) and make it trainable."""
+    # LoRA settings of the current training job (stage_lora.normalize_config),
+    # None for full fine-tuning.
+    _lora_cfg: Optional[Dict[str, Any]] = None
+
+    async def stage_train_prepare(self, shard, lora: Optional[Dict[str, Any]] = None) -> None:
+        """Load the served range (no whole-model load) and make it trainable:
+        every weight (full fine-tuning) or LoRA adapters over frozen weights."""
+        from synapse.training import stage_lora
         await self.ensure_shard(shard)
         if self._pm is None:
             raise RuntimeError("pipeline training needs layer-range loading (SYNAPSE_PARTIAL_LOAD=1)")
-        if getattr(self._pm, "quant_mode", "none") != "none":
-            raise RuntimeError(
-                f"cannot train quantized weights (quant={self._pm.quant_mode}); "
-                "set SYNAPSE_WEIGHT_QUANT=none")
+        lora = stage_lora.normalize_config(lora)
+        layers = [self._pm.layers[i] for i in range(shard.start_layer, shard.end_layer + 1)]
+        if lora is None:
+            if getattr(self._pm, "quant_mode", "none") != "none":
+                raise RuntimeError(
+                    f"cannot fully fine-tune quantized weights (quant={self._pm.quant_mode}); "
+                    "train LoRA adapters instead (use_lora) or set SYNAPSE_WEIGHT_QUANT=none")
+            if any(stage_lora.has_lora(l) for l in layers):
+                raise RuntimeError("layers carry LoRA adapters: merge them (stage_lora_merge) "
+                                   "before full fine-tuning")
+            self._lora_cfg = None
+        else:
+            if self._lora_cfg is not None and self._lora_cfg != lora:
+                raise RuntimeError(f"LoRA already set up with {self._lora_cfg}; merge first")
+            with self._forward_lock:
+                wrapped = sum(stage_lora.inject(l, lora) for l in layers)
+                if wrapped and getattr(self, "_fast_dec", None) is not None:
+                    self._fast_dec.forget()  # projections replaced: rebuild plans
+            if not any(stage_lora.has_lora(l) for l in layers):
+                raise RuntimeError(f"no LoRA target {lora['target_modules']} in this model's layers")
+            self._lora_cfg = lora
         for _, p in self._stage_params(shard):
             p.requires_grad_(True)
+
+    def stage_lora_merge(self, shard) -> int:
+        """Fold this stage's adapters into its weights (full-speed inference)
+        and return to full fine-tuning mode. Returns adapters merged."""
+        from synapse.training import stage_lora
+        with self._forward_lock:
+            n = sum(stage_lora.merge(self._pm.layers[i])
+                    for i in range(shard.start_layer, shard.end_layer + 1) if i in self._pm.layers)
+            if getattr(self, "_fast_dec", None) is not None:
+                self._fast_dec.forget()
+            self._seq_kv.clear()
+            self._stage_opt = None
+            self._lora_cfg = None
+        return n
+
+    def stage_lora_state(self, shard) -> Dict[str, Any]:
+        """This stage's adapters (CPU tensors) + settings, for saving."""
+        if self._lora_cfg is None:
+            return {"config": None, "tensors": {}}
+        return {"config": self._lora_cfg,
+                "tensors": {n: p.detach().cpu().clone() for n, p in self._stage_params(shard)}}
 
     # -- forward / backward -------------------------------------------------
     def _stage_modules(self, shard):

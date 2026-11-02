@@ -1,6 +1,6 @@
 """
-Finetuning LLM that voi Hugging Face Transformers + PEFT (LoRA).
-Support ca Local va Distributed (Pipeline LACP + Ring All-Reduce).
+Dataset loading and sample formatting for fine-tuning (full or LoRA, see
+synapse.training.stage_lora).
 """
 
 from __future__ import annotations
@@ -57,20 +57,4 @@ def format_sample_to_text(sample: Dict[str, Any], tokenizer: Any) -> str:
     if "text" in sample:
         return sample["text"] if isinstance(sample["text"], str) else str(sample["text"])
     return json.dumps(sample, ensure_ascii=False)
-
-
-def _build_lora_config(job: Dict[str, Any]):
-    try:
-        from peft import LoraConfig, TaskType
-    except ImportError:
-        return None
-    r = int(job.get("lora_r", 8))
-    alpha = int(job.get("lora_alpha", 16))
-    dropout = float(job.get("lora_dropout", 0.05))
-    target_modules = job.get("lora_target_modules")
-    if isinstance(target_modules, str):
-        target_modules = [m.strip() for m in target_modules.split(",") if m.strip()]
-    if not target_modules:
-        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
-    return LoraConfig(r=r, lora_alpha=alpha, target_modules=target_modules, lora_dropout=dropout, bias="none", task_type=TaskType.CAUSAL_LM,)
 

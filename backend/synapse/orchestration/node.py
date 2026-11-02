@@ -40,7 +40,6 @@ class Node:
     max_generate_tokens: int = 1024,
     default_sample_temperature: float = 0.0,
     max_concurrent_requests: int = 32,
-    topology_viz: Optional[Any] = None,
     partition_method: str = "lrm",
     tflops_proportional: bool = True,
     ilp_time_limit_seconds: Optional[float] = None,
@@ -120,7 +119,6 @@ class Node:
     self.checkpoints: Dict[str, Dict[str, int]] = {}
     
     self.max_generate_tokens = max_generate_tokens
-    self.topology_viz = topology_viz
     self.default_sample_temperature = default_sample_temperature
     self.num_micro_batches = 1
     self.tflops_proportional = tflops_proportional  # TFLOPS-proportional sharding (multi-resource LACP off by default)
@@ -362,11 +360,9 @@ class Node:
         except Exception as e:
             if DEBUG >= 1:
                 print(f"Cluster state broadcast failed: {e}")
-        # T3.3 advisory (default ON, observe-only): aggregate gossip demand
-        # every ~6th beat so operators see the loop working live. Set
-        # SYNAPSE_AUTOSCALE=off to silence. Advisory HINTS (not actions) are
-        # evaluated only under SYNAPSE_AUTOSCALE=advise; actuating stays
-        # gated on the C1 live gate — "on" currently means "advise".
+        # T3.3: aggregate gossip demand every ~6th beat and evaluate the
+        # autoscale hints; SYNAPSE_AUTOSCALE=on (default) acts on them
+        # (_actuate_autoscale), =advise only logs, =off silences it.
         beats += 1
         if beats % 6 == 0:
             try:
@@ -498,8 +494,6 @@ class Node:
         progress = RepoProgressEvent.from_dict(status_data.get('progress'))
         self.node_download_progress[status_data.get('node_id')] = progress
 
-      if self.topology_viz:
-        self.topology_viz.update_visualization(self.topology, self._compute_lacp_partition(), self.id, self.node_download_progress)
         
     except Exception as e:
       if DEBUG >= 1: print(f"Error in on_node_status: {e}")
@@ -597,13 +591,13 @@ class Node:
       pass
 
   async def _log_demand_summary(self) -> None:
-    """Aggregate gossip demand and log it (T3.3, observe-only).
+    """Aggregate gossip demand, evaluate autoscale hints, act on them.
 
-    SYNAPSE_AUTOSCALE=off silences this. =advise additionally evaluates
-    advisory HINTS (never actions) using the pipeline truth that every
-    partitioned node serves the one sharded model; standby = topology
-    nodes outside the partition. Actuating ("on" meaning actions) stays
-    gated on the C1 live gate — today "on" behaves as "advise".
+    Every partitioned node serves the one sharded model; standby = topology
+    nodes the placement left out (e.g. the latency objective found fewer
+    stages faster). SYNAPSE_AUTOSCALE=off silences this, =advise only logs
+    the hints, =on (default) also acts on them on the master
+    (_actuate_autoscale).
     """
     import os as _os
     if _os.getenv("SYNAPSE_AUTOSCALE", "on") == "off":
@@ -631,15 +625,63 @@ class Node:
       models = {getattr(getattr(self.inference_engine, "shard", None),
                         "model_id", "") or ""}
       servers = {m: serving_nodes for m in models}
-      hints = evaluate(agg, servers, standby)
+      hints = evaluate(agg, servers, standby, fit_fn=self._standby_fits)
       if hints and DEBUG >= 1:
-        print(f"[AUTOSCALE] advisory hints (no action taken): {hints}")
+        print(f"[AUTOSCALE] hints: {hints}")
       self._last_autoscale_hints = hints
+      if _os.getenv("SYNAPSE_AUTOSCALE", "on") == "on":
+        await self._actuate_autoscale(hints)
       if DEBUG >= 1 and (standby or hints):
         print(f"[AUTOSCALE] serving={serving_nodes} standby={standby}")
     except Exception as e:
       if DEBUG >= 1:
         print(f"[AUTOSCALE] summary failed: {e}")
+
+  # Seconds between two autoscale placement changes (no flapping).
+  AUTOSCALE_COOLDOWN_S = 60.0
+
+  def _standby_fits(self, node_id: str, model_id: str) -> Optional[bool]:
+    """Can a standby node hold at least one layer of the model? From its
+    gossiped layer profile; None (unknown) never promotes."""
+    if node_id == self.id:
+      prof = self._local_layer_profile(model_id)
+    else:
+      prof = (((getattr(self, "_peer_capabilities", {}) or {}).get(node_id) or {})
+              .get("layer_profiles") or {}).get(model_id)
+    if not prof:
+      return None
+    return int(prof.get("max_layers") or 0) > 0
+
+  async def _actuate_autoscale(self, hints, now: Optional[float] = None) -> Optional[str]:
+    """Act on autoscale hints (master only). Returns the new placement
+    objective when it changed, else None.
+
+    promote (hot model / queue backlog, a fitting node idle): place for
+    throughput, which spreads layers over more nodes so concurrent requests
+    pipeline. demote (servers idle): back to the configured objective. The
+    master re-broadcasts the partition on the next request, so nothing is
+    interrupted mid-generation."""
+    if not self.election_manager.is_master():
+      return None
+    actions = {h.get("action") for h in (hints or [])}
+    if "promote" in actions:
+      want = "throughput"
+    elif "demote" in actions:
+      want = None  # configured objective
+    else:
+      return None
+    if want == getattr(self, "_autoscale_objective", None):
+      return None
+    now = time.monotonic() if now is None else now
+    last = getattr(self, "_autoscale_changed_at", None)
+    if last is not None and now - last < self.AUTOSCALE_COOLDOWN_S:
+      return None
+    self._autoscale_objective = want
+    self._autoscale_changed_at = now
+    self._autoscale_actions = getattr(self, "_autoscale_actions", 0) + 1
+    print(f"[AUTOSCALE] placement objective -> {want or 'configured'} "
+          f"({', '.join(sorted(a for a in actions if a))})")
+    return want or "configured"
 
   async def _on_ft_heartbeat(self, event: Event):
     """Record a peer's fault-tolerance heartbeat (B5)."""
@@ -711,7 +753,7 @@ class Node:
           if DEBUG >= 1: print(f"!!! [LACP_FAULT] Node {dead_id} is dead, triggering rebalance")
 
           current_assignments = {}
-          partitions = self._compute_lacp_partition()
+          partitions = self._compute_lacp_partition(include_dead=True)
           # H4: never hardcode 32 — prefer the loaded shard's layer count,
           # else the widest assigned range, else 32 as last resort.
           total_layers = self._infer_total_layers(None)
@@ -1857,11 +1899,11 @@ class Node:
     if not self.topology.nodes:
       if DEBUG >= 1: print("No nodes in topology. Skipping forward.")
       return None
-    # CRITICAL FIX: Use authoritative partitions from master if available,
-    # otherwise compute locally (fallback for single-node or before first broadcast)
-    if self._authoritative_partitions is not None:
-        partitions = self._authoritative_partitions
-    else:
+    # The master's broadcast partition while every node in it is alive,
+    # otherwise computed locally (single node, before the first broadcast,
+    # or the master / a stage died and no new master has re-planned yet).
+    partitions = self._live_authoritative()
+    if partitions is None:
         partitions = self._compute_lacp_partition(base_shard)
     current_partition_index = next((i for i, p in enumerate(partitions) if p.node_id == self.id), None)
     if current_partition_index is None:
@@ -1872,13 +1914,25 @@ class Node:
   def get_current_shard(self, base_shard: Shard, index: Optional[int] = None) -> Shard:
     if index is None:
       index = self.get_partition_index(base_shard=base_shard)
-    # CRITICAL FIX: Use authoritative partitions if available
-    if self._authoritative_partitions is not None:
-        partitions = self._authoritative_partitions
-    else:
+    partitions = self._live_authoritative()
+    if partitions is None:
         partitions = self._compute_lacp_partition(base_shard)
     shards = map_partitions_to_shards(partitions, base_shard.n_layers, base_shard.model_id)
     return shards[index]
+
+  def _live_authoritative(self) -> Optional[List[Partition]]:
+    """The master's partition, or None when it names a node that is dead
+    or gone from the topology. Without this, after the master died every
+    request on the survivors was planned onto the dead node and paid the
+    mid-request failover timeout until a new master re-broadcast."""
+    parts = self._authoritative_partitions
+    if parts is None:
+      return None
+    if any(p.node_id not in self.topology.nodes or not self._node_alive(p.node_id) for p in parts):
+      if DEBUG >= 1:
+        print("[PARTITION] master's partition names a dead node: re-planning locally")
+      return None
+    return parts
 
   async def update_peers(self, wait_for_peers: int = 0) -> bool:
     next_peers = await self.discovery.discover_peers(wait_for_peers) if hasattr(self, "discovery") else []
@@ -2071,8 +2125,6 @@ class Node:
     # Cluster composition changed: refresh the election weight so a stronger
     # node's master weight reflects the LACP composite score over the cluster.
     self._refresh_election_weight()
-    if self.topology_viz:
-      self.topology_viz.update_visualization(self.topology, self._compute_lacp_partition(), self.id)
 
     # CRITICAL FIX: Master broadcasts authoritative topology to ensure all nodes agree
     if self.election_manager.is_master():
@@ -2442,12 +2494,15 @@ class Node:
     rtt = {}
     for peer, ms in getattr(self, "_measured_rtt", {}).items():
       rtt[(self.id, peer)] = ms / 2.0  # one-way hop
-    objective = getattr(self, "partition_objective", None) or       _os.getenv("SYNAPSE_PARTITION_OBJECTIVE", "throughput")
+    objective = getattr(self, "_autoscale_objective", None) or \
+      getattr(self, "partition_objective", None) or \
+      _os.getenv("SYNAPSE_PARTITION_OBJECTIVE", "throughput")
     placement = plan(profiles, total, rtt, objective)
     if placement is None:
       return None
     prev = getattr(self, "_last_placement", None)
     if prev is not None and prev.get("model_id") == model_id and prev.get("total") == total \
+        and prev.get("objective") == objective \
         and all(nid in self.topology.nodes for nid, _, _ in prev["stages"]):
       by_id = {p.node_id: p for p in profiles}
       stages = prev["stages"]
@@ -2470,17 +2525,22 @@ class Node:
     return [Partition(node_id=nid, start=a / total, end=(b + 1) / total)
             for nid, a, b in placement.stages]
 
-  def _compute_lacp_partition(self, base_shard: Optional[Shard] = None) -> List[Partition]:
+  def _compute_lacp_partition(self, base_shard: Optional[Shard] = None,
+                              include_dead: bool = False) -> List[Partition]:
     """Measured DP placement when every node has reported its layer cost;
-    else TFLOPS-proportional (default) or LACP multi-resource scoring."""
+    else TFLOPS-proportional (default) or LACP multi-resource scoring.
+    include_dead keeps nodes whose heartbeats stopped (the pre-failure plan
+    the rebalance needs to find the dead node's range)."""
     num_layers = base_shard.n_layers if base_shard and base_shard.n_layers > 0 else 32
     model_id = base_shard.model_id if base_shard else ""
-    incompatible = [nid for nid in self.topology.nodes if not self._peer_compatible(nid)]
+    incompatible = [nid for nid in self.topology.nodes
+                    if not self._peer_compatible(nid) or (not include_dead and not self._node_alive(nid))]
     if incompatible and not getattr(self, "_compat_filtering", False):
       # Fail closed: a peer whose bridge major version differs never gets
-      # layers (its wire format may not match ours).
+      # layers (its wire format may not match ours), nor does a node whose
+      # heartbeats stopped (it may still sit in the topology for a while).
       if DEBUG >= 1:
-        print(f"[COMPAT] excluding incompatible peers from placement: {incompatible}")
+        print(f"[COMPAT] excluding incompatible/dead peers from placement: {incompatible}")
       from synapse.topology.topology import Topology
       saved, sub_topo = self.topology, Topology()
       for nid, caps in saved.nodes.items():
@@ -2540,7 +2600,7 @@ class Node:
   def _get_authoritative_partitions(self, base_shard: Optional[Shard] = None) -> Optional[List[Partition]]:
     """Return the master's broadcast partition when it still matches the
     requested base shard, else None (caller recomputes locally)."""
-    parts = self._authoritative_partitions
+    parts = self._live_authoritative()
     if parts is None:
       return None
     cached = self._authoritative_base_shard
@@ -2772,12 +2832,6 @@ class Node:
             master_id = data.get("master_id")
             if master_id == self.election_manager.current_master_id or not self.election_manager.current_master_id:
                 self.topology = received_topo
-                if self.topology_viz:
-                    self.topology_viz.update_visualization(
-                        self.topology,
-                        self._compute_lacp_partition(),
-                        self.id
-                    )
 
   async def broadcast_authoritative_partition(self, base_shard: Shard):
     """If this node is master, compute and broadcast the authoritative partition."""

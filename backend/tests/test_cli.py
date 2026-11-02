@@ -42,7 +42,7 @@ def test_translate_serve_maps_to_backend_argv():
                "--discovery-module", "manual", "--config", "c.json",
                "--wait-for-peers", "2", "--partition-method", "ilp",
                "--ilp-time-limit-seconds", "5", "--temperature", "0.1",
-               "--chat-port", "5555", "--tui")
+               "--chat-port", "5555")
     argv = translate_serve(ns)
     assert argv[:2] == ["run", "m1"]
     for flag, val in (("--node-id", "n1"), ("--node-port", "5679"),
@@ -50,12 +50,12 @@ def test_translate_serve_maps_to_backend_argv():
                       ("--discovery-config-path", "c.json"),
                       ("--wait-for-peers", "2"), ("--partition-method", "ilp"),
                       ("--ilp-time-limit-seconds", "5.0"), ("--default-temp", "0.1"),
-                      ("--chatgpt-api-port", "5555"), ("--no-disable-tui", None)):
+                      ("--chatgpt-api-port", "5555")):
         assert flag in argv, flag
         if val is not None:
             assert argv[argv.index(flag) + 1] == val
     # Backend-unknown flags must never leak through.
-    assert not any(a.startswith("--tui") and a != "--no-disable-tui" for a in argv)
+    assert not any("tui" in a for a in argv)
 
 
 def test_translate_join_tailscale_never_takes_key_on_argv():

@@ -254,9 +254,6 @@ def build_parser():
     s.add_argument("--ilp-time-limit-seconds", type=float, default=None)
     s.add_argument("--temperature", type=float, default=None)
     s.add_argument("--chat-port", type=int, default=None)
-    tui = s.add_mutually_exclusive_group()
-    tui.add_argument("--tui", action="store_true", help="opt into rich topology TUI (needs TTY)")
-    tui.add_argument("--no-tui", action="store_true")
 
     j = sub.add_parser("join", help="join a mesh without serving a model shard")
     j.add_argument("target", help="cluster config path or tailscale://<tailnet>")
@@ -280,6 +277,11 @@ def build_parser():
     m.add_argument("--json", action="store_true")
     m.add_argument("action", nargs="?", choices=("list", "pull", "rm"), default="list")
     m.add_argument("model_id", nargs="?")
+
+    pr = sub.add_parser("pair", help="pairing code: machines sharing it talk mutual TLS")
+    pr.add_argument("--code", default=None, help="join an existing cluster with its code")
+    pr.add_argument("--show", action="store_true", help="print this machine's code")
+    pr.add_argument("--forget", action="store_true", help="remove the code (plaintext again)")
 
     b = sub.add_parser("benchmark", parents=[port_parent], help="measure the live cluster (C1 metrics)")
     b.add_argument("--model", default=None)
@@ -334,10 +336,6 @@ def translate_serve(args):
         argv += ["--default-temp", str(args.temperature)]
     if args.chat_port:
         argv += ["--chatgpt-api-port", str(args.chat_port)]
-    if args.tui:
-        argv += ["--no-disable-tui"]
-    elif args.no_tui:
-        argv += ["--disable-tui"]
     return argv
 
 
@@ -373,7 +371,7 @@ def cmd_join(args):
                                 discovery_module="tailscale", config=None,
                                 join=args.target, wait_for_peers=None,
                                 partition_method=None, ilp_time_limit_seconds=None,
-                                temperature=None, chat_port=None, tui=False, no_tui=True,
+                                temperature=None, chat_port=None,
                                 headless=args.headless, log_format=args.log_format)
         _ = tailnet
     else:
@@ -381,7 +379,7 @@ def cmd_join(args):
                                 discovery_module="manual", config=args.target,
                                 join=None, wait_for_peers=None,
                                 partition_method=None, ilp_time_limit_seconds=None,
-                                temperature=None, chat_port=None, tui=False, no_tui=True,
+                                temperature=None, chat_port=None,
                                 headless=args.headless, log_format=args.log_format)
     return cmd_serve(ns)
 
@@ -696,6 +694,48 @@ def _split_console(argv):
     return None
 
 
+def cmd_pair(args):
+    """Create, join, show or forget this machine's pairing code."""
+    from synapse.transport import tls_wrap
+    if args.forget:
+        try:
+            os.remove(tls_wrap.code_path())
+            print("pairing code removed: this node talks plaintext again (restart it)")
+        except FileNotFoundError:
+            print("no pairing code on this machine")
+        return EXIT_OK
+    try:
+        current = tls_wrap.cluster_code()
+    except ValueError as e:
+        current = None
+        _err("saved pairing code is malformed (%s); replacing it" % e)
+    if args.show:
+        if not current:
+            _err("no pairing code yet: run `synapse pair`")
+            return EXIT_FAIL
+        print(current)
+        return EXIT_OK
+    if args.code:
+        try:
+            code = tls_wrap.normalize_code(args.code)
+        except ValueError as e:
+            _err(str(e))
+            return EXIT_USAGE
+        tls_wrap.save_cluster_code(code)
+        print("paired: this machine joins the cluster of code %s...  (restart the node)" % code[:9])
+        return EXIT_OK
+    if current:
+        print(current)
+        print("(existing code; give it to the other machines: synapse pair --code <code>)")
+        return EXIT_OK
+    code = tls_wrap.new_cluster_code()
+    tls_wrap.save_cluster_code(code)
+    print(code)
+    print("on every other machine run:  synapse pair --code %s" % code)
+    print("nodes with the code talk mutual TLS; nodes without it cannot connect")
+    return EXIT_OK
+
+
 def main(argv=None):
     # Console is a separate entry (serve flags + REPL); route before argparse
     # so `synapse console ...` never collides with subcommand parsing.
@@ -726,6 +766,8 @@ def main(argv=None):
         return cmd_models(args)
     if args.command == "benchmark":
         return cmd_benchmark(args)
+    if args.command == "pair":
+        return cmd_pair(args)
     parser.print_help()
     return EXIT_USAGE
 

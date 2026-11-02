@@ -99,6 +99,14 @@ Shortcuts: type ? at an empty prompt. Shell escape: !<cmd>.""" % "\n".join(
 )
 
 
+
+def _tls_on() -> bool:
+    try:
+        from synapse.transport.tls_wrap import tls_enabled
+        return tls_enabled() != "off"
+    except Exception:
+        return False
+
 def parse_slash(line: str):
     """Parse one REPL line -> (name, argv) or (None, None) for blank,
     or ("unknown", line) for non-slash input."""
@@ -658,9 +666,19 @@ def doctor_checks(port, node_port=None, backend_pid=None, model_id=None):
         rows.append(("version", False, "unknown: %s" % e,
                      "fix the api check first"))
     # 4. TLS mode + cert files
-    tls_mode = (os.getenv("SYNAPSE_TLS", "off") or "off").strip().lower()
-    if tls_mode == "off":
-        rows.append(("tls", True, "off (default, trusted LAN)", ""))
+    from synapse.transport.tls_wrap import tls_enabled
+    try:
+        tls_mode = tls_enabled()
+    except ValueError as e:  # malformed pairing code
+        tls_mode = None
+        rows.append(("tls", False, str(e), "run `synapse pair --code <code>` again"))
+    if tls_mode is None:
+        pass
+    elif tls_mode == "off":
+        rows.append(("tls", True, "off (no pairing code, trusted LAN only)",
+                     ""))
+    elif tls_mode == "cluster":
+        rows.append(("tls", True, "cluster (paired: mutual TLS)", ""))
     else:
         cert, key = os.getenv("SYNAPSE_TLS_CERT", ""), os.getenv("SYNAPSE_TLS_KEY", "")
         if cert and key and os.path.isfile(cert) and os.path.isfile(key):
@@ -1036,7 +1054,7 @@ def run_console(args):
 
     modes = "".join([
         "[adv]" if (os.getenv("SYNAPSE_AUTOSCALE", "") in ("advise", "on")) else "",
-        "[tls]" if (os.getenv("SYNAPSE_TLS", "off") != "off") else "",
+        "[tls]" if _tls_on() else "",
         "[headless]" if getattr(args, "headless", False) else "",
     ])
     ctx = ConsoleCtx(
@@ -1238,8 +1256,6 @@ def main(argv=None):
     p.add_argument("--line", action="store_true",
                    help="force line-mode REPL instead of the full-screen TUI")
     args = p.parse_args(argv)
-    args.tui = False
-    args.no_tui = True
     # Zero-flag boot uses the same per-machine defaults file as serve.
     from synapse.cli_defaults import apply_to_namespace
     apply_to_namespace(args)

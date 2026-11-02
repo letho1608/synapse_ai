@@ -11,6 +11,7 @@ import sys
 
 import numpy as np
 import pytest
+import os
 import torch
 
 TINY = ("peft-internal-testing/tiny-random-GPT2LMHeadModel", 5)
@@ -293,3 +294,107 @@ def test_sharded_checkpoint_fetches_only_needed_files(tmp_path, monkeypatch):
     assert set(pm.files) == before | need
     assert len(set(pm.files)) < len(set(weight_map.values()))
     assert sorted(f for f in fetched if f.endswith(".safetensors")) == sorted(pm.files)  # each file once
+
+
+def test_files_for_matches_what_ensure_fetches(tmp_path):
+    """`files_for` (used by /v1/models/pull to fetch only a node's part)
+    names exactly the files `ensure` would read, for every stage shape."""
+    from transformers import AutoModelForCausalLM
+    from synapse.inference.partial_loader import PartialModel
+    AutoModelForCausalLM.from_pretrained(TINY[0]).save_pretrained(
+        tmp_path, max_shard_size="20KB", safe_serialization=True)
+    for start, end, first, last in [(0, 1, True, False), (2, 2, False, False), (3, 4, False, True)]:
+        pm = PartialModel(str(tmp_path), torch.float32, "cpu")
+        want = pm.files_for(start, end, first, last)
+        assert pm.files == {}, "files_for must not fetch"
+        pm.ensure(start, end, first, last)
+        assert sorted(pm.files) == want, (start, end)
+
+
+class _RangeServer:
+    """Serves one directory over HTTP with Range support (http.server has none)."""
+
+    def __init__(self, root):
+        import http.server
+        import threading
+        served = self.served = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                path = os.path.join(root, self.path.lstrip("/").split("?")[0])
+                if not os.path.isfile(path):
+                    self.send_error(404)
+                    return
+                data = open(path, "rb").read()
+                rng = self.headers.get("Range")
+                if not rng:
+                    body, code = data, 200
+                else:
+                    a, b = rng.split("=")[1].split("-")
+                    body, code = data[int(a):int(b) + 1], 206
+                served.append(len(body))
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+
+
+def test_single_file_checkpoint_is_read_by_byte_ranges(tmp_path, monkeypatch):
+    """An uncached single-file checkpoint: the node fetches the header and
+    only its tensors' bytes (HTTP ranges), never the whole file."""
+    from transformers import AutoModelForCausalLM
+    from synapse.inference import partial_loader
+    from synapse.inference.partial_loader import PartialModel
+    ref = AutoModelForCausalLM.from_pretrained(TINY[0])
+    repo = tmp_path / "repo"
+    ref.save_pretrained(repo, safe_serialization=True)  # one model.safetensors
+    st = repo / "model.safetensors"
+    assert st.exists() and not (repo / "model.safetensors.index.json").exists()
+    size = st.stat().st_size
+
+    srv = _RangeServer(str(repo))
+    try:
+        # the hub file is "not cached": served by range reads from our server
+        monkeypatch.setattr(partial_loader, "_range_file",
+                            lambda rid, fn: partial_loader.RangeFile(f"{srv.url}/{fn}"))
+        real = partial_loader._hub_file
+
+        def no_whole_file(rid, fn):
+            assert fn != "model.safetensors", "the whole checkpoint was requested"
+            return real(rid, fn)
+        monkeypatch.setattr(partial_loader, "_hub_file", no_whole_file)
+        pm = PartialModel(str(repo), torch.float32, "cpu")
+        assert "model.safetensors" in pm.remote
+        header_bytes = sum(srv.served)
+        assert header_bytes < size // 4
+
+        pm.ensure(2, 2, first=False, last=False)
+        got = dict(pm.layers[2].named_parameters())
+        want = dict(ref.transformer.h[2].named_parameters())
+        assert all(torch.equal(got[n], want[n]) for n in want)
+        layer_bytes = sum(t.numel() * t.element_size() for t in want.values())
+        assert sum(srv.served) - header_bytes < layer_bytes + (1 << 20)
+        assert sum(srv.served) < size, "the whole file was transferred"
+        assert pm.files == {}, "nothing written / downloaded"
+    finally:
+        srv.close()
+
+
+def test_range_reads_only_for_uncached_online_hub_files(tmp_path, monkeypatch):
+    from synapse.inference import partial_loader
+    assert partial_loader._range_file(str(tmp_path), "model.safetensors") is None  # local dir
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert partial_loader._range_file("someone/model", "model.safetensors") is None
+    monkeypatch.delenv("HF_HUB_OFFLINE")
+    monkeypatch.setenv("SYNAPSE_RANGE_FETCH", "0")
+    assert partial_loader._range_file("someone/model", "model.safetensors") is None

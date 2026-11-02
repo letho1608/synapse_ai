@@ -246,13 +246,17 @@ class FastDecoder:
         return p
 
     @staticmethod
-    def _still_valid(p: _LayerPlan) -> bool:
-        """A plan goes stale when a projection is replaced (quantized) or its
-        weight re-pointed away from the fused tensor."""
-        q = p.attn.q_proj
-        if p.fused != _is_plain_linear(q):
+    def _projections(attn, mlp) -> list:
+        return [getattr(attn, a, None) for a in ("q_proj", "k_proj", "v_proj", "o_proj")] + \
+               [getattr(mlp, a, None) for a in ("gate_proj", "up_proj", "down_proj")]
+
+    @classmethod
+    def _still_valid(cls, p: _LayerPlan) -> bool:
+        """A plan goes stale when a projection is replaced (quantized, LoRA)
+        or its weight re-pointed away from the fused tensor."""
+        if p.fused != all(_is_plain_linear(m) for m in cls._projections(p.attn, p.mlp)):
             return False
-        return not p.fused or q.weight.data_ptr() == p.qkv_w.data_ptr()
+        return not p.fused or p.attn.q_proj.weight.data_ptr() == p.qkv_w.data_ptr()
 
     def forget(self, keep: Optional[Sequence[int]] = None) -> None:
         """Drop plans for layers no longer loaded (release_layers)."""
@@ -267,8 +271,7 @@ class FastDecoder:
         n2 = getattr(layer, "post_attention_layernorm", None)
         if attn is None or mlp is None or n1 is None or n2 is None:
             return None
-        need = [getattr(attn, a, None) for a in ("q_proj", "k_proj", "v_proj", "o_proj")] + \
-               [getattr(mlp, a, None) for a in ("gate_proj", "up_proj", "down_proj")]
+        need = self._projections(attn, mlp)
         if any(m is None for m in need):
             return None
         if getattr(attn, "sliding_window", None):

@@ -24,7 +24,7 @@ from synapse.orchestration import Node
 from synapse.model_list import HF_MODELS, HF_MODEL_PARAMS, resolve_hf_id  # Danh sách + metadata cho web UI
 from typing import Callable
 from collections import defaultdict
-from synapse.training.finetune_lora import load_raw_data_async, format_sample_to_text, _build_lora_config
+from synapse.training.finetune_lora import load_raw_data_async, format_sample_to_text
 from synapse.training.preprocessing import preprocess_async
 from synapse.loading import get_checkpoints_dir
 from synapse.models import build_base_shard, get_repo
@@ -267,6 +267,53 @@ class PromptSession:
     self.prompt = prompt
 
 
+# Routes anyone on the network may call without SYNAPSE_API_KEY: chat and
+# read-only cluster status. Everything else (quit, settings, model pull /
+# delete / merge, datasets, training, logs) changes or exposes the machine.
+PUBLIC_ROUTES = {
+  ("GET", "/"), ("GET", "/healthcheck"), ("GET", "/models"), ("GET", "/v1/models"),
+  ("POST", "/chat/completions"), ("POST", "/v1/chat/completions"),
+  ("POST", "/chat/token/encode"), ("POST", "/v1/chat/token/encode"),
+  ("GET", "/topology"), ("GET", "/v1/topology"), ("GET", "/v1/distributed/status"),
+}
+# Reachable without a key even when one is set (liveness probes).
+OPEN_ROUTES = {("GET", "/"), ("GET", "/healthcheck")}
+
+
+def _is_loopback(remote: Optional[str]) -> bool:
+  import ipaddress
+  try:
+    return ipaddress.ip_address((remote or "").split("%")[0]).is_loopback
+  except ValueError:
+    return False
+
+
+def check_access(method: str, path: str, remote: Optional[str], auth_header: str,
+                 query_token: str, api_key: Optional[str]):
+  """None if the request may proceed, else (status, message).
+
+  With SYNAPSE_API_KEY set, every route but the liveness ones needs
+  `Authorization: Bearer <key>` (the websocket may pass `?token=`). Without a
+  key, chat and status stay open to the LAN, while admin routes answer only
+  to this machine, so a neighbour cannot /quit the node or delete models."""
+  import hmac
+  if method == "OPTIONS":
+    return None
+  route = (method, path)
+  if api_key:
+    if route in OPEN_ROUTES:
+      return None
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else query_token
+    if not token:
+      return 401, "Unauthorized. Missing or invalid Authorization Bearer token."
+    if not hmac.compare_digest(token.encode(), api_key.encode()):
+      return 403, "Forbidden. Invalid API Key."
+    return None
+  if route in PUBLIC_ROUTES or _is_loopback(remote):
+    return None
+  return 403, "Forbidden. Admin routes are local-only; set SYNAPSE_API_KEY to allow remote access."
+
+
 class ChatGPTAPI:
   def __init__(
     self,
@@ -285,23 +332,12 @@ class ChatGPTAPI:
     
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
-        if request.method == "OPTIONS":
-            return await handler(request)
-            
-        api_key = os.getenv("SYNAPSE_API_KEY")
-        if not api_key:
-            return await handler(request)
-            
-        # Protect all /v1/ endpoints except the websocket (which needs its own handshake if secured)
-        if request.path.startswith("/v1/") and request.path != "/v1/ws/metrics":
-            auth_header = request.headers.get("Authorization", "")
-            if not auth_header.startswith("Bearer "):
-                return web.json_response({"error": "Unauthorized. Missing or invalid Authorization Bearer token."}, status=401)
-                
-            token = auth_header.split(" ")[1]
-            if token != api_key:
-                return web.json_response({"error": "Forbidden. Invalid API Key."}, status=403)
-                
+        denied = check_access(request.method, request.path, request.remote,
+                              request.headers.get("Authorization", ""),
+                              request.query.get("token", ""), os.getenv("SYNAPSE_API_KEY"))
+        if denied:
+            status, msg = denied
+            return web.json_response({"error": msg}, status=status)
         return await handler(request)
 
     self.app = web.Application(client_max_size=10*1024*1024, middlewares=[auth_middleware])  # 10MB limit for text payloads
@@ -855,6 +891,32 @@ class ChatGPTAPI:
     except Exception as e:
       return web.json_response({"detail": str(e)}, status=500)
 
+  # Weight formats skipped when pulling only this node's part (the
+  # safetensors it needs are fetched per file below).
+  _WEIGHT_PATTERNS = ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.h5", "*.msgpack",
+                      "*.gguf", "*.onnx", "*.ot", "*.tflite"]
+
+  def _pull_node_part(self, model_name: str, hf_id: str):
+    """Fetch config/tokenizer plus only the checkpoint files of this node's
+    current layer range. Returns ((start, end), files), or None when the
+    range or a safetensors index is unknown (caller pulls the whole repo)."""
+    try:
+      base = build_base_shard(model_name, self.inference_engine_classname)
+      if base is None:
+        return None
+      shard = self.node.get_current_shard(base)
+      from huggingface_hub import snapshot_download
+      from synapse.inference.partial_loader import PartialModel
+      import torch
+      snapshot_download(repo_id=hf_id, ignore_patterns=self._WEIGHT_PATTERNS)
+      pm = PartialModel(hf_id, torch.float32, "cpu")  # meta skeleton only, nothing loaded
+      files = pm.prefetch(shard.start_layer, shard.end_layer,
+                          shard.is_first_layer(), shard.is_last_layer())
+      return (shard.start_layer, shard.end_layer), files
+    except Exception as e:
+      if DEBUG >= 1: print(f"[pull] node-part pull failed ({e}); pulling the whole repo")
+      return None
+
   async def handle_post_models_pull(self, request):
     """Tải model: Đầu tiên kiểm tra trong HF_MODELS, nếu không có thì scrape metadata và tiến hành HF snapshot_download."""
     try:
@@ -885,10 +947,15 @@ class ChatGPTAPI:
       else:
           hf_id = resolve_hf_id(model_name)
           
-      from huggingface_hub import snapshot_download
-      await asyncio.to_thread(snapshot_download, repo_id=hf_id)
-      
-      msg = f"Đã tải {model_name} -> {hf_id} (Hugging Face cache)"
+      part = None if data.get("full") else await asyncio.to_thread(self._pull_node_part, model_name, hf_id)
+      if part is None:
+        from huggingface_hub import snapshot_download
+        await asyncio.to_thread(snapshot_download, repo_id=hf_id)
+        msg = f"Đã tải {model_name} -> {hf_id} (Hugging Face cache)"
+      else:
+        (start, end), files = part
+        msg = (f"Đã tải phần của node này: {model_name} -> {hf_id}, layer {start}-{end}, "
+               f"{len(files)} file trọng số")
       if is_new_discovery:
           msg += " [Đã lưu metadata cục bộ]"
           
@@ -2355,26 +2422,13 @@ class ChatGPTAPI:
       lr_val = float((job.get("learning_rate") or "1e-5").strip()) if job.get("learning_rate") else 1e-5
       save_every = int(job.get("save_every", 5))
       checkpoint_dir = (job.get("checkpoint_dir") or "").strip() or str(get_checkpoints_dir(model))
-      use_lora = job.get("use_lora", False)
-
-      if use_lora:
-        try:
-          lora_config = _build_lora_config(job)
-          if lora_config is not None:
-            from peft import get_peft_model
-            engine = self.node.inference_engine
-            # Layer-range loading leaves _model None until training needs it:
-            # load the whole model now or LoRA was silently skipped.
-            if getattr(engine, "_model", None) is None and hasattr(engine, "_ensure_full"):
-              await engine._ensure_full(base_shard)
-            if hasattr(engine, "_model") and engine._model is not None:
-              engine._model = get_peft_model(engine._model, lora_config)
-              if hasattr(engine._model, "print_trainable_parameters"):
-                engine._model.print_trainable_parameters()
-              job["lora_applied"] = True
-        except Exception as e:
-          if DEBUG >= 1:
-            print(f"[Training] LoRA prepare failed: {e}")
+      # LoRA: every node trains adapters on the layers it serves (no
+      # whole-model load); the settings travel with each pipeline step.
+      from synapse.training.stage_lora import normalize_config
+      lora_cfg = normalize_config(job) if job.get("use_lora") else None
+      if lora_cfg is not None and ext is None:
+        raise RuntimeError("LoRA needs the pipeline extension (distributed_pipeline)")
+      job["lora_applied"] = lora_cfg is not None
 
       for epoch in range(epochs):
         if self._training_job is None or self._training_job.get("job_id") != job_id:
@@ -2399,13 +2453,14 @@ class ChatGPTAPI:
             try:
               example_np, target_np, length_np = tokenize_batch(current_batch_texts, effective_max_length)
 
-              if ext is not None and world_size > 1:
+              if ext is not None and (world_size > 1 or lora_cfg is not None):
                 import uuid
                 loss = await ext.train_step_distributed(
                   base_shard, example_np, target_np,
                   request_id=str(uuid.uuid4()),
                   learning_rate=lr_val,
                   schedule="1f1b",
+                  **({"lora": lora_cfg} if lora_cfg else {}),
                 )
               else:
                 loss = await self.node.enqueue_example(

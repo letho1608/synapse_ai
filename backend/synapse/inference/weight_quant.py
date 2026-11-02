@@ -130,7 +130,10 @@ class QuantLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from synapse.inference import qkernels
         y = None
-        if x.device.type == "cpu":
+        # The numba kernels have no backward: when a gradient must flow to x
+        # (LoRA training over frozen quantized weights) use the torch path.
+        needs_grad = torch.is_grad_enabled() and x.requires_grad
+        if x.device.type == "cpu" and not needs_grad:
             s32, z32 = self._fp32_params()
             if self.mode == "int8":
                 y = qkernels.int8_linear(x, self.qweight, s32.view(-1))
