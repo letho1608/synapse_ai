@@ -18,7 +18,6 @@ from typing import Dict, List, Optional, Tuple, Any, Callable
 
 from synapse.inference.shard import Shard
 from synapse.inference.inference_engine import InferenceEngine
-from synapse.pipeline.stage import StageResult
 from synapse.transport.codec import encode_tensor
 from synapse.transport.result_router import RoutedResult
 from synapse.helpers import DEBUG
@@ -136,7 +135,6 @@ class DistributedInferenceSession:
         self.num_micro_batches = num_micro_batches
         self.start_time = time.time()
 
-        self.results: Dict[int, StageResult] = {}
         self.total_tokens_generated = 0
         self.is_finished = False
         self.error: Optional[Exception] = None
@@ -147,12 +145,11 @@ class DistributedPipelineController:
     Coordinates distributed inference across multiple nodes using pipeline parallelism.
 
     The controller:
-    1. Computes LACP partition to assign layer ranges to nodes
-    2. Uses PipelineScheduler to create a staggered inference schedule
-    3. Creates PipelineStage per node, chains via AsyncTensorForwarder
-    4. Executes pipeline via PipelineExecutor for efficient multi-batch
-    5. Collects results from the last-stage node
-    6. Awaits each step's result (subscribe before send) and streams verified tokens
+    1. Takes the partition (layer range per node) from the node
+    2. Sends each step's input to the first stage; stages forward hidden
+       states to the next node
+    3. Awaits each step's result from the last stage (subscribe before
+       send) and streams verified tokens
     """
 
     def __init__(

@@ -30,7 +30,3 @@ class Shard:
 
   def from_dict(data: dict) -> 'Shard':
     return Shard(**data)
-
-
-def shards_overlap(shard1: Shard, shard2: Shard) -> bool:
-  return (shard1.model_id == shard2.model_id and max(shard1.start_layer, shard2.start_layer) <= min(shard1.end_layer, shard2.end_layer))

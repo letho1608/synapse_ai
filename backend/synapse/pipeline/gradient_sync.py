@@ -7,17 +7,10 @@ Each node has a full model copy (DDP style).
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Callable, Awaitable
 import numpy as np
 
-from synapse.pipeline.scheduler import (
-    MicroBatch,
-    MicroBatchOp,
-    PipelineScheduler,
-)
-from synapse.pipeline.stage import PipelineStage
 
 
 @dataclass
@@ -159,104 +152,3 @@ class DistributedTrainer:
             return 0.0
         return sum(self._loss_history) / len(self._loss_history)
 
-    async def train_1f1b(
-        self,
-        stages: List[PipelineStage],
-        num_micro_batches: int,
-        input_data: np.ndarray,
-        labels: Optional[np.ndarray] = None,
-    ) -> List[float]:
-        """
-        Execute a training step using 1F1B pipeline schedule.
-        
-        Uses PipelineScheduler.generate_1f1b_schedule() to coordinate 
-        forward and backward passes across all pipeline stages.
-        
-        Args:
-            stages: List of PipelineStage objects, one per node.
-            num_micro_batches: Number of micro-batches for the pipeline.
-            input_data: Input tensor for training.
-            labels: Optional target labels for loss computation.
-            
-        Returns:
-            List of loss values per micro-batch.
-        """
-        scheduler = PipelineScheduler(num_micro_batches=num_micro_batches)
-        num_stages = len(stages)
-        node_ids = [s.node_id for s in stages]
-
-        schedule = scheduler.generate_1f1b_schedule(num_stages, num_micro_batches, node_ids=node_ids)
-
-        # Micro-batch the training input: every micro-batch is a row-slice of
-        # the batch, so each stage sees a distinct slice per micro-batch.
-        rows = input_data.shape[0] if input_data.ndim >= 1 else 1
-        mb_rows = max(1, rows // num_micro_batches) if num_micro_batches else rows
-
-        # Execute pipeline
-        stop_events = {s.stage_id: asyncio.Event() for s in stages}
-        loop_tasks = [
-            asyncio.create_task(s.process_loop(stop_events[s.stage_id]))
-            for s in stages
-        ]
-
-        try:
-            # Feed every stage its own schedule slots: forward micro-batches
-            # first, then backward micro-batches, coordinated by the 1F1B
-            # schedule (warmup -> steady -> cooldown). Intermediate stages
-            # receive their slice of the batch and run their forward/backward
-            # functions per the schedule; the last stage emits losses.
-            for slot in sorted(schedule.slots, key=lambda s: s.step):
-                if 0 <= slot.stage < num_stages:
-                    start = slot.micro_batch_id * mb_rows
-                    mb_data = input_data[start:start + mb_rows]
-                    mb_labels = None
-                    if labels is not None:
-                        mb_labels = labels[start:start + mb_rows]
-                    op_name = "backward" if slot.op == MicroBatchOp.BACKWARD else "forward"
-                    mb = MicroBatch(
-                        batch_id=slot.micro_batch_id,
-                        data=mb_data,
-                        labels=mb_labels,
-                        metadata={"op": op_name, "step": slot.step},
-                        step=slot.step,
-                    )
-                    await stages[slot.stage].enqueue_input(mb)
-
-            # Collect results from the last stage: drain ALL its slots so the
-            # pipeline fully executes (forward + backward phases) before the
-            # stage tasks are cancelled. Forward results are the losses;
-            # backward results are gradient feedback (StageResult.op) and are
-            # discarded, so real gradient values never leak into the loss
-            # list (previously they were filtered as non-finite NaN).
-            num_ops = len([s for s in schedule.slots if s.stage == num_stages - 1])
-            losses = []
-            for _ in range(num_ops):
-                result = await stages[-1].dequeue_output(timeout=30.0)
-                if result is None:
-                    continue
-                if getattr(result, "op", "forward") != "forward":
-                    continue  # backward gradient feedback, not a loss
-                try:
-                    val = float(np.mean(result.data))
-                except Exception:
-                    continue
-                if np.isfinite(val):
-                    losses.append(val)
-        finally:
-            for evt in stop_events.values():
-                evt.set()
-            # Grace period: each stage finishes its in-flight op before
-            # exiting (the collector sees the last stage's final backward
-            # result, which is what unblocks the upstream link of the handoff
-            # chain — that last engine call completes just after collection).
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*loop_tasks, return_exceptions=True),
-                    timeout=15.0,
-                )
-            except asyncio.TimeoutError:
-                for task in loop_tasks:
-                    task.cancel()
-                await asyncio.gather(*loop_tasks, return_exceptions=True)
-
-        return losses

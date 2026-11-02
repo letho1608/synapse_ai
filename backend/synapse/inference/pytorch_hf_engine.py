@@ -36,11 +36,6 @@ def register_pytorch_models() -> None:
         register_model(model_id=model_id, num_layers=n_layers, repo_path=hf_id)
 
 
-def resolve_hf_model_id(model_id: str) -> str:
-    """Tên model -> HF repo_id (dùng trong engine)."""
-    return resolve_hf_id(model_id)
-
-
 class HFShardDownloader:
     """Tải model từ Hugging Face (cache local). Không tải theo shard file; shard = layer range khi chạy."""
 
@@ -55,7 +50,7 @@ class HFShardDownloader:
         return self._on_progress
 
     async def ensure_shard(self, shard: Shard, inference_engine_name: str) -> Path:
-        hf_id = resolve_hf_model_id(shard.model_id)
+        hf_id = resolve_hf_id(shard.model_id)
         try:
             from huggingface_hub import snapshot_download
             path = snapshot_download(repo_id=hf_id)
@@ -387,7 +382,7 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
         return profile
 
     def _get_hf_id(self, model_id: str) -> str:
-        return resolve_hf_model_id(model_id)
+        return resolve_hf_id(model_id)
 
     def _get_transformer_components(self):
         """Return transformer layers and projection modules for supported causal LM layouts."""
@@ -506,8 +501,6 @@ class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
         # layer index, so a mid-model shard works). Never shared across
         # requests: an in-place-mutated Cache must not sit under two prefixes.
         # ---------------------------------------------------------------------
-        from transformers import DynamicCache
-
         kv_key = f"{request_id}@{shard.start_layer}-{shard.end_layer}" if request_id else None
         new_rows = self._seq_rows(input_data)
         stored = self._seq_kv.get(kv_key) if kv_key else None

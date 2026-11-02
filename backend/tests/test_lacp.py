@@ -20,7 +20,6 @@ def test_import_lacp_modules():
     from synapse.topology.resource_weight import NodeResources, ResourceWeights, ResourceScorer, NormalizedScores
     from synapse.topology.latency_matrix import LatencyMatrix, LatencyProber, HierarchicalClusterer, Cluster
     from synapse.topology.partitioner import compute_partition, LACPPartition, ShardAssignment
-    from synapse.pipeline.scheduler import PipelineScheduler, PipelineSchedule, PipelineSlot, MicroBatchOp
     from synapse.pipeline.gradient_sync import RingAllReducer, DistributedTrainer, GradientShard
     from synapse.pipeline.fault_tolerance import FaultToleranceManager, NodeHealth, ShardCheckpoint
     from synapse.transport.codec import encode_tensor, decode_tensor, AsyncTensorForwarder, MAGIC
@@ -165,42 +164,6 @@ def test_compute_partition():
     assert a_assignment.layer_count > b_assignment.layer_count
     
     print(" [OK] test_compute_partition")
-
-
-# --- Test 7: PipelineScheduler 1F1B ---
-
-def test_pipeline_scheduler_1f1b():
-    """Test 1F1B pipeline schedule generation."""
-    from synapse.pipeline.scheduler import PipelineScheduler, MicroBatchOp
-    
-    scheduler = PipelineScheduler(num_micro_batches=4)
-    schedule = scheduler.generate_1f1b_schedule(num_stages=3, num_micro_batches=4)
-    
-    assert schedule.num_stages == 3
-    assert schedule.num_micro_batches == 4
-    assert schedule.warmup_steps == 2
-    assert schedule.cooldown_steps == 2
-    
-    # Check forward + backward slot counts
-    fwd = sum(1 for s in schedule.slots if s.op == MicroBatchOp.FORWARD)
-    bwd = sum(1 for s in schedule.slots if s.op == MicroBatchOp.BACKWARD)
-    assert fwd == 12  # 3 stages × 4 micro-batches
-    assert bwd == 12
-    
-    print(" [OK] test_pipeline_scheduler_1f1b")
-
-
-def test_inference_schedule():
-    """Test forward-only inference pipeline schedule."""
-    from synapse.pipeline.scheduler import PipelineScheduler, MicroBatchOp
-    
-    scheduler = PipelineScheduler(num_micro_batches=4)
-    schedule = scheduler.generate_inference_schedule(num_stages=3, num_micro_batches=4)
-    
-    assert schedule.num_stages == 3
-    assert all(s.op == MicroBatchOp.FORWARD for s in schedule.slots)
-    
-    print(" [OK] test_inference_schedule")
 
 
 # --- Test 8: Binary Codec ---
@@ -348,11 +311,10 @@ def test_async_forwarder_create():
 # --- Test 12: Integration - Full LACP flow ---
 
 def test_lacp_full_integration():
-    """Test full LACP flow: resource scoring → cluster → partition → pipeline."""
+    """Test full LACP flow: resource scoring → cluster → partition."""
     from synapse.topology.partitioner import compute_partition
     from synapse.topology.resource_weight import NodeResources
     from synapse.topology.latency_matrix import LatencyMatrix, LatencyEntry
-    from synapse.pipeline.scheduler import PipelineScheduler
     
     nodes = {
         "VN-A": NodeResources(gpu_name="RTX 4090", gpu_vram_mb=24576, gpu_tflops_fp16=165, cpu_cores=16, system_ram_mb=64000),
@@ -390,14 +352,6 @@ def test_lacp_full_integration():
     # VN-A and VN-B should be in same cluster (low latency)
     assert len(result.clusters) >= 1
     
-    # Generate pipeline schedule from partition
-    scheduler = PipelineScheduler(num_micro_batches=4)
-    schedule = scheduler.generate_inference_schedule(
-        num_stages=len(result.assignments),
-        num_micro_batches=4,
-    )
-    assert schedule.num_stages == len(result.assignments)
-    
     print(" [OK] test_lacp_full_integration")
 
 
@@ -433,8 +387,6 @@ if __name__ == "__main__":
         test_hierarchical_clusterer_fallback,
         test_resource_scorer,
         test_compute_partition,
-        test_pipeline_scheduler_1f1b,
-        test_inference_schedule,
         test_encode_decode_tensor,
         test_encode_decode_with_metadata,
         test_compress_tensor,

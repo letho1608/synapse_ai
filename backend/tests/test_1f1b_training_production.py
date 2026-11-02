@@ -15,7 +15,6 @@ from synapse.inference.inference_engine import InferenceEngine
 from synapse.inference.shard import Shard
 from synapse.orchestration.node import Node
 from synapse.pipeline.gradient_sync import DistributedTrainer
-from synapse.pipeline.scheduler import PipelineScheduler
 from synapse.routing import EventRouter
 from synapse.routing.libp2p_node import Libp2pNode
 from synapse.topology.device_capabilities import DeviceCapabilities, DeviceFlops
@@ -135,14 +134,10 @@ class Test1F1BProductionTraining:
         node, engine = _node_with_topology(n_nodes=1)
         ext = node.distributed_pipeline
 
-        schedule_calls = []
-        orig_gen = PipelineScheduler.generate_1f1b_schedule
+        async def no_pipeline(*a, **k):
+            raise AssertionError("a single node must not run the cross-node pipeline")
 
-        def record_gen(self, num_stages, num_micro_batches, node_ids=None):
-            schedule_calls.append((num_stages, num_micro_batches))
-            return orig_gen(self, num_stages, num_micro_batches, node_ids)
-
-        monkeypatch.setattr(PipelineScheduler, "generate_1f1b_schedule", record_gen)
+        monkeypatch.setattr(ext.pp_trainer, "train_step", no_pipeline)
 
         input_ids = np.array([[1, 2, 3], [4, 5, 6]])
         labels = np.array([[2, 3, 4], [5, 6, 7]])
@@ -154,7 +149,6 @@ class Test1F1BProductionTraining:
         )
 
         assert loss == pytest.approx(1.5)
-        assert schedule_calls == []  # no pipeline schedule for a single node
         assert len(engine.train_calls) == 1
         assert engine.train_calls[0]["sync"] is False
 

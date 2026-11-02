@@ -2450,7 +2450,6 @@ class Node:
     if prev is not None and prev.get("model_id") == model_id and prev.get("total") == total \
         and all(nid in self.topology.nodes for nid, _, _ in prev["stages"]):
       by_id = {p.node_id: p for p in profiles}
-      [by_id[nid] for nid, _, _ in prev["stages"]]
       stages = prev["stages"]
       # current cost of the previous placement
       cost = 0.0

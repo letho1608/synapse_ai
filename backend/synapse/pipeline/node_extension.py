@@ -31,7 +31,7 @@ _log = logging.getLogger(__name__)
 class DistributedPipelineExtension:
     def __init__(self, node: Any):
         # Lazy import: synapse.inference.distributed_engine imports back into
-        # this package (synapse.pipeline.scheduler), so importing it at module
+        # this package (synapse.pipeline), so importing it at module
         # level here creates a circular import when distributed_engine is the
         # first module loaded. Import at construction time instead.
         from synapse.inference.distributed_engine import DistributedPipelineController

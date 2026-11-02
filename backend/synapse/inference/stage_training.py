@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from synapse.helpers import DEBUG
 
 
 class StageTrainingMixin:

@@ -683,7 +683,7 @@ def doctor_checks(port, node_port=None, backend_pid=None, model_id=None):
     # 6. discovery module + tailscale CLI
     try:
         from synapse.cli_defaults import effective
-        disc = (effective({}, None).get("discovery-module") if True else None) or "udp"
+        disc = effective({}, None).get("discovery-module") or "udp"
     except Exception:
         disc = "udp"
     if disc == "tailscale":

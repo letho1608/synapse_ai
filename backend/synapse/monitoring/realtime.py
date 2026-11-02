@@ -95,19 +95,6 @@ class RealtimeMonitor:
             await asyncio.sleep(self.SAMPLE_INTERVAL)
 
 
-# ── shared sampler singleton ────────────────────────────────────
-
-_monitor: Optional[RealtimeMonitor] = None
-
-
-def get_monitor() -> RealtimeMonitor:
-    """Lazy singleton.  Call start() on first use."""
-    global _monitor
-    if _monitor is None:
-        _monitor = RealtimeMonitor()
-    return _monitor
-
-
 # ── blocking sampler (runs in thread) ───────────────────────────
 
 def _sample_blocking() -> NodeMetrics:

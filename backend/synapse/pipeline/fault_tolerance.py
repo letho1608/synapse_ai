@@ -447,15 +447,6 @@ class FaultToleranceManager:
             json.dump(manifest, f, indent=2)
         os.replace(tmp, mpath)
 
-    def get_checkpoint_manifest(self, node_id: str, model_id: str) -> Optional[Dict[str, Any]]:
-        """Read the sidecar manifest index, or None if absent/corrupt."""
-        try:
-            with open(self._manifest_path(node_id, model_id), "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else None
-        except (OSError, ValueError):
-            return None
-
 
     # ── Replication to a peer ──────────────────────────────
     # A checkpoint written only on its own machine dies with that machine.

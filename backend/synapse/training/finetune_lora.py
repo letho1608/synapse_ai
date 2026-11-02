@@ -7,15 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
-from typing import Dict, List, Any, Optional
-
-from synapse.model_list import resolve_hf_id
-
-
-def resolve_hf_model_id(model_name: str, base_model_id: Optional[str] = None) -> str:
-    if (base_model_id or "").strip():
-        return base_model_id.strip()
-    return resolve_hf_id(model_name)
+from typing import Dict, List, Any
 
 
 def load_raw_data(path: Path) -> List[Dict[str, Any]]:

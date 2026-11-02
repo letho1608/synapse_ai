@@ -22,7 +22,6 @@ Logits match the HF path (same weights, same op order up to SDPA vs eager).
 """
 from __future__ import annotations
 
-import math
 import os
 from typing import Dict, List, Optional, Sequence
 
@@ -95,8 +94,8 @@ class KVPool:
 class PagedSequence:
     """One request's KV for one shard range: a block table and a length.
 
-    Offers the subset of the HF Cache interface the engine relies on
-    (get_seq_length, crop) so it can sit in the engine's per-request state
+    Offers the part of the HF Cache interface the engine relies on
+    (crop) so it can sit in the engine's per-request state
     exactly where a DynamicCache would."""
 
     def __init__(self, pool: KVPool):
@@ -111,9 +110,6 @@ class PagedSequence:
             self.blocks = []
         except Exception:
             pass
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        return self.length
 
     def crop(self, n: int) -> None:
         n = max(0, min(int(n), self.length))
