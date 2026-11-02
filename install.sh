@@ -28,6 +28,5 @@ cat <<'EOF'
   python main.py
 
 Optional extras:
-  .venv/bin/python -m pip install -r backend/requirements-tools.txt  # assistant/viz tools
   .venv/bin/python -m pip install -r backend/requirements-dev.txt     # packaging/dev
 EOF

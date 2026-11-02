@@ -23,7 +23,8 @@ Mọi việc không phục vụ 4 điểm trên là **phụ**: không làm thêm
 |---|---|---|
 | Tự phát hiện thiết bị | Có | UDP, Tailscale, file cấu hình tay |
 | Tự chia model theo tài nguyên | Có | Chia theo dải layer, trọng số theo bộ nhớ / tốc độ đo được |
-| Mỗi node chỉ giữ layer của mình | Có | `partial_loader`; cần kiểm lại việc **tải** cũng chỉ lấy phần cần |
+| Mỗi node chỉ giữ layer của mình trong RAM | Có | `partial_loader` |
+| **Mỗi node chỉ tải phần trọng số nó cần** | **Chưa** | Mỗi node tải cả repo: `pytorch_hf_engine.py:61` gọi `snapshot_download`, `partial_loader.checkpoint_index` tải mọi file trong `weight_map`. Model 70B → mỗi máy tải ~140 GB |
 | API tương thích ChatGPT | Có | `/v1/chat/completions`, cổng 52415 |
 | Giao diện chat | Một phần | Có TUI console; chưa có web chat |
 | Nhiều loại máy / GPU | Một phần | PyTorch CPU (CUDA chưa kiểm kỹ); chưa có MLX cho Mac |
@@ -42,7 +43,12 @@ Mọi việc không phục vụ 4 điểm trên là **phụ**: không làm thêm
 - [ ] Harness phải chặn loopback giả làm nhiều máy.
 
 ### 2. Model lớn hơn một máy
-- [ ] Kiểm mỗi node chỉ **tải** các file trọng số nó cần (không tải cả repo).
+- [ ] **Mỗi máy chỉ tải phần trọng số nó cần** (giống exo):
+  - [ ] Từ `model.safetensors.index.json` suy ra file nào chứa layer của shard; chỉ tải các file đó
+        (+ config, tokenizer; embed ở stage đầu, norm/head ở stage cuối).
+  - [ ] Bỏ `snapshot_download` cả repo trong `HFShardDownloader.ensure_shard`; `checkpoint_index` chỉ resolve file cần.
+  - [ ] Khi chia lại layer (failover / re-plan), tải thêm đúng phần còn thiếu.
+  - [ ] Test: shard giữa của model nhiều file chỉ tải các file chứa layer của nó.
 - [ ] Chạy một model ~7–8B chia cho 2–3 máy mà một máy không chứa nổi ở fp16.
 - [ ] Đo int8 / int4 trên model lớn (trên SmolLM2 int8 chưa nhanh hơn fp32 vì ma trận quá nhỏ).
 
@@ -58,14 +64,14 @@ Mọi việc không phục vụ 4 điểm trên là **phụ**: không làm thêm
 ### Việc vặt đang mở
 - [ ] Một lượt chạy toàn bộ test sạch (lượt cuối dừng vì hết RAM; lượt trước 547/549, 2 test hỏng đã sửa).
 
-## Tính năng phụ — đóng băng đến khi xong mục 1
+## Tính năng ngoài lõi
 
-Những thứ đã có nhưng **ngoài phạm vi exo**. Giữ nguyên, không mở rộng:
+Giữ lại (không bắt buộc giống exo): huấn luyện (pipeline, LoRA, DDP),
+autoscale (advisory), TLS hai chiều, bầu master, ba bộ chia layer (chuỗi dự phòng: đo thật → TFLOPS / LACP),
+lượng tử hoá + kernel. Ưu tiên vẫn là mục 1, nhưng không gỡ các phần này.
 
-- Huấn luyện: train pipeline theo dải layer, LoRA (vẫn nạp cả model), DDP.
-- Autoscale (chỉ advisory), TLS hai chiều, bầu master đa tài nguyên.
-- Kernel numba int8/int4, int4 mixed precision, paged KV, fast decoder: giữ vì giúp chạy model lớn,
-  nhưng chưa tối ưu thêm khi chưa đo trên nhiều máy.
+Trùng lặp còn lại, để gộp khi làm giao diện: ba giao diện terminal (`tui.py`, `console.py`, `cli.py`)
++ `viz/topology_viz.py`.
 
 ## Đã làm
 
@@ -80,3 +86,14 @@ Những thứ đã có nhưng **ngoài phạm vi exo**. Giữ nguyên, không m�
 - Fast decoder họ Llama (~+40%, token giống hệt) + paged KV.
 - Kernel numba int8/int4; int4 top-1 51% → 74%, KL 0,63 → 0,066.
 - Train pipeline: mỗi node train layer của mình, khớp model đầy đủ (< 1e-5).
+
+### Dọn dead code / trùng lặp (2026-11-02)
+- Gỡ pipeline mô phỏng cũ: `pipeline/scheduler.py`, `pipeline/stage.py`, `DistributedTrainer.train_1f1b`
+  (thay bằng `pp_training`), bảng "scaling" mô phỏng trong README và các test chỉ kiểm phần này.
+- API: gỡ route trùng/không ai gọi (`/download`, `/initial_models`, `DELETE /models/{name}`,
+  `/v1/settings/save`, `/v1/models/list` đăng ký 2 lần); `/v1/models/pull` tải trong thread thay vì chặn event loop.
+- Hàm không ai gọi: `shards_overlap`, `get_checkpoint_manifest`, `get_monitor`, `resolve_hf_model_id` (2 bản),
+  `PagedSequence.get_seq_length`; import thừa; `if True:` / biểu thức thừa.
+- Gỡ tính năng trợ lý ảo: 11 tool gọi mạng ngoài (thời tiết, giá vàng, crypto, tin tức…), bắt từ khoá tiếng Việt
+  tự gọi tool và chèn thêm chữ vào prompt người dùng, function calling `TOOL_CALL`, `requirements-tools.txt`.
+  Bỏ cả trường `tools` trong request (server bỏ qua nếu client gửi). Endpoint chat giờ stream ngay từ token đầu.

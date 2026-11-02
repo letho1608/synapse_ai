@@ -1,6 +1,5 @@
 # Base node install: inference + cluster core only.
 # Platform extras : requirements-windows.txt (pywin32, torch-directml)
-# Assistant/viz   : requirements-tools.txt (graceful "not installed" fallback, see api/tools/*)
 # Packaging/dev   : requirements-dev.txt
 aiofiles
 aiohttp

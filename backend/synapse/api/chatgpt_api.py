@@ -29,9 +29,6 @@ from synapse.training.preprocessing import preprocess_async
 from synapse.loading import get_checkpoints_dir
 from synapse.models import build_base_shard, get_repo
 from synapse.inference.tokenizers import resolve_tokenizer
-from synapse.api.function_calling import build_tool_instructions, parse_tool_calls, run_tool_and_format, run_tools_parallel
-from synapse.api.tools.intent_trigger import detect_tool_intent
-from synapse.api.tools.format_vi import format_tool_result_vi
 
 
 # Built-in liveness page served at GET / (the project is CLI-first; there is
@@ -82,27 +79,22 @@ setInterval(refresh, 5000);
 
 
 class Message:
-  def __init__(self, role: str, content: Union[str, List[Dict[str, Union[str, Dict[str, str]]]]], tools: Optional[List[Dict]] = None):
+  def __init__(self, role: str, content: Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]):
     self.role = role
     self.content = content
-    self.tools = tools
 
   def to_dict(self):
-    data = {"role": self.role, "content": self.content}
-    if self.tools:
-      data["tools"] = self.tools
-    return data
+    return {"role": self.role, "content": self.content}
 
 
 class ChatCompletionRequest:
-  def __init__(self, model: str, messages: List[Message], temperature: float, tools: Optional[List[Dict]] = None):
+  def __init__(self, model: str, messages: List[Message], temperature: float):
     self.model = model
     self.messages = messages
     self.temperature = temperature
-    self.tools = tools
 
   def to_dict(self):
-    return {"model": self.model, "messages": [message.to_dict() for message in self.messages], "temperature": self.temperature, "tools": self.tools}
+    return {"model": self.model, "messages": [message.to_dict() for message in self.messages], "temperature": self.temperature}
 
 
 def _clean_completion_content(text: str) -> str:
@@ -237,59 +229,27 @@ def _sampling_state(data) -> Optional[dict]:
     return None
 
 
-def build_prompt(tokenizer, messages: List[Message], tools: Optional[List[Dict]] = None):
-  # Check if tokenizer has chat template (GPT-2 doesn't have one)
-  if not hasattr(tokenizer, 'chat_template') or tokenizer.chat_template is None:
-    # For models without chat template (like GPT-2), concatenate messages
-    prompt_parts = []
-    for msg in messages:
-      content = msg.content if msg.content is not None else ""
-      if msg.role == "user":
-        prompt_parts.append(content)
-      elif msg.role == "assistant":
-        prompt_parts.append(content)
-      elif msg.role == "system":
-        prompt_parts.append(content)
-    return "\n".join(prompt_parts)
-  
-  # Pass conversation as positional argument (not keyword), which is what apply_chat_template expects
-  conversation = [m.to_dict() for m in messages]
-  chat_template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-  if tools:
-    chat_template_kwargs["tools"] = tools
+def _concat_prompt(messages: List[Message]) -> str:
+  """Plain concatenation for tokenizers without a usable chat template (GPT-2)."""
+  return "\n".join(m.content or "" for m in messages if m.role in ("user", "assistant", "system"))
 
+
+def build_prompt(tokenizer, messages: List[Message]):
+  if getattr(tokenizer, "chat_template", None) is None:
+    return _concat_prompt(messages)
+  conversation = [m.to_dict() for m in messages]
   try:
-    prompt = tokenizer.apply_chat_template(conversation, **chat_template_kwargs)
-    if DEBUG >= 3: print(f"!!! Prompt: {prompt}")
-    return prompt
+    prompt = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
   except (ValueError, AttributeError):
-    # If chat template fails, fallback to simple concatenation
-    prompt_parts = []
-    for msg in messages:
-      content = msg.content if msg.content is not None else ""
-      if msg.role == "user":
-        prompt_parts.append(content)
-      elif msg.role == "assistant":
-        prompt_parts.append(content)
-      elif msg.role == "system":
-        prompt_parts.append(content)
-    return "\n".join(prompt_parts)
-  except UnicodeEncodeError:
-    # Handle Unicode encoding by ensuring everything is UTF-8
-    conversation_utf8 = [
-      {k: v.encode('utf-8').decode('utf-8') if isinstance(v, str) else v
-       for k, v in m.to_dict().items()}
-      for m in messages
-    ]
-    prompt = tokenizer.apply_chat_template(conversation_utf8, **chat_template_kwargs)
-    if DEBUG >= 3: print(f"!!! Prompt (UTF-8 encoded): {prompt}")
-    return prompt
+    return _concat_prompt(messages)
+  if DEBUG >= 3: print(f"!!! Prompt: {prompt}")
+  return prompt
 
 
 def parse_message(data: dict):
   if "role" not in data or "content" not in data:
     raise ValueError(f"Invalid message: {data}. Must have 'role' and 'content'")
-  return Message(data["role"], data["content"], data.get("tools"))
+  return Message(data["role"], data["content"])
 
 
 def parse_chat_request(data: dict, default_model: str):
@@ -297,7 +257,6 @@ def parse_chat_request(data: dict, default_model: str):
     data.get("model", default_model),
     [parse_message(msg) for msg in data["messages"]],
     data.get("temperature", 0.0),
-    data.get("tools", None),
   )
 
 
@@ -403,9 +362,6 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/chat/completions", self.handle_post_chat_completions), {"*": cors_options})
     cors.add(self.app.router.add_get("/healthcheck", self.handle_healthcheck), {"*": cors_options})
     cors.add(self.app.router.add_post("/quit", self.handle_quit), {"*": cors_options})
-    cors.add(self.app.router.add_delete("/models/{model_name}", self.handle_delete_model), {"*": cors_options})
-    cors.add(self.app.router.add_get("/initial_models", self.handle_get_initial_models), {"*": cors_options})
-    cors.add(self.app.router.add_post("/download", self.handle_post_download), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/topology", self.handle_get_topology), {"*": cors_options})
     cors.add(self.app.router.add_get("/topology", self.handle_get_topology), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/distributed/status", self.handle_get_distributed_status), {"*": cors_options})
@@ -434,14 +390,12 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/training/start", self.handle_post_training), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/training/status", self.handle_get_training_status), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/models/status", self.handle_get_models_status), {"*": cors_options})
-    cors.add(self.app.router.add_get("/v1/models/list", self.handle_get_models_list), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/models/pull", self.handle_post_models_pull), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/models/delete", self.handle_post_models_delete), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/models/merge", self.handle_post_models_merge), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/models/checkpoints", self.handle_get_model_checkpoints), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/settings", self.handle_get_settings), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/settings", self.handle_post_settings), {"*": cors_options})
-    cors.add(self.app.router.add_post("/v1/settings/save", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/cluster/resources", self.handle_get_cluster_resources), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/download/progress", self.handle_get_download_progress), {"*": cors_options})
     # CLI-first (PLAN Part E): no web frontend. GET / is a built-in liveness
@@ -932,9 +886,7 @@ class ChatGPTAPI:
           hf_id = resolve_hf_id(model_name)
           
       from huggingface_hub import snapshot_download
-      # Note: This is synchronous, which can block the event loop for a while.
-      # Usually a thread or process would be better, but we keep existing behavior.
-      snapshot_download(repo_id=hf_id)
+      await asyncio.to_thread(snapshot_download, repo_id=hf_id)
       
       msg = f"Đã tải {model_name} -> {hf_id} (Hugging Face cache)"
       if is_new_discovery:
@@ -1103,53 +1055,13 @@ class ChatGPTAPI:
             status=500,
           )
         chat_request = parse_chat_request(data, self.default_model)
-        # Trigger tool theo từ khóa (model nhỏ thường không output TOOL_CALL đúng format)
-        last_user = None
-        for msg in reversed(chat_request.messages):
-          if msg.role == "user":
-            last_user = msg.content if isinstance(msg.content, str) else ""
-            break
-        if last_user:
-          intent_tools = detect_tool_intent(last_user)
-          if intent_tools:
-            try:
-              from synapse.api.tools.registry import execute_tool
-              parts = []
-              for tool_name, tool_args in intent_tools:
-                raw = await execute_tool(tool_name, tool_args)
-                text_vi = format_tool_result_vi(tool_name, raw)
-                parts.append(text_vi)
-              tool_result_vi = "\n".join(parts)
-              inject = "\n\n[Dữ liệu thời gian thực đã lấy]\n" + tool_result_vi + "\n\nHãy trả lời ngắn gọn bằng tiếng Việt dựa trên dữ liệu trên."
-              for msg in reversed(chat_request.messages):
-                if msg.role == "user":
-                  msg.content = (msg.content or "") + inject
-                  break
-            except Exception:
-              if DEBUG >= 1:
-                traceback.print_exc()
-        # Inject system prompt và tool instructions
-        tool_instructions = build_tool_instructions() if (chat_request.tools or detect_tool_intent(last_user or "")) else ""
         has_system_message = any(msg.role == "system" for msg in chat_request.messages)
-        
         if not has_system_message and self.system_prompt:
           # The configured system prompt (settings / --system-prompt). It used
           # to be replaced by a hardcoded "answer in Vietnamese" line, which
           # derailed small English models into garbage.
-          system_content = self.system_prompt
-          if tool_instructions:
-            system_content += "\n\n" + tool_instructions
-          chat_request.messages.insert(0, Message(role="system", content=system_content))
-        elif tool_instructions:
-          # Append to existing or create new if only tools are needed
-          if has_system_message:
-            for msg in chat_request.messages:
-              if msg.role == "system":
-                msg.content = (msg.content or "") + "\n\n" + tool_instructions
-                break
-          else:
-            chat_request.messages.insert(0, Message(role="system", content=tool_instructions))
-        prompt = build_prompt(tokenizer, chat_request.messages, chat_request.tools)
+          chat_request.messages.insert(0, Message(role="system", content=self.system_prompt))
+        prompt = build_prompt(tokenizer, chat_request.messages)
         stream = data.get("stream", False)
         if self.on_chat_completion_request:
           self.on_chat_completion_request(request_id, chat_request, prompt)
@@ -1158,7 +1070,6 @@ class ChatGPTAPI:
         )
         try:
           if stream:
-            # Thu thập full response trước (để kiểm tra tool call), sau đó stream
             response = web.StreamResponse(
               status=200,
               headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -1167,8 +1078,6 @@ class ChatGPTAPI:
             
             all_tokens_stream: List[int] = []
             detok = StreamDetokenizer(tokenizer)
-            is_real_streaming = False
-            tool_call_detected = False
             process_done_at: Optional[float] = None
             
             while True:
@@ -1199,83 +1108,11 @@ class ChatGPTAPI:
                   break
 
               all_tokens_stream.extend(tokens)
-              
-              # Decide whether to start streaming or buffer for tool detection
-              if not is_real_streaming and not tool_call_detected and not tool_instructions:
-                # No tools offered: nothing to detect, stream from the first
-                # token (holding 20 tokens back inflated TTFT for every chat).
-                is_real_streaming = True
-                delta = detok.push(all_tokens_stream)
-                if delta:
-                  await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
-              elif not is_real_streaming and not tool_call_detected:
-                decoded_so_far = tokenizer.decode(all_tokens_stream)
-                if "TOOL_CALL" in decoded_so_far:
-                  tool_call_detected = True
-                  if DEBUG >= 1: print(f"[DEBUG] Tool call detected for {request_id}, buffering entire response.")
-                elif len(all_tokens_stream) >= 20 or is_finished:
-                  # No tool call detected yet or response is short/finished, start real-time streaming
-                  is_real_streaming = True
-                  if DEBUG >= 2: print(f"[DEBUG] Starting real-time stream for {request_id}")
-                  delta = detok.push(all_tokens_stream)
-                  if delta:
-                    await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
-              elif is_real_streaming:
-                # Already in real-time streaming mode, push new text immediately
-                delta = detok.push(tokens)
-                if delta:
-                  await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
-              
+              delta = detok.push(tokens)
+              if delta:
+                await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
               if is_finished:
                 break
-            
-            # Post-processing for tool calls
-            if tool_call_detected:
-              decoded_full = tokenizer.decode(all_tokens_stream)
-              tool_calls_stream = parse_tool_calls(decoded_full)
-              if tool_calls_stream:
-                if DEBUG >= 1:
-                  print(f"Tool calls (stream, {len(tool_calls_stream)}): {[name for name, _ in tool_calls_stream]}")
-                try:
-                  # Execute tools (same logic as before)
-                  if len(tool_calls_stream) > 1:
-                    result_text_s = await run_tools_parallel(tool_calls_stream)
-                    result_msg_s = f"Kết quả từ {len(tool_calls_stream)} tools:\n{result_text_s}\n\nDựa vào kết quả trên trả lời ngắn gọn cho user."
-                  else:
-                    name_s, args_s = tool_calls_stream[0]
-                    result_text_s = await run_tool_and_format(name_s, args_s)
-                    result_msg_s = f"Kết quả tool:\n{result_text_s}\n\nDựa vào kết quả trên trả lời ngắn gọn cho user."
-                  
-                  new_messages_s = list(chat_request.messages) + [
-                    Message("assistant", decoded_full),
-                    Message("user", result_msg_s),
-                  ]
-                  new_prompt_s = build_prompt(tokenizer, new_messages_s, None)
-                  request_id_s = str(uuid.uuid4())
-                  self.token_queues[request_id_s] = asyncio.Queue()
-                  asyncio.create_task(self.node.process_prompt(base_shard, new_prompt_s, request_id=request_id_s, max_generate_tokens=max_tokens, inference_state=_sampling_state(data)))
-                  
-                  # Stream the follow-up response in real-time
-                  detok_s = StreamDetokenizer(tokenizer)
-                  while True:
-                    try:
-                      tk, fin = await asyncio.wait_for(self.token_queues[request_id_s].get(), timeout=float(self.response_timeout))
-                    except asyncio.TimeoutError:
-                      break
-                    delta = detok_s.push(tk)
-                    if delta:
-                      await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
-                    if fin:
-                      break
-                  if request_id_s in self.token_queues:
-                    del self.token_queues[request_id_s]
-                except Exception as e:
-                  if DEBUG >= 1: print(f"[ERROR] Tool execution failed in stream: {e}")
-              else:
-                # False positive "TOOL_CALL" text or parsing failed, stream the buffered content
-                delta = StreamDetokenizer(tokenizer).push(all_tokens_stream)
-                if delta:
-                  await response.write(f"data: {json.dumps(stream_chunk(chat_request, request_id, delta))}\n\n".encode())
             
             # Finalize the stream (with exact usage, OpenAI-style, so clients
             # never have to estimate the token count from words)
@@ -1318,66 +1155,6 @@ class ChatGPTAPI:
               all_tokens.extend(tokens)
               if is_finished:
                 break
-            decoded_first = tokenizer.decode(all_tokens)
-            # Thử parse multiple tool calls trước
-            tool_calls = parse_tool_calls(decoded_first)
-            if tool_calls:
-              if DEBUG >= 1:
-                print(f"Tool calls ({len(tool_calls)}): {[name for name, _ in tool_calls]}")
-              try:
-                # Nếu có nhiều tools, chạy song song
-                if len(tool_calls) > 1:
-                  result_text = await run_tools_parallel(tool_calls)
-                  result_msg = f"Kết quả từ {len(tool_calls)} tools:\n{result_text}\n\nDựa vào kết quả trên trả lời ngắn gọn cho user."
-                else:
-                  name, args = tool_calls[0]
-                  result_text = await run_tool_and_format(name, args)
-                  result_msg = f"Kết quả tool:\n{result_text}\n\nDựa vào kết quả trên trả lời ngắn gọn cho user."
-                new_messages = list(chat_request.messages) + [
-                  Message("assistant", decoded_first),
-                  Message("user", result_msg),
-                ]
-                new_prompt = build_prompt(tokenizer, new_messages, None)
-                request_id_2 = str(uuid.uuid4())
-                self.token_queues[request_id_2] = asyncio.Queue()
-                process_task_2 = asyncio.create_task(
-                  self.node.process_prompt(base_shard, new_prompt, request_id=request_id_2, max_generate_tokens=max_tokens, inference_state=_sampling_state(data))
-                )
-                all_tokens_2 = []
-                while True:
-                  try:
-                    tokens_2, is_finished_2 = await asyncio.wait_for(
-                      self.token_queues[request_id_2].get(),
-                      timeout=float(self.response_timeout),
-                    )
-                  except asyncio.TimeoutError:
-                    break
-                  all_tokens_2.extend(tokens_2)
-                  if is_finished_2:
-                    break
-                completion = generate_completion(
-                  chat_request, tokenizer, new_prompt, request_id_2, all_tokens_2, False, "stop", "chat.completion"
-                )
-                if request_id_2 in self.token_queues:
-                  del self.token_queues[request_id_2]
-                if not process_task_2.done():
-                  process_task_2.cancel()
-                  try:
-                    await process_task_2
-                  except asyncio.CancelledError:
-                    pass
-                  except Exception as cleanup_e:
-                    if DEBUG >= 1:
-                      print(f"[WARN] process_task_2 cleanup error for {request_id_2}: {cleanup_e}")
-                      traceback.print_exc()
-                return web.json_response(completion)
-              except Exception:
-                if DEBUG >= 1:
-                  traceback.print_exc()
-                completion = generate_completion(
-                  chat_request, tokenizer, prompt, request_id, all_tokens, False, "stop", "chat.completion"
-                )
-                return web.json_response(completion)
             completion = generate_completion(
               chat_request,
               tokenizer,
@@ -1417,55 +1194,6 @@ class ChatGPTAPI:
         if DEBUG >= 2:
           print(f"Cleaning up token queue: {request_id=}")
         del self.token_queues[request_id]
-
-  async def handle_delete_model(self, request):
-    """Xóa model: xóa khỏi HF cache (danh sách từ HF_MODELS)."""
-    model_id = (request.match_info.get("model_name") or "").strip()
-    if not model_id:
-      return web.json_response({"detail": "model_name required"}, status=400)
-    try:
-      from huggingface_hub import scan_cache_dir
-      hf_id = resolve_hf_id(model_id)
-      cache_info = scan_cache_dir()
-      rev_hashes = []
-      for repo in getattr(cache_info, "repos", []) or []:
-        if getattr(repo, "repo_id", "") == hf_id:
-          for rev in getattr(repo, "revisions", []) or []:
-            rev_hashes.append(getattr(rev, "commit_hash", ""))
-          break
-      if rev_hashes:
-        strategy = cache_info.delete_revisions(*rev_hashes)
-        strategy.execute()
-      return web.json_response({
-        "status": "success",
-        "message": f"Đã xóa cache HF cho {model_id}" if rev_hashes else f"Không tìm thấy cache cho {model_id}",
-      })
-    except Exception as e:
-      if DEBUG >= 2: traceback.print_exc()
-      return web.json_response({"detail": str(e)}, status=500)
-
-  async def handle_get_initial_models(self, request):
-    """Danh sách model: từ HF_MODELS; downloaded = có trong HF cache."""
-    self._get_hf_downloaded_names()
-    model_data = {}
-    return web.json_response(model_data)
-
-  async def handle_post_download(self, request):
-    """Download model: HF snapshot_download (danh sách từ HF_MODELS)."""
-    try:
-      data = await request.json()
-      model_name = (data.get("model") or "").strip()
-      if not model_name:
-        return web.json_response({"error": "model parameter is required"}, status=400)
-      if model_name not in HF_MODELS:
-        return web.json_response({"error": f"Model '{model_name}' không có trong danh sách."}, status=400)
-      from huggingface_hub import snapshot_download
-      hf_id = resolve_hf_id(model_name)
-      asyncio.get_event_loop().run_in_executor(None, lambda: snapshot_download(repo_id=hf_id))
-      return web.json_response({"status": "success", "message": f"Download started for model: {model_name}"})
-    except Exception as e:
-      if DEBUG >= 2: traceback.print_exc()
-      return web.json_response({"error": str(e)}, status=500)
 
   async def handle_get_topology(self, request):
     try:

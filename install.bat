@@ -34,6 +34,5 @@ echo   .venv\Scripts\activate
 echo   python main.py
 echo.
 echo Optional extras:
-echo   .venv\Scripts\python.exe -m pip install -r backend\requirements-tools.txt  ^(assistant/viz tools^)
 echo   .venv\Scripts\python.exe -m pip install -r backend\requirements-dev.txt     ^(packaging/dev^)
 endlocal

@@ -1,6 +1,5 @@
 # Default node install = base + Windows-only lines (pip markers).
 # Slim extras (opt-in):
-#   Assistant/viz tools : backend/requirements-tools.txt
 #   Packaging/dev       : backend/requirements-dev.txt
 -r requirements-base.txt
 pywin32; sys_platform == 'win32'

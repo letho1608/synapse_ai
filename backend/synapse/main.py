@@ -99,7 +99,7 @@ TAILNET_NAME_DEFAULT = (os.getenv("TAILSCALE_TAILNET", "") or os.getenv("TS_TAIL
 parser.add_argument("--tailnet-name", type=str, default=TAILNET_NAME_DEFAULT, help="Tailnet name (from .env or passed as arg)")
 parser.add_argument("--node-id-filter", type=str, default=None, help="Comma separated list of allowed node IDs (only for UDP and Tailscale discovery)")
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
-parser.add_argument("--system-prompt", type=str, default="Bạn là trợ lý Synapse AI. Hãy luôn trả lời bằng tiếng Việt một cách hữu ích và chính xác.", help="System prompt for the ChatGPT API")
+parser.add_argument("--system-prompt", type=str, default=None, help="System prompt added when a chat request has none (default: none)")
 parser.add_argument("--log-format", type=str, choices=["text", "json"], default=None,
                     help="Log encoding: text (default) or json (one JSON object per stdout line, for scripts/CI). "
                          "Falls back to SYNAPSE_LOG_FORMAT env.")
@@ -439,73 +439,72 @@ async def main():
   await node.start(wait_for_peers=args.wait_for_peers)
 
   # Always start API server (unless disabled)
-  if True:
-    try:
-      if DEBUG >= 1: print(f"[SERVER] Starting ChatGPT API on port {args.chatgpt_api_port}...")
-      api_task = asyncio.create_task(api.run(port=args.chatgpt_api_port))
-      api_task_global = api_task
-      
-      def api_task_done(task):
-        try:
-          task.result()
-        except asyncio.CancelledError:
-          pass
-        except Exception as e:
-          print(f"[ERROR] API server failed: {e}")
-      api_task.add_done_callback(api_task_done)
-    except Exception as e:
-      print(f"[ERROR] Failed to start API: {e}")
-      raise
-
-    if args.command == "run" or args.run_model:
-      model_name = args.model_name or args.run_model
-      if not model_name:
-        print("[ERROR] Model name is required")
-        return
-
-      check_model_hardware_fit(model_name)
-
-      if args.prompt:
-        # Run CLI and then exit
-        await run_model_cli(node, model_name, args.prompt)
-        await node.stop()
-        return
-      else:
-        if DEBUG >= 1: print(f"[INFO] Model '{model_name}' ready. Waiting for API requests...")
-
+  try:
+    if DEBUG >= 1: print(f"[SERVER] Starting ChatGPT API on port {args.chatgpt_api_port}...")
+    api_task = asyncio.create_task(api.run(port=args.chatgpt_api_port))
+    api_task_global = api_task
+    
+    def api_task_done(task):
       try:
-        await asyncio.Event().wait()
-      except (asyncio.CancelledError, KeyboardInterrupt):
-        await node.stop()
-    elif args.command == "eval":
-      # C-W2: eval was parsed but fell through to idle serve. Wire it.
-      model_name = args.model_name or args.default_model
-      if not model_name:
-        print("[ERROR] Model name is required")
-        return
-      await eval_model_cli(node, model_name,
-                           lambda _encode: load_dataset(args.data),
-                           args.batch_size)
-      await node.stop()
+        task.result()
+      except asyncio.CancelledError:
+        pass
+      except Exception as e:
+        print(f"[ERROR] API server failed: {e}")
+    api_task.add_done_callback(api_task_done)
+  except Exception as e:
+    print(f"[ERROR] Failed to start API: {e}")
+    raise
+
+  if args.command == "run" or args.run_model:
+    model_name = args.model_name or args.run_model
+    if not model_name:
+      print("[ERROR] Model name is required")
       return
-    elif args.command == "train":
-      # C-W2: train was parsed but fell through to idle serve. Wire it.
-      model_name = args.model_name or args.default_model
-      if not model_name:
-        print("[ERROR] Model name is required")
-        return
-      await train_model_cli(node, model_name,
-                            lambda _encode: load_dataset(args.data),
-                            args.batch_size, args.iters,
-                            args.save_every, args.save_checkpoint_dir)
+
+    check_model_hardware_fit(model_name)
+
+    if args.prompt:
+      # Run CLI and then exit
+      await run_model_cli(node, model_name, args.prompt)
       await node.stop()
       return
     else:
-      try:
-        if DEBUG >= 1: print("[SERVER] System running. Listening for requests...")
-        await asyncio.Event().wait()
-      except (asyncio.CancelledError, KeyboardInterrupt):
-        await node.stop()
+      if DEBUG >= 1: print(f"[INFO] Model '{model_name}' ready. Waiting for API requests...")
+
+    try:
+      await asyncio.Event().wait()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+      await node.stop()
+  elif args.command == "eval":
+    # C-W2: eval was parsed but fell through to idle serve. Wire it.
+    model_name = args.model_name or args.default_model
+    if not model_name:
+      print("[ERROR] Model name is required")
+      return
+    await eval_model_cli(node, model_name,
+                         lambda _encode: load_dataset(args.data),
+                         args.batch_size)
+    await node.stop()
+    return
+  elif args.command == "train":
+    # C-W2: train was parsed but fell through to idle serve. Wire it.
+    model_name = args.model_name or args.default_model
+    if not model_name:
+      print("[ERROR] Model name is required")
+      return
+    await train_model_cli(node, model_name,
+                          lambda _encode: load_dataset(args.data),
+                          args.batch_size, args.iters,
+                          args.save_every, args.save_checkpoint_dir)
+    await node.stop()
+    return
+  else:
+    try:
+      if DEBUG >= 1: print("[SERVER] System running. Listening for requests...")
+      await asyncio.Event().wait()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+      await node.stop()
 
   if args.wait_for_peers > 0:
     print("Cooldown to allow peers to exit gracefully")
