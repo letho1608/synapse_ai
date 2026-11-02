@@ -2,7 +2,7 @@
   "peers": {
     "node_primary": {
       "address": "127.0.0.1",
-      "port": 50051,
+      "port": 46051,
       "device_capabilities": {
         "model": "Localhost Cluster Node",
         "chip": "Simulated primary",
@@ -12,7 +12,7 @@
     },
     "node_worker1": {
       "address": "127.0.0.1",
-      "port": 50052,
+      "port": 46052,
       "device_capabilities": {
         "model": "Localhost Cluster Node",
         "chip": "Simulated worker 1",
@@ -22,7 +22,7 @@
     },
     "node_worker2": {
       "address": "127.0.0.1",
-      "port": 50053,
+      "port": 46053,
       "device_capabilities": {
         "model": "Localhost Cluster Node",
         "chip": "Simulated worker 2",

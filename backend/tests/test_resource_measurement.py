@@ -44,21 +44,30 @@ class TestResourceMeasurement:
             f"again; cache not hit"
         )
 
-    def test_disk_io_cache_refreshes_after_ttl(self):
-        """A6: after the TTL expires a fresh measurement (with its sampling
-        sleep) is taken, so the cache never serves stale values forever."""
+    def test_disk_io_cache_refreshes_after_ttl_without_sleeping(self, monkeypatch):
+        """After the TTL a fresh rate is computed from the counter delta since
+        the previous sample, never with a sampling sleep: this runs on the
+        event loop, where a 0.5 s sleep stalled every in-flight request."""
         import time
+        from collections import namedtuple
         from synapse.topology import resource_weight as rw
 
-        rw._disk_io_cache_ts = 0.0  # force expiry
-        t0 = time.monotonic()
-        rw._measure_disk_io()
-        elapsed = time.monotonic() - t0
+        C = namedtuple("C", "read_bytes write_bytes")
+        mb = 1024 * 1024
+        clock = [100.0]
+        counters = [C(0, 0)]
+        monkeypatch.setattr(rw.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(rw.psutil, "disk_io_counters", lambda: counters[0])
+        monkeypatch.setattr(rw.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("slept")))
+        monkeypatch.setattr(rw, "_disk_io_prev", None)
+        monkeypatch.setattr(rw, "_disk_io_cache", {})
 
-        assert elapsed >= 0.4, (
-            f"refresh call took {elapsed:.3f}s — expected the 0.5 s sampling "
-            f"sleep to re-run; cache did not refresh"
-        )
+        assert rw._measure_disk_io() == {"read_mbps": 0.0, "write_mbps": 0.0}  # primes
+        clock[0] += rw._DISK_IO_CACHE_TTL + 5.0       # 10 s later, past the TTL
+        counters[0] = C(100 * mb, 20 * mb)
+        got = rw._measure_disk_io()
+        assert got["read_mbps"] == pytest.approx(10.0)
+        assert got["write_mbps"] == pytest.approx(2.0)
 
     def test_power_measurement_function_exists(self):
         """Verify _measure_power() is defined and returns dict."""

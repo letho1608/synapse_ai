@@ -44,6 +44,7 @@ except ImportError:
 _DISK_IO_CACHE_TTL = 5.0
 _disk_io_cache: Dict[str, float] = {}
 _disk_io_cache_ts: float = 0.0
+_disk_io_prev = None  # (psutil counters, monotonic ts) of the last sample
 
 # ──────────────────────────────────────────────────────────
 # Resource measurement
@@ -138,39 +139,32 @@ def _measure_disk_io() -> Dict[str, float]:
     Returns dict with read_mbps and write_mbps (MB/s).
     Falls back to 0 values if psutil is unavailable or measurement fails.
 
-    Measurements are cached for _DISK_IO_CACHE_TTL seconds: the LACP path
-    rebuilds NodeResources per node on every partition recompute, and a
-    0.5 s sampling sleep per call would otherwise block each recompute.
+    Never sleeps: the rate is the counter delta since the previous sample.
+    This runs on the event loop (election scoring, partition recomputes), and
+    a sampling sleep there stalled every request for 0.5 s each time the
+    cache expired. The first call only primes the counters (0 MB/s).
+    Results are cached for _DISK_IO_CACHE_TTL seconds.
     """
-    global _disk_io_cache, _disk_io_cache_ts
+    global _disk_io_cache, _disk_io_cache_ts, _disk_io_prev
     now = time.monotonic()
     if _disk_io_cache and (now - _disk_io_cache_ts) < _DISK_IO_CACHE_TTL:
         return dict(_disk_io_cache)
 
     result = {"read_mbps": 0.0, "write_mbps": 0.0}
-    if not HAS_PSUTIL:
-        _disk_io_cache, _disk_io_cache_ts = result, now
-        return result
-    try:
-        # Sample disk I/O counters twice with a short interval
-        before = psutil.disk_io_counters()
-        if before is None:
-            _disk_io_cache, _disk_io_cache_ts = result, now
-            return result
-        time.sleep(0.5)
-        after = psutil.disk_io_counters()
-        if after is None:
-            _disk_io_cache, _disk_io_cache_ts = result, now
-            return result
-
-        elapsed = 0.5  # sleep duration
-        # Convert bytes to MB, divide by elapsed seconds
-        read_bytes = after.read_bytes - before.read_bytes
-        write_bytes = after.write_bytes - before.write_bytes
-        result["read_mbps"] = (read_bytes / (1024 * 1024)) / elapsed
-        result["write_mbps"] = (write_bytes / (1024 * 1024)) / elapsed
-    except Exception:
-        pass
+    if HAS_PSUTIL:
+        try:
+            counters = psutil.disk_io_counters()
+            if counters is not None:
+                if _disk_io_prev is not None:
+                    prev, prev_ts = _disk_io_prev
+                    elapsed = now - prev_ts
+                    if elapsed > 0:
+                        mb = 1024 * 1024
+                        result["read_mbps"] = max(0.0, (counters.read_bytes - prev.read_bytes) / mb / elapsed)
+                        result["write_mbps"] = max(0.0, (counters.write_bytes - prev.write_bytes) / mb / elapsed)
+                _disk_io_prev = (counters, now)
+        except Exception:
+            pass
     _disk_io_cache, _disk_io_cache_ts = dict(result), now
     return result
 

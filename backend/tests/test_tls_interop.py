@@ -6,9 +6,11 @@ bridges with real server/client SSL contexts, and asserts: handshake with
 versions both directions, event delivery, and BOTH writers actually wrapped
 in TLS (ssl_object present) plus the advertised tls_fp pin recorded.
 
-Ports 59511/59512: unused by any other test module in this repo.
+Ports come from the OS (bind to 0): fixed numbers can fall inside a range
+Windows reserves (Hyper-V/WSL), where bind fails with WinError 13.
 """
 import asyncio
+import socket
 import ssl
 
 import pytest
@@ -21,6 +23,14 @@ from synapse.transport.tls_wrap import (
     fingerprint_bytes,
     gen_self_signed_cert,
 )
+
+
+def _free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 async def _mk(nid, port, srv_ctx, cli_ctx, tls_fp):
@@ -66,10 +76,11 @@ async def test_tls_pair_handshake_event_and_pin(tmp_path):
     srv_ctx = build_server_context(str(cert_f), str(key_f))
     cli_ctx = build_client_context(cafile=str(cert_f))
 
-    _, a, ta = await _mk("tls-a", 59511, srv_ctx, cli_ctx, fp)
-    _, b, tb = await _mk("tls-b", 59512, srv_ctx, cli_ctx, fp)
+    _, a, ta = await _mk("tls-a", _free_port(), srv_ctx, cli_ctx, fp)
+    pb = _free_port()
+    _, b, tb = await _mk("tls-b", pb, srv_ctx, cli_ctx, fp)
     try:
-        assert await a.connect_to_peer("tls-b", "127.0.0.1:59512")
+        assert await a.connect_to_peer("tls-b", f"127.0.0.1:{pb}")
         await asyncio.sleep(0.5)
 
         ha = a.get_peer_handshake("tls-b")
@@ -116,26 +127,28 @@ async def test_pins_authenticate_the_peer_without_a_ca(tmp_path, monkeypatch):
     srv_ctx = build_server_context(str(cert_f), str(key_f))
     cli_ctx = build_client_context(cafile=None)  # no CA: pins only
 
-    _, a, ta = await _mk("pin-a", 59513, srv_ctx, cli_ctx, pin)
-    _, b, tb = await _mk("pin-b", 59514, srv_ctx, cli_ctx, pin)
+    _, a, ta = await _mk("pin-a", _free_port(), srv_ctx, cli_ctx, pin)
+    pb = _free_port()
+    _, b, tb = await _mk("pin-b", pb, srv_ctx, cli_ctx, pin)
     try:
         monkeypatch.setenv("SYNAPSE_TLS_PINS", "0" * 64)
-        assert not await a.connect_to_peer("pin-b", "127.0.0.1:59514")
+        assert not await a.connect_to_peer("pin-b", f"127.0.0.1:{pb}")
         monkeypatch.setenv("SYNAPSE_TLS_PINS", pin)
-        assert await a.connect_to_peer("pin-b", "127.0.0.1:59514")
+        assert await a.connect_to_peer("pin-b", f"127.0.0.1:{pb}")
     finally:
         await _close(a, ta)
         await _close(b, tb)
 
-    srv = TCPServer(host="127.0.0.1", port=59515, ssl_ctx=srv_ctx)
+    ps = _free_port()
+    srv = TCPServer(host="127.0.0.1", port=ps, ssl_ctx=srv_ctx)
     got = []
     srv.set_frame_handler(got.append)
     await srv.start()
     try:
         monkeypatch.setenv("SYNAPSE_TLS_PINS", "f" * 64)
-        assert await TCPClientPool(ssl_ctx=cli_ctx).send("127.0.0.1:59515", b"x") is False
+        assert await TCPClientPool(ssl_ctx=cli_ctx).send(f"127.0.0.1:{ps}", b"x") is False
         monkeypatch.setenv("SYNAPSE_TLS_PINS", pin)
-        assert await TCPClientPool(ssl_ctx=cli_ctx).send("127.0.0.1:59515", b"hello") is True
+        assert await TCPClientPool(ssl_ctx=cli_ctx).send(f"127.0.0.1:{ps}", b"hello") is True
     finally:
         await srv.stop()
 
@@ -193,20 +206,22 @@ async def test_ca_mode_is_mutual_tls(tmp_path):
 
     srv_a, cli_a = ctxs()
     srv_b, _ = ctxs()
-    _, a, ta = await _mk("mtls-a", 59516, srv_a, cli_a, pin)
-    _, b, tb = await _mk("mtls-b", 59517, srv_b, cli_a, pin)
+    _, a, ta = await _mk("mtls-a", _free_port(), srv_a, cli_a, pin)
+    pb = _free_port()
+    _, b, tb = await _mk("mtls-b", pb, srv_b, cli_a, pin)
     try:
-        assert await a.connect_to_peer("mtls-b", "127.0.0.1:59517")
+        assert await a.connect_to_peer("mtls-b", f"127.0.0.1:{pb}")
     finally:
         await _close(a, ta)
         await _close(b, tb)
 
     _, cli_nocert = ctxs(with_client_cert=False)
     srv_c, _ = ctxs()
-    _, c, tc = await _mk("mtls-c", 59518, srv_c, cli_nocert, pin)
-    _, d, td = await _mk("mtls-d", 59519, srv_c, cli_nocert, pin)
+    _, c, tc = await _mk("mtls-c", _free_port(), srv_c, cli_nocert, pin)
+    pd = _free_port()
+    _, d, td = await _mk("mtls-d", pd, srv_c, cli_nocert, pin)
     try:
-        assert not await c.connect_to_peer("mtls-d", "127.0.0.1:59519")
+        assert not await c.connect_to_peer("mtls-d", f"127.0.0.1:{pd}")
     finally:
         await _close(c, tc)
         await _close(d, td)

@@ -142,6 +142,7 @@ class Node:
     self.event_router.subscribe("synapse/cluster/status", self.on_p2p_status)
     self.event_router.subscribe(f"synapse/inference/tensor/{self.id}", self.on_p2p_tensor)
     self.event_router.subscribe(f"synapse/checkpoint/replica/{self.id}", self.on_p2p_ckpt_replica)
+    self.event_router.subscribe(f"synapse/training/pp/{self.id}", self.on_p2p_pp_train)
     self.event_router.subscribe(f"synapse/inference/prompt/{self.id}", self.on_p2p_prompt)
     # C-W4: peer-sent training examples + opaque status had publishers but no
     # subscribers (black holes). Route them into enqueue_example/on_node_status.
@@ -1330,6 +1331,9 @@ class Node:
         # First decoding step from full prompt.
         prompt_ids = await self.inference_engine.encode(shard, prompt)
         self._prompt_token_ids[request_id] = prompt_ids
+        # This loop samples the last position only: skip the vocabulary
+        # projection of every other prompt row.
+        inference_state = {**(inference_state or {}), "last_logits_only": True}
         result, inference_state = await self.inference_engine.infer_prompt(request_id, shard, prompt, inference_state)
         latest_result = await self.process_inference_result(shard, result, request_id, inference_state)
 
@@ -1823,6 +1827,10 @@ class Node:
         self._record_transport(via + ":ckpt-replica")
         self._store_ckpt_replica(meta, msg.tensor)
         return
+      if meta.get("kind") == "pp_train":
+        self._record_transport(via + ":pp-train")
+        self.distributed_pipeline.pp_receive(msg.tensor, meta)
+        return
       shard_d = meta.get("shard")
       if not isinstance(shard_d, dict):
         self._record_transport(via + ":drop-no-shard")
@@ -2250,6 +2258,14 @@ class Node:
       tensor, meta = decode_tensor(data["bin"])
       if (meta or {}).get("kind") == "ckpt_replica":
         self._store_ckpt_replica(meta, tensor)
+
+  async def on_p2p_pp_train(self, event: Event):
+    """Pipeline-training message that came over the event bridge."""
+    data = event.data
+    if isinstance(data, dict) and "bin" in data:
+      tensor, meta = decode_tensor(data["bin"])
+      if (meta or {}).get("kind") == "pp_train":
+        self.distributed_pipeline.pp_receive(tensor, meta)
 
   def _node_alive(self, node_id: str) -> bool:
     """Heartbeat view of a node (used to detect a dead stage mid-request).

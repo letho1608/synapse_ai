@@ -19,7 +19,7 @@ def test_network_topology_from_path():
     assert "node1" in topo.peers
     peer = topo.peers["node1"]
     assert peer.address == "localhost"
-    assert peer.port == 50051
+    assert peer.port == 46051
     assert peer.device_capabilities is not None
     assert peer.device_capabilities.model == "Unknown Model"
 

@@ -642,11 +642,15 @@ class ChatGPTAPI:
         # Dùng SystemSpecs nếu có
         specs = getattr(caps, "_specs", None)
         if specs is None:
-          try:
-            from synapse.topology.device_capabilities import SystemSpecs
-            specs = SystemSpecs.detect()
-          except Exception:
-            specs = None
+          # Detection costs seconds (PowerShell/CIM on Windows): once per
+          # process, shared with get_system_stats_dict.
+          specs = getattr(self, "_cached_system_specs", None)
+          if specs is None:
+            try:
+              from synapse.topology.device_capabilities import SystemSpecs
+              specs = self._cached_system_specs = SystemSpecs.detect()
+            except Exception:
+              specs = None
         if specs is not None:
           if getattr(specs, "has_gpu", False) and getattr(specs, "gpu_name", None):
             vram = getattr(specs, "gpu_vram_gb", 0) or 0
@@ -1734,14 +1738,16 @@ class ChatGPTAPI:
       return {"detail": str(e), "error": True}
 
   async def handle_get_system_stats(self, request):
-    return web.json_response(self.get_system_stats_dict())
+    # Off the event loop: the first call runs hardware detection (PowerShell /
+    # CIM queries, ~4-5 s on Windows), which stalled every in-flight request.
+    return web.json_response(await asyncio.to_thread(self.get_system_stats_dict))
 
   async def handle_ws_metrics(self, request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     try:
       while True:
-        stats = self.get_system_stats_dict()
+        stats = await asyncio.to_thread(self.get_system_stats_dict)
         # Wrap it in the format expected by frontend
         await ws.send_json({"type": "metrics", "stats": stats})
         await asyncio.sleep(1)

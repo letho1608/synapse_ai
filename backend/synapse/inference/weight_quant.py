@@ -8,11 +8,16 @@ works on CPU, CUDA and DirectML alike; bitsandbytes is CUDA-only.
 
 - int8: symmetric, one scale per output row.
 - int4: asymmetric (scale + zero point) per group of GROUP input columns,
-  two values packed per byte.
+  two values packed per byte. Scale and zero are fitted per group (range
+  shrink chosen by squared error, then a least-squares refit), and the
+  tensors int4 hurts most stay int8 (mixed precision, like llama.cpp's
+  Q4_K_M): v_proj / down_proj and the first and last INT4_END_LAYERS layers.
+  On SmolLM2-135M this took int4 from KL 0.63 / top-1 51% to KL ~0.07.
 
-Weights are dequantized to the compute dtype inside forward (memory drops,
-compute stays in fp32/fp16). Embeddings and the LM head stay unquantized.
-Quality is gated by tests/test_weight_quant.py on the default model.
+On CPU, forward runs numba kernels that read the packed weights directly
+(qkernels.py: int8 2-3x faster than fp32 on decode, int4 about as fast);
+elsewhere the weights are dequantized inside forward. Embeddings and the LM
+head stay unquantized. Quality is gated by tests/test_partial_load_and_quant.py.
 """
 from __future__ import annotations
 
@@ -25,6 +30,49 @@ import torch.nn.functional as F
 
 GROUP = 32
 MODES = ("none", "int8", "int4")
+# int4 mode keeps these linears (dotted-path suffixes) and the first/last
+# INT4_END_LAYERS decoder layers in int8. SYNAPSE_INT4_KEEP overrides the
+# list ("none" = pure int4).
+INT4_KEEP_INT8 = ("v_proj", "down_proj", "mlp.c_proj")
+INT4_END_LAYERS = 2
+_SHRINK_GRID = (1.0, 0.95, 0.9, 0.85, 0.8)
+
+
+def _fit_int4(g: torch.Tensor):
+    """Per-group asymmetric 4-bit fit of g [rows, groups, GROUP].
+
+    For each range-shrink factor, quantize, refit scale/zero by least squares
+    for those codes (a few rounds), and keep the factor with the smallest
+    squared error per group. Returns (codes uint8, scale fp16, zero fp16),
+    with the codes recomputed from the fp16 scale/zero actually stored."""
+    lo0 = g.amin(dim=2, keepdim=True)
+    hi0 = g.amax(dim=2, keepdim=True)
+    mid, half = (lo0 + hi0) / 2, (hi0 - lo0) / 2
+    gm = g.mean(dim=2, keepdim=True)
+    best_s = best_z = best_err = None
+    for f in _SHRINK_GRID:
+        s = (half * f * 2 / 15.0).clamp_min(1e-8)
+        z = mid - half * f
+        for _ in range(3):
+            q = torch.round((g - z) / s).clamp_(0, 15)
+            qm = q.mean(dim=2, keepdim=True)
+            cov = ((q - qm) * (g - gm)).sum(dim=2, keepdim=True)
+            var = ((q - qm) ** 2).sum(dim=2, keepdim=True)
+            s = torch.where(var > 0, cov / var.clamp_min(1e-12), s).clamp_min(1e-8)
+            z = gm - s * qm
+        q = torch.round((g - z) / s).clamp_(0, 15)
+        err = ((q * s + z - g) ** 2).sum(dim=2, keepdim=True)
+        if best_err is None:
+            best_s, best_z, best_err = s, z, err
+        else:
+            better = err < best_err
+            best_s = torch.where(better, s, best_s)
+            best_z = torch.where(better, z, best_z)
+            best_err = torch.where(better, err, best_err)
+    s16 = best_s.clamp_min(6e-8).to(torch.float16)
+    z16 = best_z.to(torch.float16)
+    q = torch.round((g - z16.float()) / s16.float()).clamp_(0, 15).to(torch.uint8)
+    return q, s16.squeeze(2), z16.squeeze(2)
 
 
 class QuantLinear(nn.Module):
@@ -47,19 +95,12 @@ class QuantLinear(nn.Module):
             pad = (-self.in_features) % GROUP
             if pad:
                 w = F.pad(w, (0, pad))
-            g = w.view(self.out_features, -1, GROUP)
-            # Asymmetric (min/max) per group: all 16 levels span the group's
-            # actual range. Symmetric int4 lost half the top-1 agreement on
-            # SmolLM2-135M.
-            lo = g.amin(dim=2, keepdim=True)
-            hi = g.amax(dim=2, keepdim=True)
-            scale = ((hi - lo) / 15.0).clamp_min(1e-8)
-            q = torch.round((g - lo) / scale).clamp_(0, 15).to(torch.uint8)
+            q, scale, zero = _fit_int4(w.view(self.out_features, -1, GROUP))
             q = q.view(self.out_features, -1)
             packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous()
             self.register_buffer("qweight", packed)
-            self.register_buffer("scales", scale.squeeze(2).to(torch.float16))
-            self.register_buffer("zeros", lo.squeeze(2).to(torch.float16))
+            self.register_buffer("scales", scale)
+            self.register_buffer("zeros", zero)
         self.bias = None if bias is None else nn.Parameter(bias.detach().clone(), requires_grad=False)
 
     def dequantize(self) -> torch.Tensor:
@@ -76,10 +117,34 @@ class QuantLinear(nn.Module):
             w = w[:, : self.in_features]
         return w.to(self.compute_dtype)
 
+    def _fp32_params(self):
+        """fp32 copies of the (small) scale/zero tensors for the kernels;
+        rebuilt if the buffers are replaced (e.g. load_state_dict)."""
+        key = (self.scales.data_ptr(), None if self.mode == "int8" else self.zeros.data_ptr())
+        if getattr(self, "_f32_key", None) != key:
+            self._f32 = (self.scales.float().reshape(self.out_features, -1).contiguous(),
+                         None if self.mode == "int8" else self.zeros.float().contiguous())
+            self._f32_key = key
+        return self._f32
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.dequantize().to(x.dtype)
-        b = None if self.bias is None else self.bias.to(x.dtype)
-        return F.linear(x, w, b)
+        from synapse.inference import qkernels
+        y = None
+        if x.device.type == "cpu":
+            s32, z32 = self._fp32_params()
+            if self.mode == "int8":
+                y = qkernels.int8_linear(x, self.qweight, s32.view(-1))
+            else:
+                y = qkernels.int4_linear(x, self.qweight, s32, z32, self.in_features, GROUP)
+        if y is None:
+            if self.mode == "int8":
+                # Scale the outputs, not the matrix: one pass fewer over W.
+                y = F.linear(x, self.qweight.to(x.dtype)) * self.scales.view(-1).to(x.dtype)
+            else:
+                y = F.linear(x, self.dequantize().to(x.dtype))
+        if self.bias is not None:
+            y = y + self.bias.to(y.dtype)
+        return y
 
     def extra_repr(self) -> str:
         return f"{self.in_features}->{self.out_features}, {self.mode}"
@@ -93,24 +158,46 @@ def _conv1d_type():
         return None
 
 
-def quantize_module(module: nn.Module, mode: str) -> int:
+def int4_keep() -> tuple:
+    env = os.getenv("SYNAPSE_INT4_KEEP")
+    if env is None:
+        return INT4_KEEP_INT8
+    env = env.strip()
+    if env.lower() in ("", "none"):
+        return ()
+    return tuple(x.strip() for x in env.split(",") if x.strip())
+
+
+def layer_mode(mode: str, layer_index: int, n_layers: int) -> str:
+    """Mode for one decoder layer: int4 keeps the first/last layers in int8."""
+    if mode == "int4" and int4_keep() and (
+            layer_index < INT4_END_LAYERS or layer_index >= n_layers - INT4_END_LAYERS):
+        return "int8"
+    return mode
+
+
+def quantize_module(module: nn.Module, mode: str, _prefix: str = "") -> int:
     """Replace every nn.Linear (and GPT-2 Conv1D) inside `module` in place.
 
+    In int4 mode the linears named in int4_keep() become int8 instead.
     Returns the number of replaced layers. mode "none" is a no-op."""
     if mode in (None, "", "none"):
         return 0
     conv1d = _conv1d_type()
+    keep = int4_keep() if mode == "int4" else ()
     count = 0
     for name, child in list(module.named_children()):
+        path = f"{_prefix}.{name}" if _prefix else name
+        m = "int8" if any(path == k or path.endswith("." + k) for k in keep) else mode
         if isinstance(child, nn.Linear):
-            setattr(module, name, QuantLinear(child.weight, child.bias, mode))
+            setattr(module, name, QuantLinear(child.weight, child.bias, m))
             count += 1
         elif conv1d is not None and isinstance(child, conv1d):
             # Conv1D computes x @ W + b with W [in, out]: same as Linear(W^T).
-            setattr(module, name, QuantLinear(child.weight.t().contiguous(), child.bias, mode))
+            setattr(module, name, QuantLinear(child.weight.t().contiguous(), child.bias, m))
             count += 1
         else:
-            count += quantize_module(child, mode)
+            count += quantize_module(child, mode, path)
     return count
 
 

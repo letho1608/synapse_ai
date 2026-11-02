@@ -22,6 +22,8 @@ setuptools
 tqdm
 transformers
 torch
+# CPU kernels for int8/int4 weights (inference/qkernels.py); optional, torch fallback without it
+numba>=0.59
 peft
 datasets
 accelerate

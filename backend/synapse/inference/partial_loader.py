@@ -97,9 +97,15 @@ class PartialModel:
         self.final_norm: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
         self.rotary: Optional[nn.Module] = None
+        # True when the checkpoint has no separate head (output = input
+        # embedding); stage training keeps split copies in sync.
+        self.head_tied = False
         self._skeleton = self._build_skeleton(1, None)
         self._layers_path = self._find_layers_path(self._skeleton)
         self._build_rotary()
+        head = self._skeleton.get_output_embeddings()
+        head_path = self._path_of(self._skeleton, head) if head is not None else None
+        self.head_tied = bool(head_path) and self._ckpt_name(f"{head_path}.weight") is None
 
     # -- skeleton / naming -------------------------------------------------
     def _build_skeleton(self, n_layers: int, layer_ids: Optional[List[int]]):
@@ -206,8 +212,8 @@ class PartialModel:
                 dst = f"{self._layers_path}.{absolute}"
                 self._load(layer, src, rename=lambda n, s=src, d=dst: d + n[len(s):])
                 if self.quant_mode != "none":
-                    from synapse.inference.weight_quant import quantize_module
-                    quantize_module(layer, self.quant_mode)
+                    from synapse.inference.weight_quant import layer_mode, quantize_module
+                    quantize_module(layer, layer_mode(self.quant_mode, absolute, self.n_layers))
                 self.layers[absolute] = layer
             if DEBUG >= 1:
                 print(f"[PartialModel] loaded layers {missing[0]}-{missing[-1]} "
@@ -228,7 +234,7 @@ class PartialModel:
                 self.final_norm = norm
             head = sk.get_output_embeddings()
             head_path = self._path_of(sk, head)
-            tied = self._ckpt_name(f"{head_path}.weight") is None
+            tied = self.head_tied
             if tied and self.embed is not None and getattr(head, "bias", None) is None:
                 head.weight = self.embed.weight  # share, don't copy
             elif tied:

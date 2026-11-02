@@ -160,7 +160,7 @@ Quyết định: synapse xây theo kiểu **CLI terminal**, giữ web UI hiện 
 
 **Sau khi sửa (INT8 bật, temperature 0):** 2 process — A chạy 0–14 ×8, B chạy 15–29 ×8, tensor qua `tcp-chunked`, "The capital of France is Paris." (giống 1 node), ~4–5 s. 3 process — 0–9 / 10–19 / 20–29, cùng đáp án, ~8.5 s. Test live: `test_live_multiprocess_split.py` (2 process thật, assert dải layer + đáp án + transport).
 
-**Chưa kiểm được:** nhiều **máy** thật (C1) — mạng thật, băng thông, failover. Lưu ý Windows: dải cổng 50000–50059 có thể bị hệ thống giữ (Hyper-V) → cổng node mặc định 50051 không bind được.
+**Chưa kiểm được:** nhiều **máy** thật (C1) — mạng thật, băng thông, failover. Lưu ý Windows: dải cổng 50000–50059 có thể bị hệ thống giữ (Hyper-V) → cổng node mặc định cũ 50051 không bind được; nay đổi sang 46051 (dưới dải động 49152+).
 
 ## Đợt 2026-09-30: bổ sung theo tài liệu liên quan + rà soát tính năng
 
@@ -207,3 +207,22 @@ Làm theo `research/related-work.md`, các mục 1, 3, 4, 5, 6, 7.
 - `benchmark` dùng model "default" nên bị 400; `--prompt` bị bỏ qua; tok/s bị thổi phồng (~400) vì đo từ chunk đầu tiên.
 - `settings.json` trong repo đè model mặc định (Qwen chưa có trong cache); `--default-model` nay thắng.
 - Checkpoint FT ghi vào thư mục gốc cache HF; nay ở `~/.synapse/checkpoints`, test dùng thư mục tạm.
+
+## Đợt 2026-11-02: tìm chỗ chậm + kernel, paged KV, int4, huấn luyện theo dải layer
+
+**Chỗ chậm tìm được (py-spy trên server thật, SmolLM2-135M, CPU):**
+- TTFT ~2 s mỗi request: API gọi `AutoTokenizer.from_pretrained` (kèm HTTPS lên Hub) ở **mỗi** chat request → cache tokenizer theo repo (`inference/tokenizers.py`).
+- `_measure_disk_io` `time.sleep(0.5)` chạy trên event loop (election scoring định kỳ) → treo mọi request 0,5 s mỗi lần cache hết hạn → đo bằng hiệu số bộ đếm, không sleep.
+- `/v1/system/stats`: `SystemSpecs.detect()` (PowerShell/CIM, 4–5 s) chạy trên event loop, 2 lần/request → chạy trong thread + cache dùng chung.
+- Engine: ~nửa thời gian decode là Python trong module HF; DynamicCache nối lại toàn bộ K/V mỗi token.
+- Int8 hiện có chậm hơn fp32 ~10× (giải lượng tử cả ma trận mỗi lần gọi); chuyển int8→fp32 của torch bản này chỉ ~1 G phần tử/s.
+- Luồng OpenMP của torch quay chờ, giành lõi với kernel numba (cặp torch+numba chậm 3,5×) → `OMP_WAIT_POLICY=PASSIVE` mặc định (`synapse/__init__.py`).
+
+**Đã làm:**
+- `inference/fast_decoder.py`: decoder họ Llama (llama/mistral/qwen2/qwen3) gộp q|k|v và gate|up (module HF giữ view, không nhân đôi bộ nhớ), SDPA, **paged KV** (pool block 16 dùng chung, crop trả block, request xong trả block, pool tự nở); batch decode ghép hàng cho mọi matmul. Logits = đường HF; parity/batching/verify test giữ nguyên xanh.
+- `inference/qkernels.py` (numba, tùy chọn): GEMV/GEMM int8 và int4 đọc thẳng trọng số nén; 4096×4096: fp32 4,4 ms, int8 2,0 ms, int4 4,2 ms (trước: int4 ~5× chậm hơn fp32). Không có numba → fallback torch (vẫn nhanh hơn bản cũ).
+- int4: fit scale/zero theo MSE + bình phương tối thiểu; giữ v_proj/down_proj và 2 layer mỗi đầu ở int8 (kiểu Q4_K_M) → top-1 74%, KL 0,066, 0,19× fp32 (trước 51% / 0,63). Thử và loại: oneDNN dynamic int8 (lượng tử activation, top-1 49%), LLM.int8 outlier split (≤ 90%, op đã deprecated), `_weight_int8pack_mm` (chậm 4–12×).
+- Huấn luyện: `inference/stage_training.py` + `pipeline/pp_training.py` — mỗi node train đúng dải layer nó phục vụ; activation đi xuôi, dL/dx đi ngược giữa các node (chunked TCP / bridge), clip theo norm toàn cục, AdamW từng stage, embedding tied giữa stage đầu/cuối trao đổi gradient. 1 bước 3 stage = 1 bước model đầy đủ (< 1e-5/tham số). Thay đường "1F1B" giả lập (mọi stage chạy trong 1 tiến trình với cả model).
+- Cổng node mặc định 46051 (50051 nằm trong dải Windows giữ); test TLS dùng cổng do OS cấp.
+
+**Còn lại / giới hạn:** C1 (chạy nhiều máy thật) vẫn chưa làm; LoRA vẫn nạp cả model; trọng số lượng tử không train được; int8 không nhanh hơn fp32 trên model rất nhỏ (ma trận 576 chiều, chi phí gọi kernel chiếm phần lớn) — lợi ích thật ở model lớn; GPT-2 train có dropout nên không bit-exact với eval.

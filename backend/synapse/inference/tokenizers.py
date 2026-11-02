@@ -2,7 +2,7 @@ import asyncio
 import traceback
 from os import PathLike
 import os
-from typing import Union
+from typing import Dict, Union
 from transformers import AutoTokenizer
 from synapse.helpers import DEBUG
 from synapse.loading import get_models_dir
@@ -12,9 +12,29 @@ def ensure_downloads_dir():
     return get_models_dir()
 
 
+# Loaded tokenizers by repo id. The API resolves the tokenizer on every chat
+# request; reloading it each time (from_pretrained + a Hub round trip when
+# online) cost ~2 s of time-to-first-token per request.
+_TOKENIZERS: Dict[str, object] = {}
+_TOKENIZER_LOCKS: Dict[tuple, asyncio.Lock] = {}  # (repo, loop): a lock is loop-bound
+
+
 async def resolve_tokenizer(repo_id: Union[str, PathLike]):
   if repo_id is None:
     raise ValueError("repo_id cannot be None")
+  key = str(repo_id)
+  cached = _TOKENIZERS.get(key)
+  if cached is not None:
+    return cached
+  lock = _TOKENIZER_LOCKS.setdefault((key, id(asyncio.get_running_loop())), asyncio.Lock())
+  async with lock:
+    cached = _TOKENIZERS.get(key)
+    if cached is None:
+      cached = _TOKENIZERS[key] = await _resolve_tokenizer_uncached(repo_id)
+  return cached
+
+
+async def _resolve_tokenizer_uncached(repo_id: Union[str, PathLike]):
   local_path = ensure_downloads_dir() / str(repo_id).replace("/", "--")
   if DEBUG >= 2: print(f"Checking if local path exists to load tokenizer from local {local_path=}")
   try:

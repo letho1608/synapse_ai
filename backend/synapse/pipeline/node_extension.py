@@ -3,7 +3,8 @@ LACP — Distributed Pipeline Node Extension
 
 Extends the Node class with:
 1. Distributed inference pipeline (multi-node)
-2. Distributed training pipeline (DDP + all-reduce)
+2. Distributed training: pipeline-parallel (each node trains its own
+   layers, pp_training.PipelineTrainer) or DDP (full replicas + all-reduce)
 """
 
 from __future__ import annotations
@@ -21,46 +22,10 @@ from synapse.inference.inference_engine import SHARD_WEIGHTS_SUFFIX
 from synapse.inference.shard import Shard
 from synapse.topology.partitioning_strategy import map_partitions_to_shards
 from synapse.pipeline.gradient_sync import DistributedTrainer
-from synapse.pipeline.scheduler import MicroBatch
-from synapse.pipeline.stage import PipelineStage, StageResult
+from synapse.pipeline.pp_training import PipelineTrainer
 from synapse.helpers import DEBUG
 
 _log = logging.getLogger(__name__)
-
-
-class _GradientHandoff:
-    """In-process pipeline backward channel for the 1F1B schedule.
-
-    The backward phase runs in reverse stage order: stage k's backward
-    consumes the input-gradient computed by stage k+1 (the downstream stage)
-    as its ``backgrad``. Keys are ``(stage_id, micro_batch_id)``; the value
-    is the real gradient tensor handed back through the stage's send path.
-    """
-
-    def __init__(self) -> None:
-        self._queues: Dict[Tuple[int, int], asyncio.Queue] = {}
-
-    def ensure(self, key: Tuple[int, int]) -> None:
-        """Pre-create the queue for a key so a get() before any put() waits
-        instead of returning immediately (the schedule runs the upstream
-        backward before the downstream one delivers)."""
-        self._queues.setdefault(key, asyncio.Queue(maxsize=1))
-
-    def put(self, key: Tuple[int, int], value: np.ndarray) -> None:
-        q = self._queues.setdefault(key, asyncio.Queue(maxsize=1))
-        if q.empty():
-            q.put_nowait(value)
-
-    async def get(
-        self, key: Tuple[int, int], timeout: float = 30.0
-    ) -> Optional[np.ndarray]:
-        q = self._queues.get(key)
-        if q is None:
-            return None
-        try:
-            return await asyncio.wait_for(q.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
 
 
 class DistributedPipelineExtension:
@@ -84,6 +49,10 @@ class DistributedPipelineExtension:
         self._checkpoint_steps: Dict[str, int] = {}
         # (model_id, start, end) -> (weights file, step it holds).
         self._weights_saved: Dict[Tuple[str, int, int], Tuple[str, int]] = {}
+        # Pipeline-parallel training: orchestrator of steps started here and
+        # stage worker for the layers this node holds.
+        self.pp_trainer = PipelineTrainer(node.id, node.inference_engine, self._pp_send,
+                                          on_step=self._pp_on_step)
 
     async def start(self) -> None:
         if not self._started:
@@ -100,6 +69,7 @@ class DistributedPipelineExtension:
         later; the controller must always forward with the current engine.
         """
         self._controller.inference_engine = self._node.inference_engine
+        self.pp_trainer.engine = self._node.inference_engine
 
     async def stop(self) -> None:
         if self._started:
@@ -206,6 +176,29 @@ class DistributedPipelineExtension:
                 import traceback
                 traceback.print_exc()
 
+
+    # -- pipeline-training transport -----------------------------------------
+    async def _pp_send(self, target_id: str, tensor: np.ndarray, meta: Dict[str, Any]) -> None:
+        """Deliver one pipeline-training message: our own stages directly,
+        peers over chunked TCP (fp32, no wire quantization for gradients),
+        else the event bridge."""
+        node = self._node
+        if target_id == node.id:
+            asyncio.get_running_loop().create_task(self.pp_trainer.on_message(tensor, meta))
+            return
+        from synapse.transport.codec import encode_tensor
+        blob = encode_tensor(np.ascontiguousarray(tensor), metadata=meta, quantize_int8=False)
+        if not await node._send_blob_tcp(target_id, blob):
+            await node.event_router.publish(f"synapse/training/pp/{target_id}", {"bin": blob})
+
+    def pp_receive(self, tensor: np.ndarray, meta: Dict[str, Any]) -> None:
+        """A pipeline-training message from a peer (TCP or bridge)."""
+        asyncio.get_running_loop().create_task(self.pp_trainer.on_message(tensor, meta))
+
+    def _pp_on_step(self, shard: Shard) -> None:
+        """After this node applied a pipeline step: checkpoint its layers."""
+        base = Shard(shard.model_id, 0, shard.n_layers - 1, shard.n_layers)
+        self._save_shard_checkpoint(base, shard=shard)
 
     async def process_prompt_distributed(
         self,
@@ -407,12 +400,15 @@ class DistributedPipelineExtension:
     ) -> float:
         """Distributed training step.
 
-        schedule="ddp"  — full-model copies, ring all-reduce of gradients.
-        schedule="1f1b" — pipeline-parallel step driven by the 1F1B schedule
-                          (see train_step_distributed_1f1b).
+        schedule="pipeline" (alias "1f1b") — each node trains only the layers
+                          it serves; activations and gradients flow between
+                          nodes (see train_step_pipeline).
+        schedule="ddp"  — every node holds a FULL replica, ring all-reduce of
+                          gradients (data parallelism; needs the whole model
+                          on each node by definition).
         """
-        if schedule == "1f1b":
-            return await self.train_step_distributed_1f1b(
+        if schedule in ("pipeline", "1f1b"):
+            return await self.train_step_pipeline(
                 base_shard, input_ids, labels,
                 request_id=request_id, learning_rate=learning_rate,
             )
@@ -432,7 +428,8 @@ class DistributedPipelineExtension:
                 learning_rate=learning_rate,
             )
 
-        shard = self._node.get_current_shard(base_shard)
+        # Data parallel: every replica trains the whole model.
+        shard = Shard(base_shard.model_id, 0, base_shard.n_layers - 1, base_shard.n_layers)
         local_loss = None
 
         tracer = getattr(self._node, "tracer", None)
@@ -547,7 +544,7 @@ class DistributedPipelineExtension:
 
         return send_grads, recv_grads
 
-    async def train_step_distributed_1f1b(
+    async def train_step_pipeline(
         self,
         base_shard: Shard,
         input_ids: np.ndarray,
@@ -556,172 +553,28 @@ class DistributedPipelineExtension:
         learning_rate: float = 1e-4,
         num_micro_batches: Optional[int] = None,
     ) -> float:
-        """Production distributed training step driven by the 1F1B schedule.
-
-        Partitions the model across nodes, builds one PipelineStage per
-        partition, and executes the 1F1B schedule — PipelineScheduler
-        .generate_1f1b_schedule() + PipelineStage.process_loop() — so the
-        forward and backward phases of every micro-batch are coordinated
-        across the pipeline. Each stage runs its forward/backward on the local
-        engine; the per-micro-batch gradients are accumulated and synchronized
-        with the ring all-reduce (DistributedTrainer.step) before updates are
-        applied.
-
-        Returns the mean forward loss across micro-batches.
-        """
+        """Pipeline-parallel step over the current partition: every node
+        trains exactly the layer range it serves (no whole-model load) and
+        checkpoints it afterwards. Returns the mean micro-batch loss."""
         if request_id is None:
             request_id = str(uuid.uuid4())
-
-        partitions = self._get_partition_assignments(base_shard)
-        num_stages = len(partitions)
-        if num_stages <= 1:
-            # Single node: plain training step, no pipeline needed. No
-            # checkpoint is written — with no peer, there is no cross-node
-            # recovery value and the write would be per-step disk chatter.
-            shard = self._node.get_current_shard(base_shard)
-            length = np.ones(max(1, input_ids.shape[0] if input_ids.ndim >= 1 else 1))
-            loss, _ = await self._node.inference_engine.train(
-                request_id, shard, input_ids, labels, length, sync_gradients=False,
-            )
-            return float(loss) if loss is not None else 0.0
-
-        rows = max(1, input_ids.shape[0] if input_ids.ndim >= 1 else 1)
-        if num_micro_batches is None:
-            num_micro_batches = max(2, num_stages)
-        num_micro_batches = min(num_micro_batches, rows)
-
-        ring_order = [pid for pid, _ in partitions]
-        if not self._trainer or self._trainer.world_size != num_stages:
-            self._trainer = DistributedTrainer(
-                node_id=self._node.id,
-                world_size=num_stages,
-                ring_order=ring_order,
-                learning_rate=learning_rate,
-            )
-
         node = self._node
+        plan = self._get_partition_assignments(base_shard)
         node.outstanding_requests[request_id] = "training"
-        losses_by_mb: Dict[int, float] = {}
-        grads_by_mb: Dict[int, Dict[str, np.ndarray]] = {}
-        # Real 1F1B backward handoff: each stage's backward computes the
-        # gradient of the loss w.r.t. its input and delivers it upstream via
-        # the pipeline send path; the upstream stage consumes it as backgrad
-        # (reverse-order gradient flow across stage boundaries).
-        handoff = _GradientHandoff()
-        self._last_handoff_sends: List[Tuple[int, int]] = []
-        # Pre-create every (stage, micro-batch) queue: the upstream stage's
-        # backward runs before the downstream stage's delivers, so gets must
-        # block until the value arrives rather than miss it.
-        for s in range(num_stages):
-            for m in range(num_micro_batches):
-                handoff.ensure((s, m))
-
         try:
-            stages: List[PipelineStage] = []
-            for stage_idx, (nid, shard) in enumerate(partitions):
-                is_last = stage_idx == num_stages - 1
-
-                async def forward(mb: MicroBatch, _shard=shard, _last=is_last):
-                    length = np.ones(max(1, mb.data.shape[0]))
-                    mb_labels = mb.labels if mb.labels is not None else labels
-                    loss, grads = await node.inference_engine.train(
-                        request_id, _shard, mb.data, mb_labels, length,
-                        sync_gradients=True,
-                    )
-                    if loss is not None:
-                        losses_by_mb[mb.batch_id] = float(loss)
-                    if grads:
-                        grads_by_mb[mb.batch_id] = grads
-                    if _last:
-                        val = float(loss) if loss is not None else np.nan
-                        return np.array([val], dtype=np.float32)
-                    return np.zeros((1,), dtype=np.float32)
-
-                async def backward(mb: MicroBatch, _shard=shard, _last=is_last, _idx=stage_idx):
-                    # Receive the downstream stage's input-gradient: gradient
-                    # of the loss w.r.t. the next stage's input, which is the
-                    # gradient of the loss w.r.t. this stage's output. The
-                    # last stage owns the loss, so it has no downstream grad.
-                    backgrad = None
-                    if not _last:
-                        backgrad = await handoff.get((_idx + 1, mb.batch_id))
-                    grads = None
-                    try:
-                        _, grads = await node.inference_engine.train(
-                            request_id, _shard, mb.data,
-                            mb.labels if mb.labels is not None else labels,
-                            np.ones(max(1, mb.data.shape[0])),
-                            backgrad=backgrad, loss="back_gradient",
-                            sync_gradients=False,
-                        )
-                    except Exception:
-                        grads = None
-                    if grads and "__input_grad__" in grads:
-                        input_grad = np.asarray(grads["__input_grad__"], dtype=np.float32)
-                    elif backgrad is not None:
-                        input_grad = backgrad
-                    else:
-                        input_grad = np.zeros_like(mb.data, dtype=np.float32)
-                    # The last stage has no downstream send path, so it
-                    # delivers its input-gradient straight to the channel.
-                    if _last:
-                        handoff.put((_idx, mb.batch_id), input_grad)
-                    # Gradient feedback, not a loss: excluded from results.
-                    return input_grad
-
-                async def handoff_send(result: StageResult, _idx=stage_idx) -> None:
-                    # Real inter-stage handoff: the backward phase's
-                    # input-gradient flows to the upstream stage via the
-                    # pipeline send path (previously a noop_send).
-                    if result.op == "backward":
-                        handoff.put(
-                            (_idx, result.micro_batch_id),
-                            np.asarray(result.data, dtype=np.float32),
-                        )
-                        self._last_handoff_sends.append((_idx, result.micro_batch_id))
-
-                stages.append(PipelineStage(
-                    stage_id=stage_idx,
-                    node_id=nid,
-                    num_stages=num_stages,
-                    forward_fn=forward,
-                    send_tensor_fn=handoff_send,
-                    backward_fn=backward,
-                ))
-
-            losses = await self._trainer.train_1f1b(
-                stages, num_micro_batches, input_ids, labels,
-            )
-
-            # Accumulate per-micro-batch gradients (micro-batch gradient
-            # accumulation) and scale back to full-batch magnitude.
-            all_grads: Dict[str, np.ndarray] = {}
-            for mb_id in sorted(grads_by_mb):
-                for k, v in grads_by_mb[mb_id].items():
-                    if k in all_grads:
-                        all_grads[k] = all_grads[k] + v
-                    else:
-                        all_grads[k] = v.copy()
-            if all_grads:
-                scale = float(num_micro_batches)
-                all_grads = {k: v / scale for k, v in all_grads.items()}
-
-            avg_loss = float(np.mean(losses)) if losses else 0.0
-
-            if all_grads:
-                send_grads, recv_grads = self._grad_ring_io()
-                updates = await self._trainer.step(
-                    local_gradients=all_grads,
-                    local_loss=avg_loss,
-                    send_fn=send_grads,
-                    recv_fn=recv_grads,
+            if len(plan) <= 1:
+                # One node holds every layer: a plain step on the served
+                # weights. No checkpoint: with no peer there is nothing to
+                # recover from, and the write would be per-step disk chatter.
+                shard = node.get_current_shard(base_shard)
+                length = np.ones(max(1, input_ids.shape[0] if input_ids.ndim >= 1 else 1))
+                loss, _ = await node.inference_engine.train(
+                    request_id, shard, input_ids, labels, length, sync_gradients=False,
                 )
-                if updates:
-                    shard = node.get_current_shard(base_shard)
-                    await node.inference_engine.apply_gradient_updates(shard, updates)
-            # Persist the shard's step to the shared checkpoint directory so
-            # cross-node recovery restores real on-disk state.
-            self._save_shard_checkpoint(base_shard)
-            return avg_loss
+                return float(loss) if loss is not None else 0.0
+            return await self.pp_trainer.train_step(
+                plan, input_ids, labels, lr=learning_rate,
+                num_micro_batches=num_micro_batches,
+            )
         finally:
             node.outstanding_requests.pop(request_id, None)

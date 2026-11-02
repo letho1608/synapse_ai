@@ -2,7 +2,7 @@
   "peers": {
     "node1": {
       "address": "localhost",
-      "port": 50051,
+      "port": 46051,
       "device_capabilities": {
         "model": "Unknown Model",
         "chip": "Unknown Chip",
@@ -16,7 +16,7 @@
     },
     "node2": {
       "address": "localhost",
-      "port": 50052,
+      "port": 46052,
       "device_capabilities": {
         "model": "Unknown Model",
         "chip": "Unknown Chip",

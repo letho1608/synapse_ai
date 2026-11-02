@@ -1,19 +1,12 @@
 """
-Behavioral tests: 1F1B schedule execution wired into production training.
+Behavioral tests: production routing of distributed training.
 
-Verifies the fix for:
-- H2: the production distributed training path (DistributedPipelineExtension
-  .train_step_distributed) actually *executes* the 1F1B schedule — previously
-  train_1f1b() existed but was never invoked from production, and its
-  multi-stage path never fed stages past stage 0 (a real multi-stage run
-  would time out on dequeue). Now:
-    * train_step_distributed(schedule="1f1b") builds one PipelineStage per
-      partition and runs PipelineScheduler.generate_1f1b_schedule() end to end
-      (every stage receives its schedule slots; the last stage emits losses),
-    * the production caller (chatgpt_api.py) selects schedule="1f1b" for
-      multi-node training,
-    * per-micro-batch gradients are accumulated and ring all-reduced before
-      updates are applied.
+- train_step_distributed() keeps DDP (full replicas + ring all-reduce) as its
+  default schedule;
+- schedule="1f1b" on a single node is a plain training step;
+- the production caller (chatgpt_api.py) selects schedule="1f1b" for
+  multi-node training, which runs the real pipeline (each node trains its own
+  layers; see test_pipeline_training.py for the cross-node gate).
 """
 import numpy as np
 import pytest
@@ -135,70 +128,6 @@ class Test1F1BProductionTraining:
         assert engine.train_calls[0]["sync"] is True
         assert loss == pytest.approx(1.5)
         assert calls["loss"] == pytest.approx(1.5)
-
-    @pytest.mark.asyncio
-    async def test_1f1b_executes_schedule_end_to_end(self, monkeypatch):
-        """schedule="1f1b" builds stages and runs generate_1f1b_schedule for real."""
-        node, engine = _node_with_topology(n_nodes=2)
-        ext = node.distributed_pipeline
-
-        # Record the schedule construction (without disabling it).
-        schedule_calls = []
-        orig_gen = PipelineScheduler.generate_1f1b_schedule
-
-        def record_gen(self, num_stages, num_micro_batches, node_ids=None):
-            schedule_calls.append((num_stages, num_micro_batches, tuple(node_ids or [])))
-            return orig_gen(self, num_stages, num_micro_batches, node_ids)
-
-        monkeypatch.setattr(PipelineScheduler, "generate_1f1b_schedule", record_gen)
-
-        step_calls = {}
-
-        async def fake_step(self, local_gradients, local_loss, send_fn=None, recv_fn=None):
-            step_calls["grads"] = local_gradients
-            step_calls["loss"] = local_loss
-            return {"w": np.zeros(2, dtype=np.float32)}
-
-        monkeypatch.setattr(DistributedTrainer, "step", fake_step)
-
-        input_ids = np.array([[1, 2, 3], [4, 5, 6]])
-        labels = np.array([[2, 3, 4], [5, 6, 7]])
-        loss = await ext.train_step_distributed(
-            Shard(model_id="qwen", start_layer=0, end_layer=31, n_layers=32),
-            input_ids, labels,
-            request_id="req-1f1b",
-            schedule="1f1b",
-        )
-
-        # 1. The 1F1B schedule was constructed for the real production path.
-        assert len(schedule_calls) == 1, "generate_1f1b_schedule not called once"
-        num_stages, num_mb, node_ids = schedule_calls[0]
-        assert num_stages == 2
-        assert num_mb == 2  # default max(2, num_stages), clamped to 2 rows
-        assert set(node_ids) == {"node-a", "node-b"}
-
-        # 2. The schedule actually executed: both stages ran, and the engine saw
-        #    forward AND backward phases, with micro-batch-sliced inputs.
-        losses_seen = {c["loss"] for c in engine.train_calls}
-        assert "forward" in losses_seen and "back_gradient" in losses_seen, (
-            f"schedule did not drive both phases: {losses_seen}"
-        )
-        assert len(engine.train_calls) >= 4  # 2 stages x (F+B) per micro-batch
-        # Every forward saw a 1-row slice (2 rows / 2 micro-batches).
-        forward_rows = {c["rows"] for c in engine.train_calls if c["loss"] == "forward"}
-        assert forward_rows == {1}, f"input was not micro-batch sliced: {forward_rows}"
-
-        # 3. Loss comes from the last stage's forward passes.
-        assert loss == pytest.approx(1.5)
-
-        # 4. Per-micro-batch gradients were accumulated and ring all-reduced,
-        #    then applied.
-        assert step_calls["loss"] == pytest.approx(1.5)
-        assert "w" in step_calls["grads"]
-        assert len(engine.apply_calls) == 1
-
-        # 5. The trainer is sized to the pipeline.
-        assert ext._trainer.world_size == 2
 
     @pytest.mark.asyncio
     async def test_1f1b_single_node_falls_back_to_plain_train(self, monkeypatch):

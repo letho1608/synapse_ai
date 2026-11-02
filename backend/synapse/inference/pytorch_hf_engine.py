@@ -15,6 +15,7 @@ from synapse.inference.inference_engine import (
     InferenceEngine, SHARD_WEIGHTS_FORMAT, SHARD_WEIGHTS_SUFFIX,
 )
 from synapse.inference.shard import Shard
+from synapse.inference.stage_training import StageTrainingMixin
 from synapse.model_list import HF_MODELS, HF_MODEL_LAYERS, resolve_hf_id
 
 
@@ -65,7 +66,19 @@ class HFShardDownloader:
             return Path(".")
 
 
-class PyTorchHFInferenceEngine(InferenceEngine):
+_FORWARD_PARAMS: Dict[type, Any] = {}
+
+
+def _forward_params(block) -> Any:
+    """inspect.signature(block.forward).parameters, cached per class."""
+    cls = type(block)
+    params = _FORWARD_PARAMS.get(cls)
+    if params is None:
+        params = _FORWARD_PARAMS[cls] = inspect.signature(block.forward).parameters
+    return params
+
+
+class PyTorchHFInferenceEngine(StageTrainingMixin, InferenceEngine):
     """Engine: load model từ Hugging Face, chạy inference (full hoặc theo layer range cho phân tán).
     
     Hỗ trợ tự nhận diện phần cứng và tối ưu hóa tự động:
@@ -112,6 +125,10 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         self.layer_ms: Dict[str, float] = {}  # model -> decode ms per layer (EWMA)
         self.batch_stats = {"forwards": 0, "batched_forwards": 0,
                             "batched_jobs": 0, "max_batch": 0}
+        # Fast Llama-family path with a paged KV pool (fast_decoder.py);
+        # rebuilt whenever the loaded model object changes.
+        self._fast_dec = None
+        self._fast_key = None
 
     @staticmethod
     def _seq_kv_enabled() -> bool:
@@ -172,6 +189,45 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             return common, prev
         except Exception:
             return 0, None
+
+    def _fast(self):
+        """FastDecoder for the loaded model, or None (unsupported layout,
+        SYNAPSE_FAST_PATH=0, nothing loaded)."""
+        owner = self._pm if self._pm is not None else self._model
+        if owner is None:
+            return None
+        key = id(owner)
+        if self._fast_key != key:
+            from synapse.inference.fast_decoder import FastDecoder
+            config = getattr(owner, "config", None)
+            dec = None
+            if config is not None:
+                device, dtype = self._device_dtype()
+                dec = FastDecoder.build(config, self._get_rotary_embedding_module(), device, dtype)
+            self._fast_dec, self._fast_key = dec, key
+        return self._fast_dec
+
+    def _new_cache(self):
+        """Empty KV cache for one (request, shard): paged when the fast path
+        serves this model, else an HF DynamicCache."""
+        dec = self._fast()
+        if dec is not None:
+            from synapse.inference.fast_decoder import PagedSequence
+            return PagedSequence(dec.pool)
+        from transformers import DynamicCache
+        return DynamicCache()
+
+    @staticmethod
+    def _is_paged(cache) -> bool:
+        from synapse.inference.fast_decoder import PagedSequence
+        return isinstance(cache, PagedSequence)
+
+    def _cache_len(self, cache, sh) -> Optional[int]:
+        """Cached rows, or None when the layers disagree (cannot batch)."""
+        if self._is_paged(cache):
+            return cache.length
+        lens = {cache.layers[li].keys.shape[2] for li in (sh.start_layer, sh.end_layer)}
+        return lens.pop() if len(lens) == 1 else None
 
     @staticmethod
     def _causal_mask(seq_len: int, past_len: int, dtype, device):
@@ -475,7 +531,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             # already hold every position before row_offset.
             row_offset = int(row_offset)
             if row_offset == 0 and (not isinstance(stored, dict) or stored.get("cache") is None):
-                stored = {"cache": DynamicCache(), "length": 0,
+                stored = {"cache": self._new_cache(), "length": 0,
                           "ids": new_rows[:0].copy()}  # first step: nothing cached yet
             if (not isinstance(stored, dict) or stored.get("cache") is None
                     or int(stored.get("length", 0)) < row_offset):
@@ -523,7 +579,7 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 else:
                     prev_out = None
                     hidden_states = hidden_states_full
-                    cache = DynamicCache()
+                    cache = self._new_cache()
                 all_rows = new_rows
 
         seq_len = hidden_states.shape[1]
@@ -571,6 +627,9 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         import torch
         shard, layers, device = ctx["shard"], ctx["layers"], ctx["device"]
         hidden_states, past_len, cache = ctx["hidden"], ctx["past_len"], ctx["cache"]
+        if self._is_paged(cache):
+            return self._fast().run(layers, shard.start_layer, shard.end_layer,
+                                    hidden_states, cache, past_len)
         seq_len = hidden_states.shape[1]
         position_ids = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=device).unsqueeze(0)
         cache_position = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=device)
@@ -584,21 +643,25 @@ class PyTorchHFInferenceEngine(InferenceEngine):
 
     @staticmethod
     def _apply_blocks(layers, shard, hidden_states, attention_mask, position_ids,
-                      position_embeddings, cache, cache_position):
+                      position_embeddings, cache, cache_position, grad: bool = False):
+        """Run the HF decoder blocks of the shard. cache=None runs without a
+        KV cache (training: grad=True keeps the autograd graph)."""
         import torch
-        with torch.no_grad():
+        with (torch.enable_grad() if grad else torch.no_grad()):
             for layer_index in range(shard.start_layer, shard.end_layer + 1):
                 block = layers[layer_index]
-                params = inspect.signature(block.forward).parameters
+                params = _forward_params(block)
                 kwargs: Dict[str, Any] = {
                     "attention_mask": attention_mask,
                     "position_ids": position_ids,
-                    "use_cache": True,
+                    "use_cache": cache is not None,
                 }
                 if "position_embeddings" in params:
                     kwargs["position_embeddings"] = position_embeddings
                 # transformers >= 4.56 renamed past_key_value -> past_key_values.
-                if "past_key_values" in params:
+                if cache is None:
+                    pass
+                elif "past_key_values" in params:
                     kwargs["past_key_values"] = cache
                 else:
                     kwargs["past_key_value"] = cache
@@ -625,6 +688,11 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         import torch
         from transformers import DynamicCache
         shard, layers, device = ctxs[0]["shard"], ctxs[0]["layers"], ctxs[0]["device"]
+        if self._is_paged(ctxs[0]["cache"]):
+            return self._fast().run_batched(layers, shard.start_layer, shard.end_layer,
+                                            [c["hidden"] for c in ctxs],
+                                            [c["cache"] for c in ctxs],
+                                            [c["past_len"] for c in ctxs])
         dtype = ctxs[0]["hidden"].dtype
         pasts = [c["past_len"] for c in ctxs]
         news = [c["hidden"].shape[1] for c in ctxs]
@@ -718,6 +786,13 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             if lm_head is None:
                 raise RuntimeError(f"Model {shard.model_id} does not expose an output head")
 
+            # Prefill would otherwise project every prompt row onto the
+            # vocabulary; samplers only read the last verify_n rows (or the
+            # last one when the caller says so).
+            state_in = ctx["state"] or {}
+            keep = state_in.get("verify_n") or (1 if state_in.get("last_logits_only") else None)
+            if keep and hidden_states.shape[1] > int(keep):
+                hidden_states = hidden_states[:, -int(keep):]
             logits = lm_head(hidden_states)
             return logits.float().cpu().numpy(), out_state
 
@@ -747,10 +822,9 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         groups: Dict[Any, List[int]] = {}
         for idx, ctx in prepared.items():
             sh = ctx["shard"]
-            key = (sh.model_id, sh.start_layer, sh.end_layer)
+            key = (sh.model_id, sh.start_layer, sh.end_layer, self._is_paged(ctx["cache"]))
             if ctx["past_len"] > 0 and ctx["hidden"].shape[1] <= self.BATCH_MAX_NEW_ROWS \
-                    and all(ctx["cache"].layers[li].keys.shape[2] == ctx["past_len"]
-                            for li in (sh.start_layer, sh.end_layer)):
+                    and self._cache_len(ctx["cache"], sh) == ctx["past_len"]:
                 groups.setdefault(key, []).append(idx)
             else:
                 groups.setdefault(("solo", idx), []).append(idx)
@@ -890,6 +964,8 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             freed = self._pm.release(keep)
             if freed:
                 self._seq_kv.clear()
+                if self._fast_dec is not None:
+                    self._fast_dec.forget(self._pm.layers)
         return freed
 
     async def _ensure_full(self, shard: Shard) -> None:
@@ -1025,12 +1101,12 @@ class PyTorchHFInferenceEngine(InferenceEngine):
             else:
                 logits = logits[0, :].clone()
             if generated_ids and repetition_penalty != 1.0:
-                for tid in set(generated_ids):
-                    if 0 <= tid < logits.shape[-1]:
-                        if logits[tid].item() > 0:
-                            logits[tid] = logits[tid] / repetition_penalty
-                        else:
-                            logits[tid] = logits[tid] * repetition_penalty
+                ids = torch.tensor(sorted({int(t) for t in generated_ids
+                                           if 0 <= int(t) < logits.shape[-1]}), dtype=torch.long)
+                if ids.numel():
+                    vals = logits[ids]
+                    logits[ids] = torch.where(vals > 0, vals / repetition_penalty,
+                                              vals * repetition_penalty)
             if temp <= 0:
                 token_id = logits.argmax(dim=-1).item()
             else:
@@ -1396,8 +1472,10 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         loss: str = "forward",
         sync_gradients: bool = False,
     ) -> Tuple[Optional[float], Optional[np.ndarray]]:
-        # Training runs the whole HF model (every stage re-runs its forward
-        # locally), so it needs all layers, not the served range.
+        if self._model is None and self._partial_enabled() and loss != "back_gradient":
+            return await self._train_served(request_id, shard, example, target, sync_gradients)
+        # Whole-model path: a model already loaded in full (LoRA wraps
+        # _model), SYNAPSE_PARTIAL_LOAD=0, or the legacy back_gradient call.
         await self._ensure_full(shard)
         if loss == "back_gradient":
             return await self._back_gradient(
@@ -1453,7 +1531,41 @@ class PyTorchHFInferenceEngine(InferenceEngine):
                 traceback.print_exc()
             raise RuntimeError(f"PyTorchHF train error: {e}") from e
 
+    TRAIN_LR = 2e-5
+    TRAIN_MAX_GRAD_NORM = 1.0
+
+    async def _train_served(self, request_id, shard: Shard, example, target,
+                            sync_gradients: bool) -> Tuple[Optional[float], Optional[dict]]:
+        """One step on a node that holds the whole model, using the same
+        layer-range weights it serves (no second, full copy). A shard that
+        covers only part of the model trains through the pipeline
+        (pp_training.PipelineTrainer)."""
+        if not (shard.is_first_layer() and shard.is_last_layer()):
+            raise RuntimeError(
+                f"shard {shard.start_layer}-{shard.end_layer}/{shard.n_layers} is one pipeline "
+                "stage: train it with PipelineTrainer, not train()")
+        await self.stage_train_prepare(shard)
+        res = await self.stage_forward((request_id, 0, 0), shard, example, target)
+        loss = res["loss"]
+        if sync_gradients:
+            grads = self.stage_named_grads(shard)
+            for _, p in self._stage_params(shard):
+                p.grad = None
+            return loss, grads
+        norm = self.stage_grad_sq(shard) ** 0.5
+        clip = min(1.0, self.TRAIN_MAX_GRAD_NORM / (norm + 1e-6))
+        await self.stage_step(shard, self.TRAIN_LR, clip)
+        return loss, None
+
     async def apply_gradient_updates(self, shard: Shard, updates: dict) -> None:
+        if self._model is None and self._pm is not None:
+            import torch
+            with self._forward_lock:
+                for name, param in self._stage_params(shard):
+                    if name in updates:
+                        param.data.add_(torch.from_numpy(updates[name]).to(param.device, param.dtype))
+                self._seq_kv.clear()
+            return
         if self._model is None:
             return
         try:
@@ -1477,6 +1589,10 @@ class PyTorchHFInferenceEngine(InferenceEngine):
         length: np.ndarray,
     ) -> Optional[float]:
         """Đánh giá: forward, tính loss (không backward)."""
+        if self._model is None and self._partial_enabled() \
+                and shard.is_first_layer() and shard.is_last_layer():
+            await self.ensure_shard(shard)
+            return await self.stage_loss(shard, example, target)
         await self._ensure_full(shard)
         try:
             import torch
