@@ -28,21 +28,25 @@ Windows: nếu cổng không bind được, xem `netsh int ipv4 show excludedpor
 
 ```bash
 # máy A và máy B, mỗi máy một lệnh:
-python main.py --discovery-module udp --node-id A     # (B: --node-id B)
+python main.py --node-id A     # máy B: --node-id B (không cần --discovery-module: mặc định UDP trên LAN)
 ```
 
 Mở giao diện web trên từng máy: `http://127.0.0.1:52415`.
 
-## 2. Ghép máy (một lần)
+Trên cùng LAN, các node tự tìm thấy nhau qua UDP, không cần làm gì thêm (truyền không mã hoá).
 
-Máy A: **Cài đặt → Ghép máy → Tạo mã cho cụm mới**, sao chép mã.
-Máy B: **Cài đặt → Ghép máy**, dán mã, **Tham gia cụm**. Khởi động lại cả hai node (Ctrl+C rồi chạy lại lệnh bước 1).
+## 2. Ghép máy (tuỳ chọn, chỉ khi cần mã hoá)
+
+Bỏ qua bước này trên LAN tin cậy. Cần mã hoá (Tailscale, mạng lạ) thì:
+máy A: **Cài đặt → Ghép máy → Tạo mã cho cụm mới**, sao chép mã;
+máy B: **Cài đặt → Ghép máy**, dán mã, **Tham gia cụm**. Khởi động lại cả hai node (Ctrl+C rồi chạy lại lệnh bước 1).
+Đã ghép thì máy chưa ghép không vào được cụm.
 
 ## 3. Kiểm tra cụm
 
 - Trang **Node & chia layer**: thấy cả A và B, mỗi node một dải layer, có độ trễ đo được giữa hai máy.
 - Trang **Chat**: gửi "Say hello", có câu trả lời; dòng dưới câu trả lời ghi TTFT và tok/s.
-- Thanh bên: master là ai, TLS `cluster`.
+- Thanh bên: master là ai; TLS `off` (không ghép) hoặc `cluster` (đã ghép).
 
 ## 4. Đo (chạy từ một máy thấy được API của mọi node)
 

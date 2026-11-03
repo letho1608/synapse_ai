@@ -64,7 +64,7 @@ parser.add_argument("--node-port", type=int, default=46051,
                     help="Node port (below 49152: Windows reserves blocks of the dynamic range, e.g. 50000-50059 for Hyper-V)")
 parser.add_argument("--listen-port", type=int, default=5678, help="Listening port for discovery")
 parser.add_argument("--broadcast-port", type=int, default=5678, help="Broadcast port for discovery")
-parser.add_argument("--discovery-module", type=str, choices=["udp", "tailscale", "manual"], default="tailscale", help="Discovery module to use")
+parser.add_argument("--discovery-module", type=str, choices=["udp", "tailscale", "manual"], default=None, help="Discovery module to use (default: tailscale with TAILSCALE_API_KEY, else udp on the LAN)")
 parser.add_argument("--discovery-timeout", type=int, default=30, help="Discovery timeout in seconds")
 parser.add_argument("--discovery-config-path", type=str, default=None, help="Path to discovery config json file")
 parser.add_argument("--wait-for-peers", type=int, default=0, help="Number of peers to wait to connect to before starting")
@@ -182,6 +182,14 @@ try:
                 args.discovery_module = settings_data["discovery_module"]
 except Exception as e:
     if DEBUG >= 1: print(f"Failed to read settings.json for discovery_module: {e}")
+# Tailscale discovery finds nothing without an API key, so a node started with
+# no flag (or a saved "tailscale" and no key) falls back to UDP on the LAN.
+if not args.discovery_module:
+    args.discovery_module = "tailscale" if args.tailscale_api_key else "udp"
+elif (args.discovery_module == "tailscale" and not args.tailscale_api_key
+      and "--discovery-module" not in sys.argv):
+    print("[discovery] settings say tailscale but TAILSCALE_API_KEY is unset: using udp (LAN)")
+    args.discovery_module = "udp"
 
 # Initialize Discovery Module
 discovery = None
@@ -236,6 +244,7 @@ api = ChatGPTAPI(
   system_prompt=args.system_prompt,
   chatgpt_api_port=args.chatgpt_api_port,
 )
+api.discovery_module = args.discovery_module  # what actually runs, for the UI
 if args.default_model:
   # An explicit --default-model wins over config/settings.json (which the
   # API loads in its constructor); settings only fill in when none is given.

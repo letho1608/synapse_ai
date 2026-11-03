@@ -1,7 +1,7 @@
 """
 TLS staging for inter-node transport (T1.1-Inc3 / C4, H5).
 
-Posture: a machine paired with `synapse pair` runs mutual TLS against a
+Posture: a machine paired in the web UI (Settings -> Pairing) runs mutual TLS against a
 cluster CA derived from the pairing code (mode "cluster", the default once
 a code exists). Without a code, or with SYNAPSE_TLS=off, traffic is
 plaintext (trusted LAN/Tailscale only):
@@ -31,7 +31,7 @@ def tls_enabled() -> str:
     """off | selfsigned | require | cluster.
 
     Unset SYNAPSE_TLS means "cluster" when this machine has a pairing code
-    (`synapse pair`), else off. An explicit SYNAPSE_TLS=off always wins;
+    (web UI Settings -> Pairing), else off. An explicit SYNAPSE_TLS=off always wins;
     an unknown value means off."""
     raw = os.getenv("SYNAPSE_TLS")
     if raw is None or not raw.strip():
@@ -73,7 +73,7 @@ def normalize_code(code: str) -> str:
     Raises ValueError for a code that is not one `new_cluster_code` makes."""
     sym = "".join(c for c in (code or "").upper() if c.isalnum())
     if len(sym) != 32 or any(c not in _CODE_ALPHABET for c in sym):
-        raise ValueError("pairing code must be 32 letters/digits (from `synapse pair`)")
+        raise ValueError("pairing code must be 32 letters/digits (from the web UI: Settings -> Pairing)")
     return "-".join(sym[i:i + 4] for i in range(0, 32, 4))
 
 
@@ -332,7 +332,7 @@ def configure_from_env(node_id: str):
     if mode == "cluster":
         code = cluster_code()
         if not code:
-            raise ValueError("SYNAPSE_TLS=cluster needs a pairing code: run `synapse pair` "
+            raise ValueError("SYNAPSE_TLS=cluster needs a pairing code: create or join one in the web UI "
                              "(or set SYNAPSE_CLUSTER_CODE)")
         cert, key, ca = ensure_cluster_identity(node_id, code)
     if mode == "selfsigned" and not (cert or key):

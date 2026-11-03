@@ -1,6 +1,6 @@
 {
   "default_model": "qwen2.5:1.5b",
-  "discovery_module": "tailscale",
+  "discovery_module": "udp",
   "system_prompt": null,
   "load_quantization": "auto",
   "lookahead_window": 3,

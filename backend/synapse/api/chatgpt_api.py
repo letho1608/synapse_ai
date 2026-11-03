@@ -361,7 +361,7 @@ class ChatGPTAPI:
     self.prev_token_lens: Dict[str, int] = {}
     self.stream_tasks: Dict[str, asyncio.Task] = {}
     self.default_model = default_model or "HuggingFaceTB/SmolLM2-135M-Instruct"
-    self.discovery_module = "tailscale" # Default
+    self.discovery_module = "udp"  # Default; main.py sets the one in use
     self.token_queues = defaultdict(asyncio.Queue)
     self.activity_logs = [] # In-memory activity logs
     self.log_activity("System Started", "-", "success")
@@ -544,7 +544,7 @@ class ChatGPTAPI:
       self._settings_path.parent.mkdir(parents=True, exist_ok=True)
       data = {
         "default_model": self.default_model,
-        "discovery_module": getattr(self, "discovery_module", "tailscale"),
+        "discovery_module": getattr(self, "discovery_module", "udp"),
         "system_prompt": getattr(self, "system_prompt", ""),
         "load_quantization": os.getenv("SYNAPSE_WEIGHT_QUANT", "auto"),
         "lookahead_window": getattr(getattr(self, "node", None), "lookahead_window", 3),
@@ -1788,7 +1788,7 @@ class ChatGPTAPI:
     """Trả về cài đặt hiện tại."""
     return web.json_response({
       "default_model": getattr(self, "default_model", ""),
-      "discovery_module": getattr(self, "discovery_module", "tailscale"),
+      "discovery_module": getattr(self, "discovery_module", "udp"),
       "lacp_priority": getattr(self.node, "partition_objective", None) or
         os.getenv("SYNAPSE_PARTITION_OBJECTIVE", "throughput"),
       "load_quantization": os.getenv("SYNAPSE_WEIGHT_QUANT", "auto"),
@@ -1807,7 +1807,7 @@ class ChatGPTAPI:
       discovery_module = (body.get("discovery_module") or "").strip()
       requires_restart = False
       if discovery_module in ["udp", "tailscale", "manual"]:
-        old_module = getattr(self, "discovery_module", "tailscale")
+        old_module = getattr(self, "discovery_module", "udp")
         self.discovery_module = discovery_module
         if old_module != discovery_module:
             requires_restart = True
