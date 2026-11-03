@@ -58,23 +58,23 @@ class P2PPeerHandle(PeerHandle):
 
     async def health_check(self) -> bool:
         try:
-            print(f"[DEBUG-HC] {self._id}: connecting to {self.address}...", flush=True)
+            if DEBUG >= 2: print(f"[DEBUG-HC] {self._id}: connecting to {self.address}...", flush=True)
             connected = await self.libp2p_node.connect_to_peer(self._id, self.address)
-            print(f"[DEBUG-HC] {self._id}: connect_to_peer = {connected}", flush=True)
+            if DEBUG >= 2: print(f"[DEBUG-HC] {self._id}: connect_to_peer = {connected}", flush=True)
             if not connected:
                 if DEBUG >= 2: print(f"Health check failed to connect to {self._id}")
                 return False
 
-            print(f"[DEBUG-HC] {self._id}: doing RPC health call...", flush=True)
+            if DEBUG >= 2: print(f"[DEBUG-HC] {self._id}: doing RPC health call...", flush=True)
             res = await self._rpc_call("synapse/rpc/health", {}, timeout=15.0)
-            print(f"[DEBUG-HC] {self._id}: RPC result = {res}", flush=True)
+            if DEBUG >= 2: print(f"[DEBUG-HC] {self._id}: RPC result = {res}", flush=True)
             return res.get("status") == "ok"
         except asyncio.TimeoutError:
-            print(f"[DEBUG-HC] {self._id}: RPC TIMEOUT!", flush=True)
+            if DEBUG >= 1: print(f"[DEBUG-HC] {self._id}: RPC TIMEOUT!", flush=True)
             if DEBUG >= 2: print(f"Health check RPC TIMEOUT for {self._id} - check P2P event routing")
             return False
         except Exception as e:
-            print(f"[DEBUG-HC] {self._id}: ERROR {type(e).__name__}: {e}", flush=True)
+            if DEBUG >= 1: print(f"[DEBUG-HC] {self._id}: ERROR {type(e).__name__}: {e}", flush=True)
             if DEBUG >= 2: print(f"Health check error for {self._id}: {type(e).__name__}: {e}")
             return False
 
@@ -181,14 +181,14 @@ class P2PPeerHandle(PeerHandle):
         request_topic = f"{topic_base}/request/{self._id}"
         response_topic = f"{topic_base}/response/{call_id}"
 
-        print(f"[DEBUG-RPC] call_id={call_id} target={self._id} request_topic={request_topic} response_topic={response_topic}", flush=True)
+        if DEBUG >= 2: print(f"[DEBUG-RPC] call_id={call_id} target={self._id} request_topic={request_topic} response_topic={response_topic}", flush=True)
 
         future = asyncio.get_event_loop().create_future()
         self._pending_requests[call_id] = future
 
         # Subscribe to the unique response topic
         def on_response(event: Event):
-            print(f"[DEBUG-RPC] on_response fired! call_id={call_id} data={event.data}", flush=True)
+            if DEBUG >= 2: print(f"[DEBUG-RPC] on_response fired! call_id={call_id} data={event.data}", flush=True)
             if not future.done():
                 if DEBUG >= 3: print(f"[RPC] {self._id} received response on {response_topic}")
                 future.set_result(event.data)
@@ -199,16 +199,16 @@ class P2PPeerHandle(PeerHandle):
             # Publish request with the return topic information
             data["_response_topic"] = response_topic
             if DEBUG >= 3: print(f"[RPC] {self._id} publishing to {request_topic}")
-            print(f"[DEBUG-RPC] publishing to event_router topic={request_topic}", flush=True)
+            if DEBUG >= 2: print(f"[DEBUG-RPC] publishing to event_router topic={request_topic}", flush=True)
             await self.event_router.publish(request_topic, data)
-            print("[DEBUG-RPC] publish returned, waiting for future...", flush=True)
+            if DEBUG >= 2: print("[DEBUG-RPC] publish returned, waiting for future...", flush=True)
             if DEBUG >= 3: print(f"[RPC] {self._id} waiting for {response_topic}, timeout={timeout}s")
             # Wait for response
             result = await asyncio.wait_for(future, timeout=timeout)
-            print(f"[DEBUG-RPC] got result: {result}", flush=True)
+            if DEBUG >= 2: print(f"[DEBUG-RPC] got result: {result}", flush=True)
             return result
         except asyncio.TimeoutError:
-            print(f"[DEBUG-RPC] TIMEOUT after {timeout}s for {topic_base} to {self._id}", flush=True)
+            if DEBUG >= 1: print(f"[DEBUG-RPC] TIMEOUT after {timeout}s for {topic_base} to {self._id}", flush=True)
             if DEBUG >= 1: print(f"[RPC] TIMEOUT for {topic_base} to {self._id} on {response_topic}")
             raise
         finally:

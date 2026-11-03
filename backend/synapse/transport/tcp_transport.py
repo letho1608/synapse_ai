@@ -58,9 +58,19 @@ class TCPServer:
         self._on_frame = handler
 
     async def start(self) -> int:
-        self._server = await asyncio.start_server(
-            self._handle_connection, self.host, self.port, ssl=self._ssl_ctx,
-        )
+        try:
+            self._server = await asyncio.start_server(
+                self._handle_connection, self.host, self.port, ssl=self._ssl_ctx,
+            )
+        except OSError as e:
+            if not self.port:
+                raise
+            print(f"[TCP] Tensor port {self.port} unavailable ({e}); using a random port, "
+                  "which a firewall may block (set SYNAPSE_TENSOR_PORT)")
+            self.port = 0
+            self._server = await asyncio.start_server(
+                self._handle_connection, self.host, 0, ssl=self._ssl_ctx,
+            )
         for sock in self._server.sockets:
             self.port = sock.getsockname()[1]
             try:
@@ -153,6 +163,11 @@ class TCPClientPool:
         self._connect_timeout = connect_timeout
         self._ssl_ctx = ssl_ctx
         self._lock = asyncio.Lock()
+        # key -> time of the last failed connect. A blocked port (firewall
+        # DROP) costs the whole connect timeout, so it is not retried on
+        # every decode step; callers fall back to the bridge meanwhile.
+        self._failed: Dict[str, float] = {}
+        self.retry_after = 30.0
 
     async def send(self, peer_addr: str, data: bytes) -> bool:
         host, port_str = peer_addr.rsplit(":", 1)
@@ -180,6 +195,10 @@ class TCPClientPool:
                 return writer
             self._conns.pop(key, None)
 
+        failed_at = self._failed.get(key)
+        if failed_at is not None and time.time() - failed_at < self.retry_after:
+            return None
+
         async with self._lock:
             entry = self._conns.get(key)
             if entry is not None:
@@ -206,8 +225,14 @@ class TCPClientPool:
                 except Exception:
                     pass
                 self._conns[key] = (writer, time.time())
+                self._failed.pop(key, None)
                 return writer
-            except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+            except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
+                if key not in self._failed:
+                    print(f"[TCP] Cannot reach tensor port {key} ({type(e).__name__}); "
+                          f"using the slower bridge, retry in {self.retry_after:.0f}s. "
+                          "Check the peer's firewall.")
+                self._failed[key] = time.time()
                 return None
 
     async def close_all(self):

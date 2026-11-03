@@ -181,6 +181,7 @@ The master scheduler node is elected using the **LACP composite score** rather t
   - `test_live_multiprocess_split.py`: 2 real backend processes answer exactly like one process, each running one contiguous layer range, with hidden states over chunked TCP.
   - `test_live_failover.py`: 3 processes. Once profiles are gossiped, measured placement runs. One stage process is killed while an answer streams; the orchestrator detects it from heartbeats, patches the plan, resends the step, and the streamed answer equals the healthy run.
   - A hardware multi-machine run (C1) is still pending, so real-network latency, bandwidth and failover times are unmeasured.
+  - The tensor transport listens on node port + 1000 (47051 by default, `SYNAPSE_TENSOR_PORT` overrides); open it with the node port on firewalls. It used to be a random port, which a firewall cannot be opened for; a send to a blocked port waits out a 5 s connect timeout before the bridge fallback.
   - The default node port is 46051, below the dynamic range (49152+) where Windows reserves port blocks (Hyper-V/WSL; this test machine reserves 50000–50059). If a port still fails to bind, check `netsh int ipv4 show excludedportrange protocol=tcp` and pass `--node-port`.
 - **Training uses the served layers.** A single node trains its full-range shard in place; several nodes train as a pipeline (each its own range, see above), full fine-tuning or LoRA.
 - **A single request is not faster than one machine that can hold the model.** See "What it does not do" above.

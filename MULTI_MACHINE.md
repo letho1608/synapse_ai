@@ -18,7 +18,8 @@ install.bat            # Windows  |  sh install.sh   # Linux/macOS
 
 | Cổng | Dùng cho |
 |---|---|
-| 46051 | node P2P (bridge + tensor) |
+| 46051 | node P2P (bridge) |
+| 47051 | truyền tensor (cổng node + 1000, đổi bằng `SYNAPSE_TENSOR_PORT`) |
 | 52415 | API (chỉ cần trên máy nhận request / máy đo) |
 | 5678 (UDP) | UDP discovery trên LAN |
 

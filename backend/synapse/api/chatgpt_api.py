@@ -605,14 +605,17 @@ class ChatGPTAPI:
       
       if request.method == "POST" and "/chat/completions" in request.path:
         print(f"[INFO] POST request received: {request.method} {request.path} from {request.remote}")
-        print(f"[INFO] Request headers: {dict(request.headers)}")
-        print(f"[INFO] Request URL: {request.url}")
-        print(f"[INFO] Request can_read_body: {request.can_read_body}")
+        # Headers stay out of the log: it is shown in the web UI and they
+        # carry the Authorization bearer key.
+        if DEBUG >= 2:
+          print(f"[INFO] Request URL: {request.url}, can_read_body: {request.can_read_body}")
       elif DEBUG >= 3 and not is_polling_request:
         print(f"Received request: {request.method} {request.path}")
       try:
         # Only log handler call for non-polling requests or POST requests
-        if not is_polling_request or (request.method == "POST" and "/chat/completions" in request.path):
+        # The web UI polls several routes every few seconds; logging each
+        # call pushed everything else out of the 2000-line log buffer.
+        if DEBUG >= 2 and not is_polling_request:
           print(f"[INFO] Calling handler for {request.method} {request.path}...")
         response = await handler(request)
         if request.method == "POST" and "/chat/completions" in request.path:
@@ -1146,9 +1149,9 @@ class ChatGPTAPI:
   async def handle_post_chat_completions(self, request):
     request_id = None
     print(f"[INFO] handle_post_chat_completions called: path={request.path}, remote={request.remote}")
-    print(f"[INFO] Request method: {request.method}, content_type: {request.content_type}")
+    if DEBUG >= 2: print(f"[INFO] Request method: {request.method}, content_type: {request.content_type}")
     try:
-      print("[INFO] Reading request JSON...")
+      if DEBUG >= 2: print("[INFO] Reading request JSON...")
       data = await request.json()
       print(f"[INFO] Request data received: model={data.get('model')}, stream={data.get('stream')}, messages_count={len(data.get('messages', []))}")
       max_tokens = data.get("max_tokens")

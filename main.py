@@ -95,7 +95,9 @@ def run():
     try:
         while True:
             print("\n[INFO] Starting Backend System...")
-            print("[INFO] Press Ctrl+C to stop\n")
+            print("[INFO] Press Ctrl+C to stop")
+            print("[INFO] Loading PyTorch can take up to a minute; the web UI is ready "
+                  "once 'Available endpoints' is printed.\n")
             
             script_path = os.path.join(BACKEND_DIR, "synapse", "main.py")
             cmd = [sys.executable, script_path] + unknown_args

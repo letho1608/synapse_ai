@@ -229,16 +229,24 @@ class Node:
         from synapse.transport.tcp_transport import TensorTCPTransport
         # Reuse the bridge's TLS contexts so SYNAPSE_TLS covers tensors too.
         _bridge = getattr(self.libp2p_node, "_bridge", None)
+        # Fixed port (bridge port + 1000, SYNAPSE_TENSOR_PORT overrides; + 1 would
+        # collide with a second local node on the next bridge port) so it can
+        # be opened on a firewall; an ephemeral one cannot be, and each send to
+        # a blocked port waits out the connect timeout before the bridge fallback.
+        _bridge_port = getattr(self.libp2p_node, "port", None)
+        import os as _os
+        _tensor_port = int(_os.getenv("SYNAPSE_TENSOR_PORT", "0") or 0) or (
+          int(_bridge_port) + 1000 if _bridge_port else 0)
         self.tcp_transport = TensorTCPTransport(
           node_id=self.id,
+          port=_tensor_port,
           ssl_server_ctx=getattr(_bridge, "_ssl_server_ctx", None),
           ssl_client_ctx=getattr(_bridge, "_ssl_client_ctx", None),
         )
         tcp_port = await self.tcp_transport.start()
         if _bridge is not None:
           _bridge.tcp_port = tcp_port
-        if DEBUG >= 1:
-            print(f"[TCP] Binary tensor transport listening on port {tcp_port}")
+        print(f"[TCP] Tensor transport on port {tcp_port} (open it on the firewall with {_bridge_port})")
     except Exception as e:
         if DEBUG >= 1:
             print(f"[TCP] Failed to start binary transport: {e}")
