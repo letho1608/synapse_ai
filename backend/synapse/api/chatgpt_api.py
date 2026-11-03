@@ -31,8 +31,10 @@ from synapse.models import build_base_shard, get_repo
 from synapse.inference.tokenizers import resolve_tokenizer
 
 
-# Built-in liveness page served at GET / (the project is CLI-first; there is
-# no separate web frontend).
+# The web UI (frontend/, built by Vite into frontend/dist) is served at GET /.
+FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+
+# Fallback page at GET / while frontend/dist has not been built.
 _DEFAULT_DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -51,6 +53,9 @@ _DEFAULT_DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 <header><h1>Synapse <span style="color:#58a6ff;font-size:12px;border:1px solid #1f6feb;padding:2px 8px;border-radius:999px">LACP</span></h1></header>
 <main>
+  <div class="card"><h2>Web UI not built</h2><p>Build it once with
+    <code>npm --prefix frontend install &amp;&amp; npm --prefix frontend run build</code>
+    (the installers do this when Node.js is present), then reload.</p></div>
   <div class="card" id="status"><h2>Status</h2><p class="ok">API reachable</p></div>
   <div class="card"><h2>Cluster topology</h2><pre id="topo">loading…</pre></div>
 </main>
@@ -268,16 +273,25 @@ class PromptSession:
 
 
 # Routes anyone on the network may call without SYNAPSE_API_KEY: chat and
-# read-only cluster status. Everything else (quit, settings, model pull /
-# delete / merge, datasets, training, logs) changes or exposes the machine.
+# read-only cluster status. Everything else (quit, settings, pairing, model
+# pull / delete / merge, datasets, training, logs) changes or exposes the
+# machine.
 PUBLIC_ROUTES = {
   ("GET", "/"), ("GET", "/healthcheck"), ("GET", "/models"), ("GET", "/v1/models"),
   ("POST", "/chat/completions"), ("POST", "/v1/chat/completions"),
   ("POST", "/chat/token/encode"), ("POST", "/v1/chat/token/encode"),
   ("GET", "/topology"), ("GET", "/v1/topology"), ("GET", "/v1/distributed/status"),
+  # read-only monitoring for the web UI opened from another machine
+  ("GET", "/v1/system/stats"), ("GET", "/v1/system/info"), ("GET", "/v1/cluster/resources"),
+  ("GET", "/v1/training/status"), ("GET", "/v1/download/progress"), ("GET", "/v1/models/list"),
 }
-# Reachable without a key even when one is set (liveness probes).
+# Reachable without a key even when one is set (liveness probes, and the web
+# UI's own page and static assets: the UI asks for the key itself).
 OPEN_ROUTES = {("GET", "/"), ("GET", "/healthcheck")}
+
+
+def _is_ui_asset(method: str, path: str) -> bool:
+  return method == "GET" and (path.startswith("/assets/") or path in ("/favicon.ico", "/favicon.svg"))
 
 
 def _is_loopback(remote: Optional[str]) -> bool:
@@ -300,6 +314,8 @@ def check_access(method: str, path: str, remote: Optional[str], auth_header: str
   if method == "OPTIONS":
     return None
   route = (method, path)
+  if _is_ui_asset(method, path):
+    return None
   if api_key:
     if route in OPEN_ROUTES:
       return None
@@ -434,9 +450,13 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/v1/settings", self.handle_post_settings), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/cluster/resources", self.handle_get_cluster_resources), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/download/progress", self.handle_get_download_progress), {"*": cors_options})
-    # CLI-first (PLAN Part E): no web frontend. GET / is a built-in liveness
+    # GET / serves the web UI (frontend/dist), or a built-in liveness
     # page (status + topology), registered unconditionally.
     self.app.router.add_get("/", self.handle_root)
+    self.app.router.add_get("/assets/{path:.+}", self.handle_ui_asset)
+    self.app.router.add_get("/favicon.svg", self.handle_ui_asset)
+    cors.add(self.app.router.add_get("/v1/cluster/pairing", self.handle_get_pairing), {"*": cors_options})
+    cors.add(self.app.router.add_post("/v1/cluster/pairing", self.handle_post_pairing), {"*": cors_options})
       
     self.app.middlewares.append(self.timeout_middleware)
     self.app.middlewares.append(self.log_request)
@@ -622,7 +642,67 @@ class ChatGPTAPI:
     import os as _os
     if _os.getenv("SYNAPSE_HEADLESS", "0") == "1":
       return web.Response(status=204)
+    index = FRONTEND_DIST / "index.html"
+    if index.is_file():
+      return web.FileResponse(index, headers={"Cache-Control": "no-cache"})
     return web.Response(text=_DEFAULT_DASHBOARD_HTML, content_type="text/html")
+
+  async def handle_ui_asset(self, request):
+    """Static files of the built web UI, confined to frontend/dist."""
+    rel = request.match_info.get("path")
+    rel = ("assets/" + rel) if rel else request.path.lstrip("/")
+    root = FRONTEND_DIST.resolve()
+    target = (root / rel).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+      raise HTTPNotFound()
+    return web.FileResponse(target, headers={"Cache-Control": "public, max-age=31536000, immutable"}
+                            if rel.startswith("assets/") else None)
+
+  async def handle_get_pairing(self, request):
+    """Pairing state of this machine (the code itself only to local callers,
+    which the access policy already enforces for this admin route)."""
+    from synapse.transport import tls_wrap
+    try:
+      code = tls_wrap.cluster_code()
+      error = None
+    except ValueError as e:
+      code, error = None, str(e)
+    try:
+      mode = tls_wrap.tls_enabled()
+    except ValueError:
+      mode = "off"
+    return web.json_response({"paired": bool(code), "code": code, "tls_mode": mode,
+                              "error": error, "restart_needed": getattr(self, "_pairing_changed", False)})
+
+  async def handle_post_pairing(self, request):
+    """{"action": "create"} | {"action": "join", "code": "..."} | {"action": "forget"}.
+    Takes effect when the node restarts (TLS contexts are built at boot)."""
+    from synapse.transport import tls_wrap
+    try:
+      body = await request.json()
+    except Exception:
+      body = {}
+    action = (body.get("action") or "").strip()
+    try:
+      if action == "create":
+        code = tls_wrap.cluster_code() or tls_wrap.new_cluster_code()
+        tls_wrap.save_cluster_code(code)
+      elif action == "join":
+        code = tls_wrap.normalize_code(body.get("code") or "")
+        tls_wrap.save_cluster_code(code)
+      elif action == "forget":
+        code = None
+        try:
+          os.remove(tls_wrap.code_path())
+        except FileNotFoundError:
+          pass
+      else:
+        return web.json_response({"success": False, "message": "action: create | join | forget"}, status=400)
+    except ValueError as e:
+      return web.json_response({"success": False, "message": str(e)}, status=400)
+    self._pairing_changed = True
+    self.log_activity("Pairing " + action, "-", "success")
+    return web.json_response({"success": True, "code": code, "restart_needed": True})
 
   def _get_gpu_info(self) -> str:
     """Lấy thông tin GPU từ device_capabilities (hỗ trợ NVIDIA, AMD, Apple, Intel, Ascend)."""
@@ -751,42 +831,28 @@ class ChatGPTAPI:
     })
 
   def _get_hf_downloaded_names(self) -> Set[str]:
-    """Model đã tải đủ (có trong HF cache và load được local_files_only). Tránh hiển thị 'đã tải' khi mới tải dở."""
+    """Models usable on this node: their config.json is in the HF cache.
+    A node fetches only the checkpoint files of its own layers (and the
+    rest on demand), so "the whole snapshot is cached" is the wrong test:
+    it hid every model pulled the default (node-part) way."""
     try:
-      from huggingface_hub import scan_cache_dir, snapshot_download
-      cache = scan_cache_dir()
-      repo_ids_in_cache: Set[str] = set()
-      for repo in getattr(cache, "repos", []) or []:
-        rid = getattr(repo, "repo_id", None)
-        if rid:
-          repo_ids_in_cache.add(rid)
-      complete: Set[str] = set()
-      
-      # 1. Quét HF_MODELS truyền thống
-      for name, repo_id in HF_MODELS.items():
-        if repo_id not in repo_ids_in_cache:
-          continue
+      from huggingface_hub import scan_cache_dir, try_to_load_from_cache
+      cached_repos = {getattr(r, "repo_id", None) for r in (getattr(scan_cache_dir(), "repos", []) or [])}
+
+      def usable(repo_id: str) -> bool:
+        if repo_id not in cached_repos:
+          return False
         try:
-          snapshot_download(repo_id=repo_id, local_files_only=True)
-          complete.add(name)
+          return isinstance(try_to_load_from_cache(repo_id, "config.json"), str)
         except Exception:
-          pass
-          
-      # 2. Quét từ Discovery Database
+          return False
+
+      complete: Set[str] = {name for name, repo_id in HF_MODELS.items() if usable(repo_id)}
       try:
-          from synapse.helpers import _load_model_db
-          db = _load_model_db()
-          for entry in db:
-              rid = entry.get("name")
-              if rid and rid in repo_ids_in_cache:
-                  try:
-                      snapshot_download(repo_id=rid, local_files_only=True)
-                      complete.add(rid) # Save HF repo id as the alias
-                  except Exception:
-                      pass
+        from synapse.helpers import _load_model_db
+        complete |= {e.get("name") for e in _load_model_db() if e.get("name") and usable(e.get("name"))}
       except Exception:
-          pass
-          
+        pass
       return complete
     except Exception:
       return set()
@@ -1317,6 +1383,22 @@ class ChatGPTAPI:
           hints = getattr(node, "_last_autoscale_hints", None)
           if hints:
             payload["autoscale_hints"] = hints
+          payload["autoscale_mode"] = os.getenv("SYNAPSE_AUTOSCALE", "on")
+          payload["autoscale_objective"] = getattr(node, "_autoscale_objective", None)
+          payload["partition_objective"] = (getattr(node, "_autoscale_objective", None)
+                                            or getattr(node, "partition_objective", None)
+                                            or os.getenv("SYNAPSE_PARTITION_OBJECTIVE", "throughput"))
+          em = getattr(node, "election_manager", None)
+          if em is not None:
+            payload["master_id"] = getattr(em, "current_master_id", None)
+            payload["is_master"] = bool(em.is_master())
+          payload["node_id"] = getattr(node, "id", None)
+          try:
+            from synapse.transport.tls_wrap import tls_enabled
+            payload["tls_mode"] = tls_enabled()
+          except ValueError:
+            payload["tls_mode"] = "off"
+          payload["api_key_required"] = bool(os.getenv("SYNAPSE_API_KEY"))
           stats = getattr(node, "transport_stats", None)
           counts = stats.snapshot() if stats is not None else {}
           if counts:
@@ -2855,7 +2937,7 @@ class ChatGPTAPI:
       print("[INFO] Available endpoints:")
       print(f"[INFO]   - POST http://{display_host}:{port}/v1/chat/completions")
       print(f"[INFO]   - GET  http://{display_host}:{port}/v1/models")
-      print(f"[INFO]   - GET  http://{display_host}:{port}/ (status page)")
+      print(f"[INFO]   - GET  http://{display_host}:{port}/ (web UI)")
       try:
         _, tailscale_ips = await get_self_tailscale_info()
         if tailscale_ips:
@@ -2863,19 +2945,19 @@ class ChatGPTAPI:
           for ip in tailscale_ips:
             print(f"[INFO]   - POST http://{ip}:{port}/v1/chat/completions")
             print(f"[INFO]   - GET  http://{ip}:{port}/v1/models")
-            print(f"[INFO]   - GET  http://{ip}:{port}/ (status page)")
+            print(f"[INFO]   - GET  http://{ip}:{port}/ (web UI)")
         else:
           lan_ips = [ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip and ip not in ("127.0.0.1", "::1", "localhost")]
           if lan_ips:
             print("[INFO]   (Tailscale chưa bật — máy khác truy cập qua LAN):")
             for ip in lan_ips:
-              print(f"[INFO]   - GET  http://{ip}:{port}/ (status page)")
+              print(f"[INFO]   - GET  http://{ip}:{port}/ (web UI)")
           else:
             print(f"[INFO]   (Tailscale): chưa bật — máy khác dùng IP LAN của máy này, port {port}")
       except Exception:
         lan_ips = [ip for ip, _ in get_all_ip_addresses_and_interfaces() if ip and ip not in ("127.0.0.1", "::1", "localhost")]
         if lan_ips:
-          print(f"[INFO]   (Máy khác truy cập qua LAN): GET http://{lan_ips[0]}:{port}/ (status page)")
+          print(f"[INFO]   (Máy khác truy cập qua LAN): GET http://{lan_ips[0]}:{port}/ (web UI)")
         else:
           print(f"[INFO]   (Máy khác truy cập): dùng IP LAN máy này, port {port}")
       

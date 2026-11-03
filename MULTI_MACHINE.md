@@ -24,29 +24,27 @@ install.bat            # Windows  |  sh install.sh   # Linux/macOS
 
 Windows: nếu cổng không bind được, xem `netsh int ipv4 show excludedportrange protocol=tcp` và dùng `--node-port`.
 
-## 1. Ghép máy (một lần)
-
-```bash
-python main.py pair                  # máy 1: in ra mã
-python main.py pair --code <mã>      # các máy còn lại
-```
-
-## 2. Hai máy cùng LAN
+## 1. Bật node (mỗi máy)
 
 ```bash
 # máy A và máy B, mỗi máy một lệnh:
-python main.py serve --discovery-module udp --node-id A     # (B: --node-id B)
+python main.py --discovery-module udp --node-id A     # (B: --node-id B)
 ```
 
-Kiểm tra từ máy bất kỳ:
+Mở giao diện web trên từng máy: `http://127.0.0.1:52415`.
 
-```bash
-python main.py status --port 52415          # thấy cả A và B, mỗi node một dải layer
-python main.py topology --port 52415
-python main.py client --prompt "Say hello"  # có câu trả lời
-```
+## 2. Ghép máy (một lần)
 
-## 3. Đo (chạy từ một máy thấy được API của mọi node)
+Máy A: **Cài đặt → Ghép máy → Tạo mã cho cụm mới**, sao chép mã.
+Máy B: **Cài đặt → Ghép máy**, dán mã, **Tham gia cụm**. Khởi động lại cả hai node (Ctrl+C rồi chạy lại lệnh bước 1).
+
+## 3. Kiểm tra cụm
+
+- Trang **Node & chia layer**: thấy cả A và B, mỗi node một dải layer, có độ trễ đo được giữa hai máy.
+- Trang **Chat**: gửi "Say hello", có câu trả lời; dòng dưới câu trả lời ghi TTFT và tok/s.
+- Thanh bên: master là ai, TLS `cluster`.
+
+## 4. Đo (chạy từ một máy thấy được API của mọi node)
 
 ```bash
 python backend/tests/benchmark_live_cluster.py \
@@ -58,19 +56,19 @@ python backend/tests/benchmark_live_cluster.py \
 Harness từ chối (exit 3) nếu mọi URL là loopback: phải dùng IP LAN/Tailscale thật.
 Đo: hình thành mesh (M1), TTFT (M2), tok/s (M3), văn bản temp-0 giống chạy một máy (M6).
 
-## 4. Failover
+## 5. Failover
 
 Chạy lại lệnh đo với `--failover`; khi harness nhắc, tắt hẳn một máy đang giữ layer (rút mạng hoặc tắt tiến trình).
 Ghi: thời gian cụm tự chia lại, câu trả lời đang stream có giữ nguyên không.
 
-## 5. Mở rộng
+## 6. Mở rộng
 
-- [ ] 3 máy LAN (bước 2–4 với 3 URL).
+- [ ] 3 máy LAN (bước 1–5 với 3 URL).
 - [ ] Qua Tailscale: `--discovery-module tailscale` (cần `TAILSCALE_API_KEY`) hoặc `manual` với file cấu hình dùng IP 100.x.
 - [ ] Rút máy master: các node còn lại phải chia lại ngay (không treo request mới).
-- [ ] Train: `POST /v1/training/start` với `use_lora: true` trên cụm 2 máy; rút một máy rồi xem checkpoint phục hồi.
+- [ ] Train: trang **Huấn luyện**, bật LoRA, trên cụm 2 máy; rút một máy rồi xem checkpoint phục hồi.
 - [ ] Model ~7–8B mà một máy không chứa nổi ở fp16 (đặt `SYNAPSE_WEIGHT_QUANT` = `none` / `int8` / `int4` để so).
-- [ ] Máy có GPU NVIDIA: `python -c "import torch; print(torch.cuda.is_available())"`, chạy lại bước 3.
+- [ ] Máy có GPU NVIDIA: `python -c "import torch; print(torch.cuda.is_available())"`, chạy lại bước 4.
 
 ## Kết quả
 

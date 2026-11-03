@@ -21,11 +21,23 @@ echo "[INFO] pip install -r backend/requirements.txt ..."
 echo "[INFO] torch backend detect:"
 .venv/bin/python -c "import torch; print('  torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
 
+if command -v npm >/dev/null 2>&1; then
+  echo "[INFO] building the web UI ..."
+  if npm --prefix frontend install --no-audit --no-fund; then
+    npm --prefix frontend run build || echo "[WARN] web UI build failed" >&2
+  else
+    echo "[WARN] npm install failed: web UI not built" >&2
+  fi
+else
+  echo "[WARN] Node.js/npm not found: the web UI is not built (the node serves a basic status page)." >&2
+  echo "       Install Node.js 18+, then: npm --prefix frontend install && npm --prefix frontend run build" >&2
+fi
+
 cat <<'EOF'
 
 [OK] installed. Next steps:
   source .venv/bin/activate
-  python main.py
+  python main.py            # then open http://127.0.0.1:52415
 
 Optional extras:
   .venv/bin/python -m pip install -r backend/requirements-dev.txt     # packaging/dev

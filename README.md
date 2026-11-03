@@ -49,11 +49,11 @@ These runs use separate processes on one machine. Real-network latency and bandw
 ### Also in the box
 
 - Pipeline-parallel training: each node trains only the layers it serves; activations go forward and gradients go back between nodes. LoRA works the same way (adapters on each node's own layers, also over int8/int4 weights).
-- Pairing: `synapse pair` gives a cluster one code; machines that share it talk mutual TLS, machines without it cannot connect.
+- Pairing: one code per cluster (Settings page of the web UI); machines that share it talk mutual TLS, machines without it cannot connect.
 - Autoscale: under load the master re-places layers for throughput (spreading them over idle nodes), and back when idle.
 - Versioned handshakes.
 - Shard-weight checkpoints, replicated to a peer.
-- The CLI/TUI console; any OpenAI-compatible chat UI works against the API (see "Chat UI").
+- A web UI served by every node at `http://<node>:52415`: dashboard, nodes and layer split, chat with measured TTFT / tok/s, models, training (full or LoRA), datasets, logs, settings and pairing. Any OpenAI-compatible chat app also works against the API (see "Chat UI").
 
 ---
 
@@ -143,7 +143,7 @@ The master scheduler node is elected using the **LACP composite score** rather t
 ## Known Limitations
 
 - **TLS between nodes: pairing code, or manual certificates.**
-  - `synapse pair` creates a code (160 random bits); `synapse pair --code <code>` on every other machine. Each machine derives the same cluster CA key from the code, issues its own node certificate, and runs mutual TLS on the event bridge and the tensor path. A node with another code, or none, cannot handshake in either direction (`test_tls_pairing.py`). With a saved code TLS is on by default (`SYNAPSE_TLS=off` overrides); `synapse pair --forget` removes it.
+  - Settings → "Ghép máy" creates a code (160 random bits) on one machine; paste it on every other machine (`POST /v1/cluster/pairing`). Each machine derives the same cluster CA key from the code, issues its own node certificate, and runs mutual TLS on the event bridge and the tensor path. A node with another code, or none, cannot handshake in either direction (`test_tls_pairing.py`). With a saved code TLS is on by default after a restart (`SYNAPSE_TLS=off` overrides); "Bỏ ghép" removes it.
   - Manual mode: `SYNAPSE_TLS=selfsigned|require` wraps both the event bridge and the chunked TCP tensor path.
   - Peers are authenticated by a CA (`SYNAPSE_TLS_CA`) or by sha256 certificate pins (`SYNAPSE_TLS_PINS`). With pins, every client connection checks the server certificate against them, on the bridge and on the tensor path (`test_tls_interop.py`).
   - Without a CA, the old code encrypted to whoever answered: the advertised `tls_fp` was never checked.
@@ -166,7 +166,7 @@ The master scheduler node is elected using the **LACP composite score** rather t
 - **Handshakes are versioned and enforced.** Bridges exchange `synapse_version`, `bridge_version`, `caps_hash` and `features`.
   - A peer whose bridge major version differs from ours is excluded from placement, from failover plans and from checkpoint replication (`_peer_compatible` → `bridge.is_compatible`; `test_wiring_compat_replica.py`, `test_handshake_compat.py`).
   - Capability/demand gossip also carries layer profiles and loaded layers.
-- **CLI-first terminal surface exists.** `python main.py console|serve|join|client|status|topology|models|benchmark [--json] [--port N]` (verified by `test_cli.py`, `test_console.py`); `console` is the interactive TUI shell (see `UI.md`). `--log-format json` emits JSONL backend logs and `--headless` turns `GET /` into a 204 liveness stub. Launchers pass `SYNAPSE_PARENT_PID`, so the backend exits if its launcher is killed (no orphan holding ports).
+- **The web UI is the interface** (`frontend/`, Vite + TypeScript, built into `frontend/dist` and served by the node at `GET /`). It shows only real data from the API: a failed call shows the error, never placeholder numbers. Admin actions follow the API access policy (from the node's own machine, or with the API key entered on the Settings page). The terminal console/CLI was removed; `python main.py` takes the backend flags (`--log-format json` for JSONL logs, `--headless` turns `GET /` into a 204 stub). The launcher passes `SYNAPSE_PARENT_PID`, so the backend exits if its launcher is killed (no orphan holding ports).
 - **Decode reuses a per-request KV cache on every stage.**
   - Each stage keeps a KV cache per request and shard range.
   - Full-context calls reuse the longest common prefix with the previous input. The cache is cropped after a rejected draft, and the last `verify_n` rows are always recomputed.
@@ -184,7 +184,7 @@ The master scheduler node is elected using the **LACP composite score** rather t
   - The default node port is 46051, below the dynamic range (49152+) where Windows reserves port blocks (Hyper-V/WSL; this test machine reserves 50000–50059). If a port still fails to bind, check `netsh int ipv4 show excludedportrange protocol=tcp` and pass `--node-port`.
 - **Training uses the served layers.** A single node trains its full-range shard in place; several nodes train as a pipeline (each its own range, see above), full fine-tuning or LoRA.
 - **A single request is not faster than one machine that can hold the model.** See "What it does not do" above.
-- **No built-in web chat (CLI-first).** The terminal CLI/console is the user interface; `GET /` is a small built-in status page served by the API process (a 204 stub under `--headless`). For a browser chat, point any OpenAI-compatible UI at the API (see "Chat UI").
+- **The web UI needs a build step.** Without Node.js the installers skip it and `GET /` serves a small built-in status page that says how to build the UI.
 - **The master dies.** Survivors ignore a broadcast partition that names a dead node and place layers over the live ones until a new master is elected (`test_master_death.py`); a request whose stage dies mid-generation is patched by the failover loop. A request whose *orchestrator* (the node the client talks to) dies ends with that connection: the client retries on another node.
 
 ---
@@ -208,7 +208,7 @@ The master scheduler node is elected using the **LACP composite score** rather t
 | `OMP_WAIT_POLICY` | `PASSIVE` | Set by the package before torch loads (spinning OpenMP threads starved the numba kernels); an explicit value wins |
 | `SYNAPSE_CHUNKED_TCP` | `1` | Chunked binary TCP tensor path |
 | `SYNAPSE_TLS` | `cluster` if paired, else off | `off` / `cluster` / `selfsigned` / `require` |
-| `SYNAPSE_CLUSTER_CODE` | — | Pairing code (else `~/.synapse/cluster_code`, written by `synapse pair`) |
+| `SYNAPSE_CLUSTER_CODE` | — | Pairing code (else `~/.synapse/cluster_code`, written by the Settings page) |
 | `SYNAPSE_TLS_PINS` | — | Comma-separated sha256 cert pins that authenticate peers (manual mode) |
 | `SYNAPSE_API_KEY` | — | Bearer key required on every API route; unset = chat open, admin routes local-only |
 | `SYNAPSE_AUTOSCALE` | `on` | `on` = act on hints (master), `advise` = log only, `off` |
@@ -230,12 +230,12 @@ sh install.sh      # Linux / macOS
 ## Quick Start (Single Node)
 
 ```bash
-python main.py console        # interactive TUI: boots a node + slash commands
-# or headless:
-python main.py serve          # then: python main.py status / client / benchmark
+python main.py                # or run.bat on Windows (opens the browser)
 ```
 
-The API listens on `http://127.0.0.1:52415` (`/v1/*`); `GET /` is only a built-in status page.
+Open `http://127.0.0.1:52415`: the web UI (dashboard, chat, models, training, settings). The API is under `/v1/*` on the same port.
+
+Working on the UI itself: `npm --prefix frontend run dev` serves it on `:3000` with hot reload and proxies `/v1` to the node (`SYNAPSE_API` to point elsewhere).
 
 ---
 
@@ -246,12 +246,7 @@ The API listens on `http://127.0.0.1:52415` (`/v1/*`); `GET /` is only a built-i
 1. All nodes must be on the same network (LAN) or connected via Tailscale
 2. Each node needs `python main.py` running with the same discovery config
 3. A shared `cluster_config.json` file or Tailscale API access (UDP discovery on a LAN needs neither)
-4. Optional but recommended: pair the machines once, so they talk mutual TLS:
-
-```bash
-python main.py pair                  # on the first machine: prints a code
-python main.py pair --code <code>    # on every other machine
-```
+4. Optional but recommended: pair the machines once, so they talk mutual TLS. In the web UI of the first machine, Settings → "Tạo mã cho cụm mới"; on every other machine paste the code in "Tham gia cụm". Restart the nodes.
 
 ### Cluster Config Example
 
@@ -326,12 +321,11 @@ python backend/tests/test_multimachine_distributed.py --config-based --port 6088
 
 ```
 synapse_ai/
-├── main.py                          # Entry point
+├── main.py                          # Entry point (starts a node; web UI at :52415)
+├── frontend/                        # Web UI (Vite + TypeScript): src/main.ts pages, src/api.ts client
 ├── backend/
 │   └── synapse/
 │       ├── main.py                  # Backend entry, wiring
-│       ├── cli.py                   # CLI subcommands (serve/status/...)
-│       ├── console.py / tui.py      # Interactive console + full-screen TUI
 │       ├── inference/               # Model execution
 │       │   ├── distributed_engine.py  # Orchestrator: one-pass draft verify, failover
 │       │   ├── partial_loader.py      # Load only a shard's layers from safetensors

@@ -212,3 +212,15 @@ async def test_fast_decoder_serves_the_adapters(monkeypatch):
     assert not np.allclose(fast_out, x0, atol=1e-3), "adapters had no effect on the fast path"
     np.testing.assert_allclose(np.asarray(fast_out).reshape(-1)[-ref.shape[-1]:],
                                ref[0, -1].numpy(), atol=2e-3)
+
+
+def test_messages_samples_format_without_a_chat_template():
+    """Models without a chat template (tiny GPT-2) used to drop every
+    {"messages": [...]} sample: apply_chat_template raised."""
+    from transformers import AutoTokenizer
+    from synapse.training.finetune_lora import format_sample_to_text
+    tok = AutoTokenizer.from_pretrained(TINY[0])
+    assert not getattr(tok, "chat_template", None)
+    text = format_sample_to_text({"messages": [{"role": "user", "content": "hi"},
+                                               {"role": "assistant", "content": "hello"}]}, tok)
+    assert "hi" in text and "hello" in text

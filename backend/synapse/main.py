@@ -72,7 +72,7 @@ parser.add_argument("--chatgpt-api-port", type=int, default=52415, help="ChatGPT
 parser.add_argument("--chatgpt-api-response-timeout", type=int, default=600, help="ChatGPT API response timeout in seconds")
 parser.add_argument("--max-generate-tokens", type=int, default=10000, help="Max tokens to generate in each request")
 parser.add_argument("--inference-engine", type=str, default="pytorch", help="Inference engine (pytorch)")
-# Accepted for old scripts; the topology TUI was folded into `synapse console`.
+# Accepted for old scripts; the terminal UIs were replaced by the web UI.
 parser.add_argument("--disable-tui", action=argparse.BooleanOptionalAction, default=True, help=argparse.SUPPRESS)
 parser.add_argument("--run-model", type=str, help="Specify a model to run directly")
 parser.add_argument("--prompt", type=str, help="Prompt for the model when using --run-model", default="")

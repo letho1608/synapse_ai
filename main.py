@@ -55,45 +55,36 @@ def _check_gpu_environment() -> None:
         print(f"[GPU] Error checking hardware => REASON: {e}")
         print("  => CONCLUSION: System will run on CPU.\n")
 
+# Former CLI subcommands: the web UI replaced them (served by the node).
+_REMOVED_CMDS = ("console", "serve", "join", "client", "status", "topology", "models",
+                 "benchmark", "pair")
+
+
 def run():
-    # C-W11: --no-frontend was a documented no-op; it now maps to headless
-    # (TUI off + GET / stub) with a one-release deprecation warning.
     if "--no-frontend" in sys.argv:
         print("[DEPRECATION] --no-frontend is renamed to the headless mode "
-              "(CLI: serve --headless, backend: --headless / SYNAPSE_HEADLESS=1).",
-              file=sys.stderr)
+              "(backend: --headless / SYNAPSE_HEADLESS=1).", file=sys.stderr)
         os.environ["SYNAPSE_HEADLESS"] = "1"
-    # T2.1 CLI-first: subcommands route to synapse.cli; everything else keeps
-    # the legacy passthrough below (incl. --no-frontend no-op).
-    # Global flags may precede the subcommand (either order works).
-    _cli_cmds = ("serve", "join", "client", "status", "topology", "models",
-                 "benchmark", "console", "pair")
-    _goes_to_cli = (len(sys.argv) > 1 and sys.argv[1] in _cli_cmds
-                    or len(sys.argv) > 2 and sys.argv[1] in (
-                        "--port", "--log-format", "--headless")
-                    and any(a in _cli_cmds for a in sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] in _REMOVED_CMDS:
+        print(f"`{sys.argv[1]}` was a terminal command; the terminal UI was removed.\n"
+              "Run `python main.py` and open http://127.0.0.1:52415 in a browser: chat, cluster status,\n"
+              "models, training, pairing and settings are there. Backend flags still work, e.g.\n"
+              "  python main.py --discovery-module udp --node-id A", file=sys.stderr)
+        sys.exit(2)
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
-        # The launcher's own parser only knows --no-frontend; show the real
-        # CLI surface plus how the bare legacy passthrough behaves.
-        from synapse.cli import build_parser
-        build_parser().print_help()
-        print("\nWith no subcommand, main.py runs the backend directly and "
-              "forwards all arguments to backend/synapse/main.py.")
+        print("usage: python main.py [backend flags]\n\n"
+              "Starts a node; its web UI is at http://127.0.0.1:52415 (other machines: http://<ip>:52415).\n"
+              "Backend flags are listed below.\n")
+        subprocess.call([sys.executable, os.path.join(BACKEND_DIR, "synapse", "main.py"), "--help"],
+                        env=dict(os.environ, PYTHONPATH=BACKEND_DIR))
         return
     if len(sys.argv) > 1 and sys.argv[1] == "--version":
         from synapse.helpers import VERSION
         print("synapse %s" % VERSION)
         return
-    if _goes_to_cli:
-        from synapse.cli import main as cli_main
-        # Normalize global-first order onto the canonical subcommand-first
-        # form argparse understands (parents accept both, this is just for
-        # the legacy argv[1] check above on re-entry — no-op otherwise).
-        sys.exit(cli_main(sys.argv[1:]))
     parser = argparse.ArgumentParser(description="Universal Synapse Launcher")
-    # Retained for CLI compatibility only (there is no web frontend any more);
-    # handled above as a deprecated alias of headless mode.
-    parser.add_argument("--no-frontend", action="store_true", help="Deprecated alias of headless mode (there is no web frontend)")
+    # Deprecated alias of headless mode, handled above.
+    parser.add_argument("--no-frontend", action="store_true", help=argparse.SUPPRESS)
 
     # Parse known args, pass the rest to the backend core
     args, unknown_args = parser.parse_known_args()

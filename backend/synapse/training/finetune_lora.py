@@ -37,8 +37,13 @@ async def load_raw_data_async(path: Path) -> List[Dict[str, Any]]:
 def format_sample_to_text(sample: Dict[str, Any], tokenizer: Any) -> str:
     if "messages" in sample:
         msgs = sample["messages"]
-        if hasattr(tokenizer, "apply_chat_template"):
-            return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False,)
+        # Only when the tokenizer has a template: apply_chat_template raises
+        # without one, and every sample of such a model was dropped.
+        if getattr(tokenizer, "chat_template", None):
+            try:
+                return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False,)
+            except (ValueError, TypeError):
+                pass
         parts = []
         for m in msgs:
             role = m.get("role", "user")

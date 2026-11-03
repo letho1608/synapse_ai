@@ -74,18 +74,20 @@ async def test_root_route_serves_real_page():
 
 
 @pytest.mark.asyncio
-async def test_root_serves_builtin_page_without_frontend_dir():
-    """No web frontend exists (CLI-first); GET / is the built-in page and
-    constructing the API must not recreate a frontend/ directory."""
-    root = Path(__file__).resolve().parents[2]
+async def test_root_serves_builtin_page_when_ui_not_built(tmp_path, monkeypatch):
+    """Without frontend/dist, GET / is the built-in page (with build hint);
+    constructing the API must not create any directory for it."""
+    from synapse.api import chatgpt_api as C
+    monkeypatch.setattr(C, "FRONTEND_DIST", tmp_path / "frontend" / "dist")
+    monkeypatch.delenv("SYNAPSE_HEADLESS", raising=False)
     node = MockNode()
     api = ChatGPTAPI(node=node, inference_engine_classname="PyTorchEngine")
-    assert not (root / "frontend").exists()
+    assert not (tmp_path / "frontend").exists()
     req = make_mocked_request('GET', '/')
     resp = await api.handle_root(req)
     assert resp.status == 200
     assert '<html' in resp.text.lower()
-    assert 'Synapse' in resp.text
+    assert 'Synapse' in resp.text and 'npm --prefix frontend' in resp.text
 
 
 @pytest.mark.asyncio

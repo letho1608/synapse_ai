@@ -26,7 +26,7 @@ Cập nhật: 2026-11-02 · nhánh `distributed-v2`. Chi tiết kỹ thuật và
 | Mỗi node chỉ giữ layer của mình trong RAM | Có | `partial_loader` |
 | Mỗi node chỉ tải phần trọng số nó cần | Có | Checkpoint chia nhiều file: chỉ tải file chứa tensor của node, lúc cần (`partial_loader`). Model một file thì vẫn phải tải cả file |
 | API tương thích ChatGPT | Có | `/v1/chat/completions`, cổng 52415 |
-| Giao diện chat | Một phần | Có TUI console; chưa có web chat |
+| Giao diện | Có | Web UI do node phục vụ tại :52415 (chat, node, model, huấn luyện, dataset, log, cài đặt) |
 | Nhiều loại máy / GPU | Một phần | PyTorch CPU (CUDA chưa kiểm kỹ); chưa có MLX cho Mac |
 | Nhiều họ model | Một phần | Chạy qua HF; đường nhanh chỉ llama / mistral / qwen2 / qwen3 |
 | Không có master (các node ngang hàng) | Khác | Synapse bầu master; exo thì các node ngang hàng |
@@ -59,8 +59,10 @@ Các bước từng bước: `MULTI_MACHINE.md`.
 - [x] Cài một lệnh: requirements thiếu `msgpack` (gossip trạng thái cụm hỏng im lặng trên máy sạch), `lz4`, `cryptography`
       → đã thêm; bỏ 7 gói không ai import. Đã cài thật vào venv sạch và chạy toàn bộ test (xem "Đã làm").
       Còn: thử trên một máy khác hẳn (Linux/macOS).
-- [x] Giao diện chat: CLI/console có sẵn; trình duyệt dùng Open WebUI / LibreChat / Chatbox trỏ vào API (README "Chat UI").
-      Không tự viết web chat.
+- [x] Giao diện web (`frontend/`, khôi phục từ commit trước `e6f4b0e`, bỏ toàn bộ dữ liệu giả, nối API thật):
+      tổng quan, node & chia layer, chat (stream, đo TTFT/tok/s), model (tải phần của node), huấn luyện (full/LoRA),
+      dataset, log, cài đặt (node, ghép máy, API key). Đã gỡ console/TUI/CLI.
+- [ ] Web UI cần Node.js để build; máy không có Node chỉ có trang trạng thái cơ bản.
 - [ ] Kiểm CUDA (cần máy NVIDIA); MLX cho Mac (cần máy Mac).
 
 ### 4. Chịu lỗi trên mạng thật
@@ -68,7 +70,7 @@ Các bước từng bước: `MULTI_MACHINE.md`.
 - [x] Checkpoint không phụ thuộc thư mục dùng chung (C2): bản sao gửi sang node kế tiếp. Còn phải thử trên máy thật.
 
 ### Việc vặt đang mở
-- [ ] Một lượt chạy toàn bộ test sạch sau đợt hoàn thiện (xem "Đã làm").
+- [ ] Một lượt chạy toàn bộ test sạch sau đợt web UI (lần trước dừng ở 83% vì hết RAM, xem "Đã làm").
 
 ## Tính năng hỗ trợ mục tiêu nhưng chưa hoàn thiện
 
@@ -87,7 +89,7 @@ Làm sau mục 1 vì đa số cần cụm thật mới kiểm được.
 - [ ] Đo trên cụm thật (ngưỡng rpm, cooldown) khi mục 1 xong.
 
 ### TLS (phục vụ 3: dùng an toàn qua Tailscale / LAN lạ)
-- [x] Ghép máy bằng mã: `synapse pair` sinh mã 160 bit; `synapse pair --code <mã>` trên máy khác. Mọi máy dẫn xuất cùng
+- [x] Ghép máy bằng mã: trang Cài đặt sinh mã 160 bit; dán mã ở trang Cài đặt của máy khác. Mọi máy dẫn xuất cùng
       CA cụm từ mã, tự cấp cert riêng, mutual TLS; máy khác mã / không mã không bắt tay được. Có mã thì TLS bật mặc định.
 - [ ] Chưa chạy TLS giữa hai máy thật.
 
@@ -106,13 +108,24 @@ Làm sau mục 1 vì đa số cần cụm thật mới kiểm được.
 
 Ba bộ chia layer giữ nguyên: là chuỗi dự phòng (đo thật → TFLOPS / LACP), không trùng nhau.
 
-Giao diện terminal: `cli.py` (lệnh không tương tác), `console.py` (REPL + engine lệnh), `tui.py` (giao diện toàn màn hình
-của console) là ba lớp khác nhau, không trùng. `viz/topology_viz.py` (bảng topology thứ hai, chỉ có với `serve --tui`)
-trùng với `/topology` của console → đã gỡ.
+Giao diện: chỉ còn web UI. Console/TUI/CLI (`console.py`, `tui.py`, `cli.py`, `cli_defaults.py`, `theme.py`) và
+`viz/topology_viz.py` đã gỡ.
 
 ## Đã làm
 
-### Đợt hoàn thiện (2026-11-02, chưa commit)
+### Giao diện web thay CLI (2026-11-03)
+- Khôi phục `frontend/` (Vite + TS): giữ thiết kế, viết lại lớp dữ liệu theo API thật; lỗi API hiện thành thông báo,
+  không còn số giả (bản cũ hiện "3 node RTX 4090", "341 tok/s" khi API lỗi; proxy trỏ nhầm cổng 8000).
+- Backend phục vụ `frontend/dist` tại `/` (file tĩnh giới hạn trong `dist`); thêm `/v1/cluster/pairing` (thay `synapse pair`);
+  `/v1/distributed/status` có master, TLS, autoscale; route đọc trạng thái mở cho LAN để mở UI từ máy khác.
+- Sửa "model đã tải": trước chỉ tính khi cả repo trong cache, nên model tải theo phần của node không bao giờ hiện.
+- Sửa huấn luyện: model không có chat template (vd tiny-GPT2) bị loại hết mẫu dạng `messages`; giờ rơi về định dạng role thường.
+- Gỡ console/TUI/CLI và test của chúng; `python main.py` bật node; installer build UI khi có npm.
+- Kiểm bằng Chrome headless trên server thật: 8 trang không lỗi JS, chat stream, ghép máy tạo/bỏ, xem dataset,
+  LoRA tiny-GPT2 chạy xong từ UI. Lượt chạy toàn bộ test bị dừng ở 83% vì máy hết RAM; 2 lỗi thấy được đã sửa /
+  qua khi chạy riêng (`test_parent_watchdog`), phần còn lại chưa chạy.
+
+### Đợt hoàn thiện (2026-11-02, commit `aad4daf`, `e530312`, `302927e`)
 - Bảo mật API: không có `SYNAPSE_API_KEY` thì chat + trạng thái mở cho LAN, route quản trị (quit, settings, pull/xoá model,
   dataset, training, log) chỉ nhận từ máy local; có key thì mọi route trừ `/` và `/healthcheck` cần Bearer (so sánh hằng thời gian).
   Trước đây ai cùng mạng cũng gọi được `/quit` và xoá model; `/quit` không được bảo vệ kể cả khi có key.

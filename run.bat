@@ -1,8 +1,6 @@
 @echo off
-title Synapse AI Console
-python main.py console %*
-
-echo.
-echo Console closed. Backend API was on its configured port (default: 52415).
-echo.
+title Synapse AI
+echo Web UI: http://127.0.0.1:52415  (opens when the node is ready)
+start "" /b cmd /c "timeout /t 8 >nul & start http://127.0.0.1:52415"
+python main.py %*
 pause

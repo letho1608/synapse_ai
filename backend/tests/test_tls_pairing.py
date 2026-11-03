@@ -91,17 +91,40 @@ async def test_paired_nodes_connect_and_strangers_are_refused(monkeypatch):
             await _close(br, t)
 
 
-def test_cli_pair_create_join_show_forget(capsys):
-    from synapse import cli
+@pytest.mark.asyncio
+async def test_pairing_api_create_join_forget():
+    """The web UI pairs machines through /v1/cluster/pairing (was `synapse pair`)."""
+    from aiohttp.test_utils import make_mocked_request
+    from synapse.api.chatgpt_api import ChatGPTAPI
     from synapse.transport import tls_wrap
-    assert cli.main(["pair"]) == 0
-    code = tls_wrap.cluster_code()
-    assert code and code in capsys.readouterr().out
-    assert cli.main(["pair", "--show"]) == 0
-    assert capsys.readouterr().out.strip() == code
+    import json as _json
+
+    api = ChatGPTAPI.__new__(ChatGPTAPI)  # handlers only need log_activity
+    api.log_activity = lambda *a, **k: None
+
+    async def post(body):
+        req = make_mocked_request("POST", "/v1/cluster/pairing")
+        async def _json_body():
+            return body
+        req.json = _json_body
+        r = await api.handle_post_pairing(req)
+        return r.status, _json.loads(r.body)
+
+    async def get():
+        r = await api.handle_get_pairing(make_mocked_request("GET", "/v1/cluster/pairing"))
+        return _json.loads(r.body)
+
+    assert (await get())["paired"] is False
+    status, body = await post({"action": "create"})
+    assert status == 200 and body["code"] == tls_wrap.cluster_code()
+    st = await get()
+    assert st["paired"] and st["tls_mode"] == "cluster" and st["restart_needed"]
     other = tls_wrap.new_cluster_code()
-    assert cli.main(["pair", "--code", other.lower()]) == 0
-    assert tls_wrap.cluster_code() == other
-    assert cli.main(["pair", "--code", "nope"]) == 2
-    assert cli.main(["pair", "--forget"]) == 0
-    assert tls_wrap.cluster_code() is None
+    status, _ = await post({"action": "join", "code": other.lower()})
+    assert status == 200 and tls_wrap.cluster_code() == other
+    status, body = await post({"action": "join", "code": "nope"})
+    assert status == 400 and not body["success"]
+    status, _ = await post({"action": "forget"})
+    assert status == 200 and tls_wrap.cluster_code() is None
+    status, _ = await post({"action": "bogus"})
+    assert status == 400
