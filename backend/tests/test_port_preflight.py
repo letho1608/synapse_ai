@@ -3,7 +3,7 @@ Behavioral tests: port preflight (bind-conflict fail-fast).
 
 - Free ports report no conflicts.
 - An occupied port reports {name, port, holder} and the fix-it message
-  names netstat/taskkill plus the --node-port/--chat-port escape hatch.
+  names netstat/taskkill plus the --node-port/--chatgpt-api-port escape hatch.
 - Invalid entries never raise.
 """
 import socket

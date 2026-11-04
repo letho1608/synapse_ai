@@ -236,7 +236,7 @@ class Node:
         _bridge_port = getattr(self.libp2p_node, "port", None)
         import os as _os
         _tensor_port = int(_os.getenv("SYNAPSE_TENSOR_PORT", "0") or 0) or (
-          int(_bridge_port) + 1000 if _bridge_port else 0)
+          int(_bridge_port) + 1000 if _bridge_port and int(_bridge_port) + 1000 <= 65535 else 0)
         self.tcp_transport = TensorTCPTransport(
           node_id=self.id,
           port=_tensor_port,
@@ -757,6 +757,10 @@ class Node:
         if is_pending:
           ft._pending_rebalance = None  # consumed by this rebalance
         health = ft._health.get(dead_id)
+        # Flagged at a missed heartbeat but heard from again since (a link
+        # that healed within seconds): rebalancing now would drop a live node.
+        if health and health.is_alive:
+          continue
         if health and (health.is_blacklisted or is_pending):
           _hb = health.last_heartbeat if health else 0.0
           print(f"[FAULT] node {dead_id} missed heartbeats "

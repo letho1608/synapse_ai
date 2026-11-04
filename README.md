@@ -53,7 +53,7 @@ These runs use separate processes on one machine. Real-network latency and bandw
 - Autoscale: under load the master re-places layers for throughput (spreading them over idle nodes), and back when idle.
 - Versioned handshakes.
 - Shard-weight checkpoints, replicated to a peer.
-- A web UI served by every node at `http://<node>:52415`: dashboard, nodes and layer split, chat with measured TTFT / tok/s, models, training (full or LoRA), datasets, logs, settings and pairing. Any OpenAI-compatible chat app also works against the API (see "Chat UI").
+- A web UI served by every node at `http://<node>:52415`: live dashboard (tok/s and TTFT per request, CPU / RAM per node, updated every 3 s), a 3D view of the cluster (nodes in pipeline order, a ring per node for its share of the layers, flow along the links while requests run), nodes and layer split with a latency heat map, chat with measured TTFT / tok/s, models (node-part pull, Hugging Face search, what fits this machine, checkpoints and LoRA merge), training (full or LoRA, live loss curve), datasets (upload, create, link, edit, validate, rename, download), logs, settings and pairing. Any OpenAI-compatible chat app also works against the API (see "Chat UI").
 
 ---
 
@@ -180,12 +180,13 @@ The master scheduler node is elected using the **LACP composite score** rather t
 - **Multi-process runs are verified on one machine, not yet across machines.**
   - `test_live_multiprocess_split.py`: 2 real backend processes answer exactly like one process, each running one contiguous layer range, with hidden states over chunked TCP.
   - `test_live_failover.py`: 3 processes. Once profiles are gossiped, measured placement runs. One stage process is killed while an answer streams; the orchestrator detects it from heartbeats, patches the plan, resends the step, and the streamed answer equals the healthy run.
-  - A hardware multi-machine run (C1) is still pending, so real-network latency, bandwidth and failover times are unmeasured.
+  - First real run, 2026-11-04: Windows + Ubuntu on one Wi-Fi LAN found each other by UDP, split SmolLM2 0–15 / 16–31 and answered correctly at ~15 tok/s with two concurrent requests both right. For the first ~10–15 minutes generation took ~9 s per token; the cause is still unknown (see TODO). Latency, bandwidth and failover times across machines are not measured yet.
+  - `docker/`: two nodes in separate containers (own IPs, UDP discovery) plus `netem_scenarios.py`, which measures tok/s right after formation and under 50 ms latency, 5–20 % loss and 3–10 s link cuts. All stayed fast and correct; a 10 s cut fails over to the surviving node and the cluster re-forms when the link returns.
   - The tensor transport listens on node port + 1000 (47051 by default, `SYNAPSE_TENSOR_PORT` overrides); open it with the node port on firewalls. It used to be a random port, which a firewall cannot be opened for; a send to a blocked port waits out a 5 s connect timeout before the bridge fallback.
   - The default node port is 46051, below the dynamic range (49152+) where Windows reserves port blocks (Hyper-V/WSL; this test machine reserves 50000–50059). If a port still fails to bind, check `netsh int ipv4 show excludedportrange protocol=tcp` and pass `--node-port`.
 - **Training uses the served layers.** A single node trains its full-range shard in place; several nodes train as a pipeline (each its own range, see above), full fine-tuning or LoRA.
 - **A single request is not faster than one machine that can hold the model.** See "What it does not do" above.
-- **The web UI needs a build step.** Without Node.js the installers skip it and `GET /` serves a small built-in status page that says how to build the UI.
+- **The built web UI ships in git** (`frontend/dist`), so a node without Node.js serves the full UI; installers do not rebuild it (that would dirty the checkout). Rebuild only after editing `frontend/src`: `npm --prefix frontend install && npm --prefix frontend run build`.
 - **The master dies.** Survivors ignore a broadcast partition that names a dead node and place layers over the live ones until a new master is elected (`test_master_death.py`); a request whose stage dies mid-generation is patched by the failover loop. A request whose *orchestrator* (the node the client talks to) dies ends with that connection: the client retries on another node.
 
 ---
@@ -249,6 +250,13 @@ Working on the UI itself: `npm --prefix frontend run dev` serves it on `:3000` w
 3. A shared `cluster_config.json` file or Tailscale API access (UDP discovery on a LAN needs neither)
 4. Optional but recommended: pair the machines once, so they talk mutual TLS. In the web UI of the first machine, Settings → "Tạo mã cho cụm mới"; on every other machine paste the code in "Tham gia cụm". Restart the nodes.
 
+### Problems met on the first real LAN run
+
+- **Windows network set to Public.** Windows Firewall had inbound *block* rules for `python.exe` on Public networks, so UDP discovery and the bridge port never reached the node. Set the Wi-Fi to Private (Settings → Network → the network → Private), or allow ports 46051, 47051, 52415/tcp and 5678/udp explicitly.
+- **ufw on Ubuntu.** Open the same ports: `sudo ufw allow 46051/tcp && sudo ufw allow 47051/tcp && sudo ufw allow 52415/tcp && sudo ufw allow 5678/udp`. Without 52415 the node works but its API (and `benchmark_live_cluster.py`) cannot be reached from the other machine.
+- **Discovery defaulted to Tailscale.** Without `TAILSCALE_API_KEY` no peer was ever found; the default is now UDP on the LAN, Tailscale only when a key is set.
+- **First start looks frozen.** Loading PyTorch takes up to a minute with nothing printed; the UI is up once `Available endpoints` appears.
+
 ### Cluster Config Example
 
 ```json
@@ -289,6 +297,8 @@ The cluster self-organizes:
 | GET | `/v1/topology` | Cluster topology (nodes, links, latency matrix) |
 | GET | `/v1/distributed/status` | Distributed pipeline status |
 | POST | `/v1/training/start` | Start distributed training job |
+| GET | `/v1/training/status` | Current job, with `loss_history` ([step, loss], last 2000) |
+| GET | `/v1/metrics/requests` | Last 200 chat requests on this node: tokens, TTFT, decode tok/s, error (`?since=<unix ts>` for new ones) |
 
 ### Chat UI
 
@@ -323,7 +333,9 @@ python backend/tests/test_multimachine_distributed.py --config-based --port 6088
 ```
 synapse_ai/
 ├── main.py                          # Entry point (starts a node; web UI at :52415)
-├── frontend/                        # Web UI (Vite + TypeScript): src/main.ts pages, src/api.ts client
+├── frontend/                        # Web UI (Vite + TypeScript, three.js): src/main.ts pages, live.ts poller,
+│                                    #   charts.ts SVG charts, cluster3d.ts 3D view; dist/ = prebuilt UI
+├── docker/                          # Two-node cluster in containers + network-condition scenarios
 ├── backend/
 │   └── synapse/
 │       ├── main.py                  # Backend entry, wiring

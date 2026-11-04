@@ -1,8 +1,9 @@
 // Thin client for the Synapse API. No mock data: a failed call raises
 // ApiError and the page shows the error.
 import type {
-  ActivityEntry, ClusterResources, Dataset, DistributedStatus, ModelsList, Pairing,
-  Settings, SystemInfo, SystemStats, TrainingStatus,
+  ActivityEntry, Checkpoint, ClusterResources, Compatibility, Dataset, DatasetValidation,
+  DistributedStatus, ModelsList, Pairing, RequestMetric, SearchResult, Settings, SystemInfo,
+  SystemStats, TrainingStatus,
 } from './types';
 
 const KEY_STORAGE = 'synapse.apiKey';
@@ -94,6 +95,41 @@ export const api = {
   pairing: () => call<Pairing>('GET', '/v1/cluster/pairing'),
   pair: (action: 'create' | 'join' | 'forget', code?: string) =>
     call<{ code: string | null }>('POST', '/v1/cluster/pairing', { action, code }),
+
+  requestMetrics: (since = 0) =>
+    call<{ data: RequestMetric[] }>('GET', `/v1/metrics/requests?since=${since}`).then(r => r.data),
+  networkNodes: () => call<{ data: Array<Record<string, any>>; type: string }>('GET', '/v1/network/nodes'),
+
+  searchModels: (q: string) =>
+    call<{ data: SearchResult[] }>('GET', `/v1/models/search?q=${encodeURIComponent(q)}`).then(r => r.data),
+  compatibility: (page = 1, filter = '', sort = 'fit_score') =>
+    call<Compatibility>('GET', `/v1/models/compatibility?page=${page}&limit=20&sort=${sort}${filter ? `&filter=${encodeURIComponent(filter)}` : ''}`),
+  checkpoints: () => call<{ data: Checkpoint[] }>('GET', '/v1/models/checkpoints').then(r => r.data),
+  mergeModel: (base_model: string, adapters: string[], output_name: string) =>
+    call<{ message?: string; output_path?: string }>('POST', '/v1/models/merge', { base_model, adapters, output_name }),
+
+  createDataset: (name: string, template: string, content = '') =>
+    call<{ message?: string }>('POST', '/v1/datasets/create', { name, template, format: name.endsWith('.json') ? 'json' : 'jsonl', content }),
+  linkDataset: (path: string, name: string) => call<{ message?: string }>('POST', '/v1/datasets/link', { path, name }),
+  renameDataset: (path: string, new_name: string) =>
+    call<{ message?: string }>('POST', '/v1/datasets/rename', { path, new_name }),
+  updateDataset: (path: string, content: string) =>
+    call<{ message?: string }>('POST', '/v1/datasets/update', { path, content }),
+  validateDataset: (path: string) =>
+    call<DatasetValidation>('GET', `/v1/datasets/validate?path=${encodeURIComponent(path)}`),
+  /** Fetched with the API key (a plain link would not carry it), saved as a file. */
+  downloadDataset: async (path: string, name: string) => {
+    const res = await fetch(`/v1/datasets/download?path=${encodeURIComponent(path)}`, { headers: headers() });
+    if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`);
+    const url = URL.createObjectURL(await res.blob());
+    const a = Object.assign(document.createElement('a'), { href: url, download: name });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  },
+
+  startDistributedTraining: (body: Record<string, unknown>) =>
+    call<{ job_id?: string; message?: string }>('POST', '/v1/training/distributed/start', body),
+  quit: () => call<{ detail: string }>('POST', '/quit'),
 };
 
 export interface ChatStats {
@@ -108,6 +144,7 @@ export async function streamChat(
   messages: Array<{ role: string; content: string }>,
   onDelta: (text: string) => void,
   signal?: AbortSignal,
+  opts: { temperature?: number; max_tokens?: number } = {},
 ): Promise<ChatStats> {
   const t0 = performance.now();
   let res: Response;
@@ -115,7 +152,8 @@ export async function streamChat(
     res = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ model, messages, stream: true, temperature: 0.7 }),
+      body: JSON.stringify({ model, messages, stream: true, temperature: opts.temperature ?? 0.7,
+        ...(opts.max_tokens ? { max_tokens: opts.max_tokens } : {}) }),
       signal,
     });
   } catch (e) {

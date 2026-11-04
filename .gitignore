@@ -18,6 +18,8 @@ test_logs/
 .env
 node_modules/
 dist/
+# built web UI ships in git so nodes without Node.js still serve it
+!frontend/dist/
 *.egg-info/
 .DS_Store
 Thumbs.db

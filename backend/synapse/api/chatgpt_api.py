@@ -15,15 +15,14 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.web_exceptions import HTTPMethodNotAllowed, HTTPNotFound
 import aiohttp_cors
 import traceback
-import signal
 from synapse import DEBUG, VERSION
 from synapse.terminal_log import get_lines as get_terminal_log_lines
-from synapse.helpers import PrefixDict, shutdown, get_all_ip_addresses_and_interfaces
+from synapse.helpers import PrefixDict, get_all_ip_addresses_and_interfaces
 from synapse.networking.tailscale.tailscale_helpers import get_self_tailscale_info
 from synapse.orchestration import Node
 from synapse.model_list import HF_MODELS, HF_MODEL_PARAMS, resolve_hf_id  # Danh sách + metadata cho web UI
 from typing import Callable
-from collections import defaultdict
+from collections import defaultdict, deque
 from synapse.training.finetune_lora import load_raw_data_async, format_sample_to_text
 from synapse.training.preprocessing import preprocess_async
 from synapse.loading import get_checkpoints_dir
@@ -284,6 +283,7 @@ PUBLIC_ROUTES = {
   # read-only monitoring for the web UI opened from another machine
   ("GET", "/v1/system/stats"), ("GET", "/v1/system/info"), ("GET", "/v1/cluster/resources"),
   ("GET", "/v1/training/status"), ("GET", "/v1/download/progress"), ("GET", "/v1/models/list"),
+  ("GET", "/v1/metrics/requests"),
 }
 # Reachable without a key even when one is set (liveness probes, and the web
 # UI's own page and static assets: the UI asks for the key itself).
@@ -363,13 +363,17 @@ class ChatGPTAPI:
     self.default_model = default_model or "HuggingFaceTB/SmolLM2-135M-Instruct"
     self.discovery_module = "udp"  # Default; main.py sets the one in use
     self.token_queues = defaultdict(asyncio.Queue)
+    # Last chat requests (time, tokens, TTFT, tok/s) for the web UI's live charts.
+    self._request_metrics: deque = deque(maxlen=200)
     self.activity_logs = [] # In-memory activity logs
     self.log_activity("System Started", "-", "success")
     self.chatgpt_api_port = chatgpt_api_port
     self._training_job: Optional[Dict] = None  # job_id, model, dataset, epochs, batch_size, status, progress, error
     _base_dir = Path(__file__).resolve().parent.parent
     self._data_dir = _base_dir / "data"  # Chỉ dataset (json/jsonl)
-    self._settings_path = _base_dir / "config" / "settings.json"  # Cấu hình (tách khỏi data)
+    # SYNAPSE_SETTINGS_PATH: tests point it at a temp file so a node they start
+    # never writes the repo's settings.json.
+    self._settings_path = Path(os.getenv("SYNAPSE_SETTINGS_PATH") or (_base_dir / "config" / "settings.json"))
     self._linked_datasets_path = _base_dir / "config" / "linked_datasets.json"
     self.linked_datasets = {} # name -> path
     self._load_settings()
@@ -441,6 +445,7 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_get("/v1/logs/terminal", self.handle_get_terminal_logs), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/training/start", self.handle_post_training), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/training/status", self.handle_get_training_status), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/metrics/requests", self.handle_get_request_metrics), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/models/status", self.handle_get_models_status), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/models/pull", self.handle_post_models_pull), {"*": cors_options})
     cors.add(self.app.router.add_post("/v1/models/delete", self.handle_post_models_delete), {"*": cors_options})
@@ -560,14 +565,27 @@ class ChatGPTAPI:
 
 
   async def handle_quit(self, request):
-    if DEBUG >= 1: print("Received quit signal")
+    print("[INFO] Quit requested: stopping the node")
     response = web.json_response({"detail": "Quit signal received"}, status=200)
     await response.prepare(request)
     try:
       await response.write_eof()
     except (ClientConnectionResetError, ConnectionResetError, OSError):
       pass  # Client đã đóng connection
-    await shutdown(signal.SIGINT, asyncio.get_event_loop(), self.node.server)
+
+    # It used to await shutdown(..., self.node.server): Node has no `server`,
+    # so /quit raised and the node kept running. Stop the node, then exit 0
+    # (the launcher restarts only on 42).
+    async def _stop():
+      await asyncio.sleep(0.2)
+      try:
+        await asyncio.wait_for(self.node.stop(), timeout=10)
+      except Exception as e:
+        print(f"[WARN] node.stop during quit: {e}")
+      os._exit(0)
+
+    self._quit_task = asyncio.create_task(_stop())
+    return response
 
   async def timeout_middleware(self, app, handler):
     async def middleware(request):
@@ -1201,6 +1219,8 @@ class ChatGPTAPI:
         stream = data.get("stream", False)
         if self.on_chat_completion_request:
           self.on_chat_completion_request(request_id, chat_request, prompt)
+        t_start = time.time()
+        t_first: Optional[float] = None
         process_task = asyncio.create_task(
           self.node.process_prompt(base_shard, prompt, request_id=request_id, max_generate_tokens=max_tokens, inference_state=_sampling_state(data))
         )
@@ -1230,6 +1250,7 @@ class ChatGPTAPI:
                   if task_exc:
                     if DEBUG >= 1:
                       print(f"Inference task failed for {request_id}: {task_exc}")
+                    self._record_request(request_id, model_from_request, bool(stream), t_start, t_first, 0, str(task_exc))
                     return web.json_response(
                       {"error": {"message": f"Inference failed: {task_exc}", "code": "inference_failed"}},
                       status=500,
@@ -1243,6 +1264,8 @@ class ChatGPTAPI:
                   # Timeout real
                   break
 
+              if tokens and t_first is None:
+                t_first = time.time()
               all_tokens_stream.extend(tokens)
               delta = detok.push(tokens)
               if delta:
@@ -1261,6 +1284,7 @@ class ChatGPTAPI:
                               "total_tokens": n_prompt + len(all_tokens_stream)}
             await response.write(f"data: {json.dumps(final)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
+            self._record_request(request_id, model_from_request, True, t_start, t_first, len(all_tokens_stream), None)
             return response
           else:
             all_tokens = []
@@ -1279,6 +1303,7 @@ class ChatGPTAPI:
                   if task_exc:
                     if DEBUG >= 1:
                       print(f"Inference task failed for {request_id}: {task_exc}")
+                    self._record_request(request_id, model_from_request, bool(stream), t_start, t_first, 0, str(task_exc))
                     return web.json_response(
                       {"error": {"message": f"Inference failed: {task_exc}", "code": "inference_failed"}},
                       status=500,
@@ -1288,6 +1313,8 @@ class ChatGPTAPI:
                       print(f"Grace timeout waiting for tokens: {request_id}")
                     break
                 continue
+              if tokens and t_first is None:
+                t_first = time.time()
               all_tokens.extend(tokens)
               if is_finished:
                 break
@@ -1301,6 +1328,7 @@ class ChatGPTAPI:
               "stop",
               "chat.completion",
             )
+            self._record_request(request_id, model_from_request, False, t_start, t_first, len(all_tokens), None)
             return web.json_response(completion)
         finally:
           if not process_task.done():
@@ -1621,6 +1649,26 @@ class ChatGPTAPI:
     # Off the event loop: the first call runs hardware detection (PowerShell /
     # CIM queries, ~4-5 s on Windows), which stalled every in-flight request.
     return web.json_response(await asyncio.to_thread(self.get_system_stats_dict))
+
+  def _record_request(self, request_id, model, stream, t_start, t_first, n_tokens, error):
+    end = time.time()
+    decode = (end - t_first) if t_first else 0.0
+    self._request_metrics.append({
+      "id": (request_id or "")[:8], "model": model, "stream": bool(stream), "at": round(end, 3),
+      "tokens": int(n_tokens), "total_s": round(end - t_start, 3),
+      "ttft_s": round(t_first - t_start, 3) if t_first else None,
+      # decode rate excludes the wait for the first token (prompt + pipeline fill)
+      "tok_s": round((n_tokens - 1) / decode, 2) if n_tokens > 1 and decode > 0 else None,
+      "error": error,
+    })
+
+  async def handle_get_request_metrics(self, request):
+    """Recent chat requests, oldest first (?since=<unix ts> for new ones only)."""
+    try:
+      since = float(request.query.get("since", 0) or 0)
+    except ValueError:
+      since = 0.0
+    return web.json_response({"data": [m for m in self._request_metrics if m["at"] > since]})
 
   async def handle_ws_metrics(self, request):
     ws = web.WebSocketResponse()
@@ -2559,6 +2607,12 @@ class ChatGPTAPI:
               step_count += 1
               job["current_step"] = step_count
               job["current_epoch"] = epoch
+              if job.get("loss") is not None:
+                # Loss curve for the web UI; capped so a long run stays small.
+                hist = job.setdefault("loss_history", [])
+                hist.append([step_count, job["loss"]])
+                if len(hist) > 2000:
+                  del hist[: len(hist) - 2000]
               job["progress"] = min(100, int(100 * step_count / total_steps))
               # Nhường event loop để endpoint status vẫn phản hồi được trong lúc train.
               await asyncio.sleep(0)

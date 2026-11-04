@@ -69,7 +69,7 @@ export interface ClusterResources {
   total_layers: number;
   strategy_name: string;
   latency_matrix: Record<string, Record<string, number>>;
-  peer_graph: Record<string, unknown>;
+  peer_graph: Record<string, Array<{ from_id: string; to_id: string; description?: string }>>;
   training_job: TrainingJob | null;
 }
 
@@ -143,7 +143,68 @@ export interface TrainingJob {
   use_lora?: boolean;
   lora_applied?: boolean;
   completed_at?: string;
+  started_at?: string;
+  max_steps?: number;
+  loss_history?: Array<[number, number]>;
   preprocess?: Record<string, unknown>;
+}
+
+export interface RequestMetric {
+  id: string;
+  model: string;
+  stream: boolean;
+  at: number;          // unix seconds, request end
+  tokens: number;
+  total_s: number;
+  ttft_s: number | null;
+  tok_s: number | null;
+  error: string | null;
+}
+
+export interface SearchResult {
+  name: string;
+  repo: string;
+  pipeline_tag?: string;
+  downloads?: number;
+  likes?: number;
+  last_modified?: string;
+  isDownloaded?: boolean;
+}
+
+export interface CompatModel {
+  name: string;
+  parameters: string;
+  quantization: string;
+  context_length: number;
+  memory_needed_gb: number;
+  fit: string;
+  fit_score: number;
+  estimated_speed: number;
+}
+
+export interface Compatibility {
+  total: number;
+  page: number;
+  total_pages: number;
+  budget_gb: number;
+  hardware: { ram_total_gb: number; ram_available_gb: number; gpu: string | null; gpu_vram_gb: number };
+  models: CompatModel[];
+}
+
+export interface Checkpoint {
+  name: string;
+  path: string;
+  type?: 'adapter' | 'full';
+  created?: string;
+  [k: string]: unknown;
+}
+
+export interface DatasetValidation {
+  valid_count?: number;
+  total_lines?: number;
+  errors?: Array<string | { line: number; message: string }>;
+  format_detected?: string;
+  [k: string]: unknown;
 }
 
 export interface TrainingStatus {

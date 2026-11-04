@@ -44,9 +44,9 @@ Các bước từng bước: `MULTI_MACHINE.md`.
 - [ ] Rồi 3 máy, rồi qua Tailscale.
 - [ ] Đo TTFT, tok/s; so với chạy một máy.
 - [ ] Rút một máy giữa chừng: đo thời gian cụm tự chia lại.
-- [ ] Ghi mọi lỗi gặp được (firewall, cổng, IP, thời gian máy lệch) vào README. Đã gặp: Wi-Fi Windows để Public chặn
-      python.exe (phải chuyển Private); ufw Ubuntu cần mở 46051, 47051, 52415/tcp và 5678/udp.
-- [ ] Harness phải chặn loopback giả làm nhiều máy.
+- [x] Ghi lỗi gặp được vào README ("Problems met on the first real LAN run"): Wi-Fi Windows để Public chặn python.exe,
+      ufw Ubuntu cần mở 46051, 47051, 52415/tcp và 5678/udp, discovery mặc định từng là tailscale, khởi động lâu không in gì.
+- [x] Harness chặn loopback giả làm nhiều máy: `benchmark_live_cluster.py` trả mã 3 nếu mọi URL là loopback (`test_live_harness_gate.py`).
 
 ### 2. Model lớn hơn một máy
 - [x] **Mỗi máy chỉ tải phần trọng số nó cần** (2026-11-02):
@@ -67,14 +67,18 @@ Các bước từng bước: `MULTI_MACHINE.md`.
 - [x] Giao diện web (`frontend/`, khôi phục từ commit trước `e6f4b0e`, bỏ toàn bộ dữ liệu giả, nối API thật):
       tổng quan, node & chia layer, chat (stream, đo TTFT/tok/s), model (tải phần của node), huấn luyện (full/LoRA),
       dataset, log, cài đặt (node, ghép máy, API key). Đã gỡ console/TUI/CLI.
-- [ ] Web UI cần Node.js để build; máy không có Node chỉ có trang trạng thái cơ bản.
+- [x] Web UI đã build nằm sẵn trong git (`frontend/dist`): máy không có Node.js vẫn có đủ giao diện; installer không build lại.
+- [x] Web UI làm lại (2026-11-04): biểu đồ trực tiếp (tok/s, TTFT mỗi request; CPU/RAM từng node), sơ đồ cụm 3D (three.js,
+      chỉ tải ở trang cần), bảng nhiệt độ trễ, đủ chức năng backend (tìm model HF, model vừa máy, checkpoint + gộp LoRA,
+      dataset tạo/liên kết/sửa/kiểm tra/đổi tên/tải về, train phân tán, đường loss trực tiếp, tắt node). Kiểm bằng Chrome
+      headless ở 1440px và 390px (điện thoại): không lỗi JS, không tràn ngang.
 - [ ] Kiểm CUDA (cần máy NVIDIA); MLX cho Mac (cần máy Mac).
 
 ### 4. Chịu lỗi trên mạng thật
 - [ ] Failover khi một máy rời cụm: đã đúng trong 2 container Docker (đứt mạng 10 s giữa câu trả lời → node còn lại
       chạy hết layer, trả đủ câu; nối lại thì chia lại 2 node). Chưa thử trên máy thật.
-- [ ] Sau khi mạng nối lại vẫn chạy chia lại layer cho node vừa quay về (`[FAULT] ... last 0.0s ago`); cụm tự hồi phục
-      nhưng không nên bỏ node đang sống.
+- [x] Sau khi mạng nối lại vẫn chia lại layer bỏ node vừa quay về (`[FAULT] ... last 0.0s ago`): giờ bỏ qua node đã gửi
+      heartbeat lại (`test_pending_rebalance_skipped_when_node_heard_from_again`).
 - [x] Checkpoint không phụ thuộc thư mục dùng chung (C2): bản sao gửi sang node kế tiếp. Còn phải thử trên máy thật.
 
 ### Việc vặt đang mở
@@ -120,6 +124,11 @@ Giao diện: chỉ còn web UI. Console/TUI/CLI (`console.py`, `tui.py`, `cli.py
 `viz/topology_viz.py` đã gỡ.
 
 ## Đã làm
+
+### Web UI có biểu đồ trực tiếp + 3D, sửa /quit (2026-11-04)
+- Backend: `/v1/metrics/requests` (200 request gần nhất: token, TTFT, tok/s, lỗi), `loss_history` trong trạng thái train.
+- `/quit` hỏng từ trước: gọi `self.node.server` không tồn tại nên node không tắt; giờ dừng node rồi thoát mã 0.
+- Bố cục điện thoại trước đây hỏng hẳn (thanh bên chiếm cả màn hình); giờ thanh bên thành thanh điều hướng ngang.
 
 ### Chạy 2 máy thật + Docker (2026-11-04)
 - Mặc định tìm node qua UDP trên LAN (trước là tailscale: không có API key thì không thấy máy nào); ghép máy là tuỳ chọn.

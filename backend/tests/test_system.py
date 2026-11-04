@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import subprocess
+import tempfile
 import json
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -104,11 +105,20 @@ def _start_server():
     if not os.path.exists(main_py_path):
         main_py_path = os.path.join(ROOT, "synapse", "main.py")
         
+    # A free node port: the default 46051 belongs to any node already running
+    # on this machine, and the test then failed with a port conflict.
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        node_port = s.getsockname()[1]
     proc = subprocess.Popen(
         [sys.executable, main_py_path, "--chatgpt-api-port", str(TEST_PORT),
+         "--node-port", str(node_port),
          "--discovery-module", "manual", "--discovery-config-path", config_path],
         cwd=os.path.dirname(ROOT),
-        env=os.environ.copy(),
+        # POST /v1/settings below must not rewrite the repo's settings.json
+        # (it saved discovery_module=manual there).
+        env=dict(os.environ, SYNAPSE_SETTINGS_PATH=os.path.join(tempfile.mkdtemp(prefix="synapse-settings-"), "settings.json")),
     )
     return proc
 

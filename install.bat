@@ -30,15 +30,21 @@ if errorlevel 1 (
 echo [INFO] torch backend detect:
 .venv\Scripts\python.exe -c "import torch; print('  torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
 
+rem frontend\dist ships prebuilt in git; rebuilding here would dirty the checkout.
+if exist frontend\dist\index.html (
+  echo [INFO] web UI: prebuilt frontend\dist ^(rebuild after editing frontend\src: npm --prefix frontend run build^)
+  goto :ui_done
+)
 where npm >nul 2>&1
 if errorlevel 1 (
-  echo [WARN] Node.js/npm not found: the web UI is not built ^(the node serves a basic status page^).
-  echo        Install Node.js 18+, then: npm --prefix frontend install ^&^& npm --prefix frontend run build
+  echo [INFO] Node.js/npm not found: using the prebuilt web UI in frontend\dist.
+  echo        To rebuild after editing frontend\src: npm --prefix frontend install ^&^& npm --prefix frontend run build
 ) else (
   echo [INFO] building the web UI ...
   call npm --prefix frontend install --no-audit --no-fund
-  if errorlevel 1 ( echo [WARN] npm install failed: web UI not built ) else ( call npm --prefix frontend run build )
+  if errorlevel 1 ( echo [WARN] npm install failed: keeping the prebuilt web UI ) else ( call npm --prefix frontend run build )
 )
+:ui_done
 
 echo.
 echo [OK] installed. Next steps:

@@ -253,3 +253,31 @@ async def test_check_fault_tolerance_rebalances_pending_node():
         "pending node was not rebalanced — _pending_rebalance is write-only"
     )
     assert result.removed_node == "node-b"
+
+
+@pytest.mark.asyncio
+async def test_pending_rebalance_skipped_when_node_heard_from_again():
+    """A node flagged at a missed heartbeat that sends one again before
+    check_fault_tolerance() runs (a link that healed within seconds) is not
+    rebalanced out. Found 2026-11-04 cutting a Docker link for 10 s: after it
+    healed the master still logged '[FAULT] node B ... last 0.0s ago' and
+    dropped the live node."""
+    node = _make_node("master")
+    node.distributed_pipeline
+    node._lazy_init_fault_tolerance()
+    ft = node.fault_tolerance
+
+    topo = Topology()
+    topo.update_node("master", _dc(4096, 2.0))
+    topo.update_node("node-b", _dc(8192, 4.0))
+    node.topology = topo
+
+    ft.register_node("node-b")
+    ft._health["node-b"].is_alive = False
+    ft._pending_rebalance = "node-b"             # flagged at the missed beat
+    ft._health["node-b"].record_heartbeat()      # ...then heard from again
+
+    await node.check_fault_tolerance()
+
+    assert ft._pending_rebalance is None, "stale flag should still be consumed"
+    assert getattr(node, "_last_rebalance_result", None) is None, "live node was rebalanced out"

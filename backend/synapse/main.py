@@ -171,7 +171,7 @@ def create_peer_handle(node_id: str, address: str, desc: str, dev_caps: DeviceCa
     return P2PPeerHandle(node_id, address, desc, dev_caps, event_router, libp2p_node)
 
 # Read discovery_module from settings.json if exists
-settings_path = os.path.join("synapse", "config", "settings.json")
+settings_path = os.getenv("SYNAPSE_SETTINGS_PATH") or os.path.join("synapse", "config", "settings.json")
 try:
     if os.path.isfile(settings_path):
         with open(settings_path, "r", encoding="utf-8") as f:

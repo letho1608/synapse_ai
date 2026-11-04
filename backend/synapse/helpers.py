@@ -232,9 +232,9 @@ def format_port_conflicts(conflicts) -> str:
         lines.append("  - %s port %s held by %s" % (
             c.get("name", "?"), c.get("port", "?"), c.get("holder", "?") or "?"))
     lines.append("Fix (Windows): netstat -ano | findstr :<port>  ->  taskkill /PID <pid> /F")
-    lines.append("Or run with free ports: --node-port <free> --chat-port <free>")
-    lines.append("(A previous `serve`/`console` that was closed without Ctrl+C "
-                 "often leaves its backend holding the ports.)")
+    lines.append("Or run with free ports: --node-port <free> --chatgpt-api-port <free>")
+    lines.append("(Often another node already running on this machine, or a launcher "
+                 "that was killed and left its backend holding the ports.)")
     return "\n".join(lines)
 
 
