@@ -13,3 +13,4 @@ research
 .synapse_checkpoints
 .hf_cache
 .env
+docker/hf-cache

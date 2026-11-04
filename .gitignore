@@ -23,3 +23,5 @@ dist/
 *.egg-info/
 .DS_Store
 Thumbs.db
+# model cache used only by the docker/ test containers
+docker/hf-cache/

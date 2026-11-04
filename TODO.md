@@ -17,6 +17,11 @@ Cập nhật: 2026-11-02 · nhánh `distributed-v2`. Chi tiết kỹ thuật và
 
 Ưu tiên điểm 1 trước: đa số việc khác (kể cả các tính năng hỗ trợ bên dưới) chỉ kiểm được khi đã có cụm thật.
 
+**Thứ tự làm (thống nhất 2026-11-04):** gần đây công sức dồn vào 3 và 4 (UI 3D, biểu đồ, thử tách mạng Docker) trong khi
+1 và 2 đứng yên vì cần máy thật. Từ giờ: (a) sửa lỗi chịu lỗi đang mở bên dưới và hoàn thiện mục 4 trong phạm vi một máy;
+(b) chạy lại 2 máy thật, đo TTFT / tok/s, tìm nguyên nhân chậm 9 s/token; (c) model 7–8B chia 2–3 máy (mục 2);
+(d) không thêm tính năng phụ (UI, huấn luyện) cho tới khi (b), (c) có kết quả. Không để code chết, không trùng chức năng.
+
 ## Hiện trạng so với mục tiêu
 
 | Tính năng kiểu exo | Synapse | Ghi chú |
@@ -80,9 +85,29 @@ Các bước từng bước: `MULTI_MACHINE.md`.
 - [x] Sau khi mạng nối lại vẫn chia lại layer bỏ node vừa quay về (`[FAULT] ... last 0.0s ago`): giờ bỏ qua node đã gửi
       heartbeat lại (`test_pending_rebalance_skipped_when_node_heard_from_again`).
 - [x] Checkpoint không phụ thuộc thư mục dùng chung (C2): bản sao gửi sang node kế tiếp. Còn phải thử trên máy thật.
+- [x] Tách mạng 3 container (`docker/partition_scenarios.py`, 2026-11-04): cắt rời node thường hoặc master → mỗi nhóm có
+      master riêng (dự kiến) và chat vẫn đúng ở cả hai phía; nối lại thì về 1 master.
+- [x] Sau khi nối lại, node quay về không được nhận lại vào pipeline (không hội tụ sau 240 s). Nguyên nhân thật không phải
+      bản sửa "chia lại một lần": master chỉ phát bảng chia layer khi chính nó phục vụ một request, nên bảng 2 node lúc tách
+      mạng vẫn được dùng (và một máy MỚI vào cụm cũng không được giao layer). Lần chạy đầu "hội tụ" chỉ vì container không
+      có model nên chưa từng có bảng. Giờ master phát lại bảng khi tập node dùng được đổi (`_resync_partition_membership`);
+      Docker: hội tụ 10 s / 13 s, chat đúng ở cả hai phía khi tách và sau khi nối lại.
+- [x] Node chết bị chia lại layer mỗi 2 s suốt thời gian chết: giờ một lần, chia lại nếu nó sống lại rồi chết tiếp.
+- [x] Heartbeat giả: vòng cập nhật peer ghi heartbeat cho mọi peer discovery còn liệt kê, nên node treo vẫn "sống"; trùng
+      với heartbeat thật qua event mesh. Đã bỏ; liveness chỉ từ heartbeat thật (test tiến trình thật vẫn qua).
+- [x] Kiểm tra chịu lỗi chạy sau `update_peers` (chờ hết timeout của peer chết) nên phát hiện node chết sau 19–23 s;
+      giờ có vòng riêng theo nhịp heartbeat.
+- [x] Chia lại layer khi node chết dùng một partitioner thứ hai (khác bảng thật) chỉ để chọn node nhận checkpoint; giờ dùng
+      đúng `_compute_lacp_partition`. "Phase 1" (request kẹt) là code chết (`outstanding_requests` chỉ chứa chuỗi): đã xoá.
+- [x] Test chạy tiến trình thật dùng cổng cố định 511xx/512xx, hỏng khi Windows dành dải đó cho Hyper-V/WSL (sau khi bật
+      Docker): giờ lấy cổng trống từ hệ điều hành (`tests/_ports.py`).
+- [x] Cache HF thật (`~/.cache/huggingface`) bị phát hiện trống sau một lượt Docker có mount nó (2026-11-04, chưa rõ
+      nguyên nhân). Đã tải lại SmolLM2 + tiny-GPT2; PhoWhisper, laya-multilingual, dataset vinews và các file
+      `node-a_qwen*.ckpt` trong `hub/` đã mất. Container giờ dùng `docker/hf-cache` riêng (gitignored), không mount cache thật;
+      lượt chạy sau đã kiểm cache thật không đổi.
 
 ### Việc vặt đang mở
-- [ ] Một lượt chạy toàn bộ test sạch sau đợt web UI (lần trước dừng ở 83% vì hết RAM, xem "Đã làm").
+- [x] Toàn bộ test sạch sau đợt sửa chịu lỗi: 439 qua (2026-11-04, chia 4 lượt để không hết RAM).
 
 ## Tính năng hỗ trợ mục tiêu nhưng chưa hoàn thiện
 

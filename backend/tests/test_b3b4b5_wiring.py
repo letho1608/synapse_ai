@@ -281,3 +281,85 @@ async def test_pending_rebalance_skipped_when_node_heard_from_again():
 
     assert ft._pending_rebalance is None, "stale flag should still be consumed"
     assert getattr(node, "_last_rebalance_result", None) is None, "live node was rebalanced out"
+
+
+@pytest.mark.asyncio
+async def test_dead_node_rebalanced_once_until_it_returns():
+    """Found 2026-11-04 isolating a container for 45 s: the survivors
+    rebalanced the same dead node every 2 s ([FAULT] repeated 14 times)."""
+    node = _make_node("master")
+    node.distributed_pipeline
+    node._lazy_init_fault_tolerance()
+    ft = node.fault_tolerance
+
+    topo = Topology()
+    topo.update_node("master", _dc(4096, 2.0))
+    topo.update_node("node-a", _dc(6144, 3.0))
+    topo.update_node("node-b", _dc(8192, 4.0))
+    node.topology = topo
+    ft.register_node("node-a")
+    ft.register_node("node-b")
+
+    calls = []
+    real = ft.rebalance_after_failure
+
+    async def counting(**kw):
+        calls.append(kw["dead_node_id"])
+        return await real(**kw)
+
+    ft.rebalance_after_failure = counting
+
+    def kill():
+        ft._health["node-b"].is_alive = False
+        ft._health["node-b"].is_blacklisted = True
+
+    kill()
+    for _ in range(3):
+        await node.check_fault_tolerance()
+    assert calls == ["node-b"], calls
+
+    ft._health["node-b"].record_heartbeat()   # back...
+    await node.check_fault_tolerance()
+    kill()                                     # ...and down again
+    await node.check_fault_tolerance()
+    assert calls == ["node-b", "node-b"], calls
+
+
+@pytest.mark.asyncio
+async def test_master_rebroadcasts_plan_when_a_node_joins_or_returns():
+    """Found 2026-11-04 healing a 3-container partition: the master only
+    broadcast its layer plan when it served a request itself, so the cluster
+    stayed on a 2-node plan for 240 s after the third node came back (and a
+    newly joined machine would get no layers either)."""
+    node = _make_node("master")
+    node.distributed_pipeline
+    node._lazy_init_fault_tolerance()
+    node.election_manager.current_master_id = "master"
+
+    topo = Topology()
+    topo.update_node("master", _dc(4096, 2.0))
+    topo.update_node("node-a", _dc(6144, 3.0))
+    node.topology = topo
+    node.fault_tolerance.register_node("node-a")
+    node.fault_tolerance.record_heartbeat("node-a")
+
+    sent = []
+    node.event_router.subscribe("synapse/cluster/partition",
+                                lambda ev: sent.append({p["node_id"] for p in ev.data["partitions"]}))
+
+    await node.broadcast_authoritative_partition(_base_shard())   # plan while 2 nodes
+    assert sent[-1] == {"master", "node-a"}
+
+    # the monitor records live peers' heartbeats every tick; do the same here
+    # (a broadcast can take seconds in this setup, past the liveness window)
+    node.fault_tolerance.record_heartbeat("node-a")
+    await node.check_fault_tolerance()                              # nothing changed
+    assert len(sent) == 1
+
+    topo.update_node("node-b", _dc(8192, 4.0))                      # joins / returns
+    node.fault_tolerance.register_node("node-b")
+    for nid in ("node-a", "node-b"):
+        node.fault_tolerance.record_heartbeat(nid)
+    await node.check_fault_tolerance()
+    assert sent[-1] == {"master", "node-a", "node-b"}, sent
+    assert {p.node_id for p in node._authoritative_partitions} == {"master", "node-a", "node-b"}

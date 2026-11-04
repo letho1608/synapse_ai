@@ -20,9 +20,13 @@ import urllib.request
 
 import pytest
 
+from _ports import free_ports
+
 MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-NODES = [("foA", 51261, 59821), ("foB", 51262, 59822), ("foC", 51263, 59823)]
+# (node id, node port, API port): free ports picked by the OS, see _ports.py
+_P = free_ports(6)
+NODES = [('foA', _P[0], _P[3]), ('foB', _P[1], _P[4]), ('foC', _P[2], _P[5])]
 MESSAGES = [
     {"role": "system", "content": "You are a helpful AI assistant named SmolLM, trained by Hugging Face"},
     {"role": "user", "content": "List five fruits, one per line."}]

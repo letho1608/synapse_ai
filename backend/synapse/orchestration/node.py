@@ -95,6 +95,8 @@ class Node:
     # Most recent LACP rebalance result (kept so the recovered cross-node
     # checkpoint staged by rebalance_after_failure is not discarded).
     self._last_rebalance_result = None
+    # Dead nodes already rebalanced out; cleared when one is heard from again.
+    self._rebalanced_dead: Set[str] = set()
 
     # Tracks whether distributed inference is currently active across multiple nodes.
     # Set to True when distributed pipeline starts, False on fallback to single-node.
@@ -333,6 +335,7 @@ class Node:
         # rebalanced even if discovery never drops it).
         self.event_router.subscribe("synapse/cluster/heartbeat", self._on_ft_heartbeat)
         self._schedule_task(self._ft_heartbeat_loop(), "ft_heartbeat")
+        self._schedule_task(self._fault_check_loop(), "fault_check")
         # T3.3 (advisory-only): capability + demand gossip on the same mesh.
         # Old peers ignore these topics; handlers store with hygiene caps.
         try:
@@ -691,6 +694,21 @@ class Node:
           f"({', '.join(sorted(a for a in actions if a))})")
     return want or "configured"
 
+  async def _fault_check_loop(self):
+    """Run check_fault_tolerance on the heartbeat cadence. It used to run
+    inside periodic_topology_collection, after update_peers, which waits out
+    connect and topology timeouts on a dead peer: a node cut off from the
+    cluster was declared dead after 19-23 s instead of ~5 s."""
+    while True:
+      try:
+        await asyncio.sleep(self.fault_tolerance.HEARTBEAT_INTERVAL if self.fault_tolerance else 2.0)
+        await self.check_fault_tolerance()
+      except asyncio.CancelledError:
+        break
+      except Exception as e:
+        print(f"[FAULT] check failed: {e}")
+        if DEBUG >= 2: traceback.print_exc()
+
   async def _on_ft_heartbeat(self, event: Event):
     """Record a peer's fault-tolerance heartbeat (B5)."""
     try:
@@ -724,28 +742,25 @@ class Node:
       pass
     return 32
 
+  @staticmethod
+  def _layer_ranges(partitions, total_layers: int) -> Dict[str, Tuple[int, int]]:
+    """{node_id: (start_layer, end_layer)} from fractional partitions."""
+    return {p.node_id: (int(p.start * total_layers), min(int(p.end * total_layers) - 1, total_layers - 1))
+            for p in partitions}
+
   async def check_fault_tolerance(self) -> None:
-    """LACP: Dynamic Fault Tolerance with rebalancing on node failure."""
-    current_time = time.time()
+    """LACP: Dynamic Fault Tolerance with rebalancing on node failure.
 
-    # Phase 1: Check stuck requests (original watchdog)
-    stuck_requests = []
-    for request_id, req_info in list(self.outstanding_requests.items()):
-      if isinstance(req_info, dict):
-          start_time = req_info.get("start_time", 0)
-      else:
-          start_time = 0
-      if start_time and (current_time - start_time) > 10.0:
-        stuck_requests.append(request_id)
-
-    if stuck_requests:
-      if DEBUG >= 1: print(f"!!! [FAULT_TOLERANCE] Found {len(stuck_requests)} stuck requests. Triggering topology refresh.")
-      await self.collect_topology(set())
-
-    # Phase 2: LACP node failure detection + rebalancing
+    (A "stuck request" watchdog used to sit here; outstanding_requests only
+    ever holds status strings, so it never fired. Stalled requests are caught
+    by the distributed engine's per-step timeout and failover.)"""
+    # Node failure detection + rebalancing
     if self.fault_tolerance and self._distributed_pipeline:
       ft = self.fault_tolerance
       dead_nodes = ft.get_dead_nodes()
+      # forget nodes heard from again, so a later death is rebalanced afresh
+      self._rebalanced_dead = {n for n in self._rebalanced_dead
+                               if not (ft._health.get(n) and ft._health[n].is_alive)}
       # The monitor loop flags a node at its FIRST missed heartbeat
       # (_pending_rebalance) while blacklisting waits for 3 consecutive
       # misses; rebalance it now instead of waiting for the threshold (B5).
@@ -760,42 +775,31 @@ class Node:
         # Flagged at a missed heartbeat but heard from again since (a link
         # that healed within seconds): rebalancing now would drop a live node.
         if health and health.is_alive:
+          self._rebalanced_dead.discard(dead_id)
+          continue
+        # Already rebalanced out and still dead: once is enough. It used to
+        # repeat on every check (every 2 s) for as long as the node stayed down.
+        if dead_id in self._rebalanced_dead:
           continue
         if health and (health.is_blacklisted or is_pending):
           _hb = health.last_heartbeat if health else 0.0
           print(f"[FAULT] node {dead_id} missed heartbeats "
                 f"(last {time.time() - _hb:.1f}s ago); rebalancing layers without it", flush=True)
 
-          current_assignments = {}
-          partitions = self._compute_lacp_partition(include_dead=True)
           # H4: never hardcode 32 — prefer the loaded shard's layer count,
           # else the widest assigned range, else 32 as last resort.
           total_layers = self._infer_total_layers(None)
-          for p in partitions:
-            num_layers = total_layers
-            start = int(p.start * num_layers)
-            end = min(int(p.end * num_layers) - 1, num_layers - 1)
-            current_assignments[p.node_id] = (start, end)
+          # The plan the cluster was actually running (the master's), not a
+          # fresh computation that may differ from it.
+          current_assignments = self._layer_ranges(
+            self._authoritative_partitions or self._compute_lacp_partition(include_dead=True), total_layers)
 
           async def repartition(alive_nodes, total_layers):
-            nodes_resources = {}
-            for nid in alive_nodes:
-              if nid in self.topology.nodes:
-                nodes_resources[nid] = NodeResources.from_device_capabilities(self.topology.nodes[nid])
-            latency_matrix = self._build_latency_matrix()
-            apply_measured_bandwidth(nodes_resources, latency_matrix, self.id)
-            result = compute_partition(
-              nodes=nodes_resources,
-              latency_matrix=latency_matrix,
-              total_layers=total_layers,
-              model_id="",
-              method=self.partition_method,
-              time_limit_seconds=self.ilp_time_limit_seconds,
-            )
-            new_assignments = {}
-            for a in result.assignments:
-              new_assignments[a.node_id] = (a.start_layer, a.end_layer)
-            return new_assignments
+            # The dead node is already marked not alive, so this is the same
+            # placement every request will now use. (It used to run a second
+            # partitioner here, so the checkpoint went to a node chosen by a
+            # plan the cluster never used.)
+            return self._layer_ranges(self._compute_lacp_partition(), total_layers)
 
           rebalance_result = await self.fault_tolerance.rebalance_after_failure(
             dead_node_id=dead_id,
@@ -808,6 +812,8 @@ class Node:
           # over the dead node's shard range, retrievable via
           # fault_tolerance.get_recovery_checkpoint(<target>).
           self._last_rebalance_result = rebalance_result
+          if rebalance_result.success:
+            self._rebalanced_dead.add(dead_id)
           target = rebalance_result.recovery_target_node
           ckpt = self.fault_tolerance.get_recovery_checkpoint(target) if target else None
           if rebalance_result.recovered_from_checkpoint and ckpt is not None:
@@ -848,6 +854,25 @@ class Node:
                     )
                 else:
                   self._last_recovery_degraded = None
+
+    await self._resync_partition_membership()
+
+  async def _resync_partition_membership(self) -> None:
+    """Master: re-broadcast the layer plan when the set of usable nodes no
+    longer matches it (a node joined, came back after a partition, or died).
+
+    The plan used to be broadcast only when the master itself served a
+    request, so a node that joined or returned got no layers until then:
+    3 containers stayed on a 2-node plan for 240 s after a partition healed."""
+    em = getattr(self, "election_manager", None)
+    base = getattr(self, "_authoritative_base_shard", None)
+    if em is None or base is None or not em.is_master():
+      return
+    usable = {nid for nid in self.topology.nodes if self._peer_compatible(nid) and self._node_alive(nid)}
+    planned = {p.node_id for p in (self._authoritative_partitions or [])}
+    if usable and usable != planned:
+      print(f"[PARTITION] nodes changed {sorted(planned)} -> {sorted(usable)}: re-broadcasting the layer plan", flush=True)
+      await self.broadcast_authoritative_partition(base)
 
   async def on_p2p_tensor(self, event: Event):
     """Handle incoming tensor for inference via P2P."""
@@ -2062,19 +2087,16 @@ class Node:
         did_peers_change = await self.update_peers()
         if DEBUG >= 3: print(f"{did_peers_change=}")
         
-        # LACP: Record heartbeat for all connected peers
+        # Register new peers with the monitor. Liveness comes only from the
+        # heartbeats peers publish (_on_ft_heartbeat): this loop used to also
+        # record a heartbeat for every peer discovery still listed, so a hung
+        # node whose discovery entry had not expired yet still counted as alive.
         self._lazy_init_fault_tolerance()
         if self.fault_tolerance:
-          for peer_id in [p.id() for p in self.peers]:
-            self.fault_tolerance.record_heartbeat(peer_id)
-          # Register any new peers
           for peer_id in [p.id() for p in self.peers]:
             if peer_id not in self.fault_tolerance._health:
               self.fault_tolerance.register_node(peer_id)
 
-        # EXO-INSPIRED: Dynamic Fault Tolerance check
-        await self.check_fault_tolerance()
-        
         await self.collect_topology(set())
 
         # CRITICAL FIX: Master broadcasts authoritative topology after each collection

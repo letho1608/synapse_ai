@@ -22,9 +22,13 @@ import urllib.request
 
 import pytest
 
+from _ports import free_ports
+
 MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-NODES = [("liveA", 51161, 59811), ("liveB", 51162, 59812)]
+# (node id, node port, API port): free ports picked by the OS, see _ports.py
+_P = free_ports(4)
+NODES = [('liveA', _P[0], _P[2]), ('liveB', _P[1], _P[3])]
 
 
 def _cached():

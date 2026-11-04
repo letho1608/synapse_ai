@@ -8,8 +8,11 @@
 #   docker exec synapse-b tc qdisc add dev eth0 root netem delay 50ms loss 5%
 #   docker exec synapse-b tc qdisc del dev eth0 root
 #
-# Models come from the host's Hugging Face cache (HF_CACHE, default
-# ~/.cache/huggingface); download them on the host first.
+# Models come from docker/hf-cache, a cache used only by these containers
+# (gitignored). Fill it once from the host:
+#   python -c "from huggingface_hub import snapshot_download as d; d('HuggingFaceTB/SmolLM2-135M-Instruct', cache_dir='docker/hf-cache/hub', allow_patterns=['*.json','*.safetensors','*.txt','*.model'])"
+# Never mount the host's real ~/.cache/huggingface here: on 2026-11-04 it was
+# found empty after a run that mounted it (cause not established).
 
 x-node: &node
   build:
@@ -20,7 +23,7 @@ x-node: &node
   environment:
     HF_HUB_OFFLINE: "1"
   volumes:
-    - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+    - ./hf-cache:/root/.cache/huggingface
   networks: [lan]
   mem_limit: 2g
 
@@ -37,6 +40,15 @@ services:
     hostname: synapse-b
     command: ["--node-id", "B"]
     ports: ["52417:52415"]
+  # third node, for partition tests (docker/partition_scenarios.py):
+  #   docker compose -f docker/docker-compose.yml --profile three up -d
+  c:
+    <<: *node
+    container_name: synapse-c
+    hostname: synapse-c
+    command: ["--node-id", "C"]
+    ports: ["52418:52415"]
+    profiles: ["three"]
 
 networks:
   lan:
