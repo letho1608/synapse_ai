@@ -758,7 +758,9 @@ class Node:
           ft._pending_rebalance = None  # consumed by this rebalance
         health = ft._health.get(dead_id)
         if health and (health.is_blacklisted or is_pending):
-          if DEBUG >= 1: print(f"!!! [LACP_FAULT] Node {dead_id} is dead, triggering rebalance")
+          _hb = health.last_heartbeat if health else 0.0
+          print(f"[FAULT] node {dead_id} missed heartbeats "
+                f"(last {time.time() - _hb:.1f}s ago); rebalancing layers without it", flush=True)
 
           current_assignments = {}
           partitions = self._compute_lacp_partition(include_dead=True)

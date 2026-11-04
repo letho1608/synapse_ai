@@ -1,0 +1,15 @@
+.git
+**/__pycache__
+**/*.pyc
+.venv
+venv
+frontend/node_modules
+backend/checkpoints
+checkpoints
+logs
+research
+*.log
+.pytest_cache
+.synapse_checkpoints
+.hf_cache
+.env

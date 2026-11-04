@@ -236,6 +236,7 @@ class DistributedPipelineController:
         ]
 
         all_generated_tokens: List[int] = []
+        t_start = time.time()
 
         async def emit(tokens: List[int], finished: bool) -> None:
             if not on_token_callback:
@@ -290,9 +291,8 @@ class DistributedPipelineController:
                             new_plan = None
                     if new_plan:
                         stats["failovers"] += 1
-                        if DEBUG >= 1:
-                            print(f"[{request_id}] [FAILOVER] dead={sorted(dead)} new plan="
-                                  f"{[(n, s.start_layer, s.end_layer) for n, s in new_plan]}")
+                        print(f"[{request_id}] [FAILOVER] dead={sorted(dead)} new plan="
+                              f"{[(n, s.start_layer, s.end_layer) for n, s in new_plan]}", flush=True)
                         plan = list(new_plan)
                         self._plans[request_id] = [
                             [nid, int(sh.start_layer), int(sh.end_layer), int(sh.n_layers)]
@@ -333,6 +333,16 @@ class DistributedPipelineController:
                 import traceback
                 traceback.print_exc()
         finally:
+            # One line per request, always: a slow cluster otherwise leaves no
+            # trace (timeouts, failovers and kv misses only printed under DEBUG).
+            st = self.decode_stats.get(request_id, {})
+            wall = time.time() - t_start
+            print(f"[decode] {request_id[:8]} {len(all_generated_tokens)} tok in {wall:.1f}s"
+                  f" | steps={st.get('steps', 0)} timeouts={st.get('timeouts', 0)}"
+                  f" failovers={st.get('failovers', 0)} kv_miss={st.get('kv_miss', 0)}"
+                  f" plan={self._plans.get(request_id)}"
+                  + (f" error={type(session.error).__name__}: {session.error}" if session.error else ""),
+                  flush=True)
             self._sessions.pop(request_id, None)
             self._plans.pop(request_id, None)
             self._sampling.pop(request_id, None)
@@ -388,10 +398,15 @@ class DistributedPipelineController:
                     extra_state={"verify_n": len(draft) + 1, "draft": list(draft),
                                  "gen_ids": list(generated), "delta_rows": delta_rows},
                 )
+                t_step = time.time()
                 res, dead = await self._await_result(waiter, partition_assignments, alive_fn)
             finally:
                 waiter.close()
             if res is None:
+                stats["timeouts"] = stats.get("timeouts", 0) + 1
+                print(f"[decode] {request_id[:8]} step {step} got no result after "
+                      f"{time.time() - t_step:.1f}s from {last_node}"
+                      + (f"; stages marked dead: {sorted(dead)}" if dead else " (timeout)"), flush=True)
                 return None, dead
             if res.metadata.get("kv_miss"):
                 stats["kv_miss"] = stats.get("kv_miss", 0) + 1

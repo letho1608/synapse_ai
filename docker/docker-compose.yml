@@ -1,0 +1,43 @@
+# Two Synapse nodes on one machine, each in its own container (own IP and
+# network stack), finding each other by UDP broadcast like two LAN machines.
+#
+#   docker compose -f docker/docker-compose.yml up -d --build
+#   web UI: http://127.0.0.1:52416 (node A), http://127.0.0.1:52417 (node B)
+#
+# Simulate a bad link on one node (needs NET_ADMIN, granted below):
+#   docker exec synapse-b tc qdisc add dev eth0 root netem delay 50ms loss 5%
+#   docker exec synapse-b tc qdisc del dev eth0 root
+#
+# Models come from the host's Hugging Face cache (HF_CACHE, default
+# ~/.cache/huggingface); download them on the host first.
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: synapse-node
+  cap_add: [NET_ADMIN]
+  environment:
+    HF_HUB_OFFLINE: "1"
+  volumes:
+    - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+  networks: [lan]
+  mem_limit: 2g
+
+services:
+  a:
+    <<: *node
+    container_name: synapse-a
+    hostname: synapse-a
+    command: ["--node-id", "A"]
+    ports: ["52416:52415"]
+  b:
+    <<: *node
+    container_name: synapse-b
+    hostname: synapse-b
+    command: ["--node-id", "B"]
+    ports: ["52417:52415"]
+
+networks:
+  lan:
+    driver: bridge

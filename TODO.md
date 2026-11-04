@@ -30,17 +30,22 @@ Cập nhật: 2026-11-02 · nhánh `distributed-v2`. Chi tiết kỹ thuật và
 | Nhiều loại máy / GPU | Một phần | PyTorch CPU (CUDA chưa kiểm kỹ); chưa có MLX cho Mac |
 | Nhiều họ model | Một phần | Chạy qua HF; đường nhanh chỉ llama / mistral / qwen2 / qwen3 |
 | Không có master (các node ngang hàng) | Khác | Synapse bầu master; exo thì các node ngang hàng |
-| **Chạy thật trên nhiều máy** | **Chưa** | Mọi test đều trên một máy (loopback) |
+| **Chạy thật trên nhiều máy** | **Một phần** | 2 máy LAN (Windows + Ubuntu) chạy được 2026-11-04; chưa đo đủ, chưa 3 máy / Tailscale |
 
 ## Việc cần làm (theo thứ tự)
 
 ### 1. Chạy thật trên nhiều máy — chặn mọi thứ khác
 Các bước từng bước: `MULTI_MACHINE.md`.
-- [ ] Chạy 2 máy cùng LAN với SmolLM2-135M: tự thấy nhau, chia layer, chat được.
+- [x] Chạy 2 máy cùng LAN với SmolLM2-135M (2026-11-04, Windows + Ubuntu): tự thấy nhau qua UDP, chia layer 0–15 / 16–31,
+      chat đúng; khi ổn định ~15 tok/s, 2 request song song đều đúng.
+- [ ] **Chậm ~9 s/token trong ~10–15 phút đầu của lần chạy đó, chưa rõ nguyên nhân.** Đã loại: tải/nạp model, máy A tính
+      chậm, cổng tensor bị firewall, web UI poll, mạng xấu (Docker + netem: trễ 50 ms, mất 5–20% gói, đứt 3–10 s đều
+      không tái hiện). Nghi: đổi firewall / loại mạng Windows khi node đang chạy. Lần sau đọc dòng `[decode]` / `[FAULT]`.
 - [ ] Rồi 3 máy, rồi qua Tailscale.
 - [ ] Đo TTFT, tok/s; so với chạy một máy.
 - [ ] Rút một máy giữa chừng: đo thời gian cụm tự chia lại.
-- [ ] Ghi mọi lỗi gặp được (firewall, cổng, IP, thời gian máy lệch) vào README.
+- [ ] Ghi mọi lỗi gặp được (firewall, cổng, IP, thời gian máy lệch) vào README. Đã gặp: Wi-Fi Windows để Public chặn
+      python.exe (phải chuyển Private); ufw Ubuntu cần mở 46051, 47051, 52415/tcp và 5678/udp.
 - [ ] Harness phải chặn loopback giả làm nhiều máy.
 
 ### 2. Model lớn hơn một máy
@@ -66,7 +71,10 @@ Các bước từng bước: `MULTI_MACHINE.md`.
 - [ ] Kiểm CUDA (cần máy NVIDIA); MLX cho Mac (cần máy Mac).
 
 ### 4. Chịu lỗi trên mạng thật
-- [ ] Failover khi một máy rời cụm (đã có, chỉ mới kiểm trên một máy).
+- [ ] Failover khi một máy rời cụm: đã đúng trong 2 container Docker (đứt mạng 10 s giữa câu trả lời → node còn lại
+      chạy hết layer, trả đủ câu; nối lại thì chia lại 2 node). Chưa thử trên máy thật.
+- [ ] Sau khi mạng nối lại vẫn chạy chia lại layer cho node vừa quay về (`[FAULT] ... last 0.0s ago`); cụm tự hồi phục
+      nhưng không nên bỏ node đang sống.
 - [x] Checkpoint không phụ thuộc thư mục dùng chung (C2): bản sao gửi sang node kế tiếp. Còn phải thử trên máy thật.
 
 ### Việc vặt đang mở
@@ -112,6 +120,13 @@ Giao diện: chỉ còn web UI. Console/TUI/CLI (`console.py`, `tui.py`, `cli.py
 `viz/topology_viz.py` đã gỡ.
 
 ## Đã làm
+
+### Chạy 2 máy thật + Docker (2026-11-04)
+- Mặc định tìm node qua UDP trên LAN (trước là tailscale: không có API key thì không thấy máy nào); ghép máy là tuỳ chọn.
+- Cổng tensor cố định 47051 (cổng node + 1000), trước là cổng ngẫu nhiên không mở được trên firewall; nối thất bại nhớ 30 s.
+- Log: bỏ ~10 dòng/s debug RPC và log mỗi lần web UI poll (làm tràn bộ đệm 2000 dòng); không còn ghi header chứa API key.
+  Luôn in một dòng `[decode]` sau mỗi request (bước, timeout, failover, kv miss), `[FAULT]` khi node bị coi là chết.
+- `docker/`: 2 node trong 2 container (mạng riêng, UDP như LAN) + `netem_scenarios.py` đo dưới trễ / mất gói / đứt mạng.
 
 ### Giao diện web thay CLI (2026-11-03)
 - Khôi phục `frontend/` (Vite + TS): giữ thiết kế, viết lại lớp dữ liệu theo API thật; lỗi API hiện thành thông báo,
