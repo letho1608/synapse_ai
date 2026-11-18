@@ -162,6 +162,10 @@ class Node:
     self._setup_p2p_rpc_handlers()
 
     self.node_download_progress: Dict[str, RepoProgressEvent] = {}
+    # Our own pulls land here directly; peers' arrive as download_progress status events.
+    if getattr(shard_downloader, "on_progress", None) is not None:
+      shard_downloader.on_progress.register("node").on_next(
+        lambda _shard, event: self.node_download_progress.__setitem__(self.id, event))
     self.topology_inference_engines_pool: List[List[str]] = []
     self.outstanding_requests = {}
     self._background_tasks: Set[asyncio.Task] = set()

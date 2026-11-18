@@ -983,10 +983,11 @@ class ChatGPTAPI:
   _WEIGHT_PATTERNS = ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.h5", "*.msgpack",
                       "*.gguf", "*.onnx", "*.ot", "*.tflite"]
 
-  def _pull_node_part(self, model_name: str, hf_id: str):
+  def _pull_node_part(self, model_name: str, hf_id: str, progress=None):
     """Fetch config/tokenizer plus only the checkpoint files of this node's
     current layer range. Returns ((start, end), files), or None when the
-    range or a safetensors index is unknown (caller pulls the whole repo)."""
+    range or a safetensors index is unknown (caller pulls the whole repo).
+    progress(status, done, total) reports weight files fetched so far."""
     try:
       base = build_base_shard(model_name, self.inference_engine_classname)
       if base is None:
@@ -997,8 +998,9 @@ class ChatGPTAPI:
       import torch
       snapshot_download(repo_id=hf_id, ignore_patterns=self._WEIGHT_PATTERNS)
       pm = PartialModel(hf_id, torch.float32, "cpu")  # meta skeleton only, nothing loaded
+      on_file = (lambda done, total: progress("in_progress", done, total)) if progress else None
       files = pm.prefetch(shard.start_layer, shard.end_layer,
-                          shard.is_first_layer(), shard.is_last_layer())
+                          shard.is_first_layer(), shard.is_last_layer(), on_file=on_file)
       return (shard.start_layer, shard.end_layer), files
     except Exception as e:
       if DEBUG >= 1: print(f"[pull] node-part pull failed ({e}); pulling the whole repo")
@@ -1034,18 +1036,24 @@ class ChatGPTAPI:
       else:
           hf_id = resolve_hf_id(model_name)
           
-      part = None if data.get("full") else await asyncio.to_thread(self._pull_node_part, model_name, hf_id)
-      if part is None:
-        from huggingface_hub import snapshot_download
-        await asyncio.to_thread(snapshot_download, repo_id=hf_id)
-        msg = f"Đã tải {model_name} -> {hf_id} (Hugging Face cache)"
-      else:
-        (start, end), files = part
-        msg = (f"Đã tải phần của node này: {model_name} -> {hf_id}, layer {start}-{end}, "
-               f"{len(files)} file trọng số")
+      progress = self._download_reporter(model_name, hf_id)
+      progress("in_progress", 0, 0)
+      try:
+        part = None if data.get("full") else await asyncio.to_thread(self._pull_node_part, model_name, hf_id, progress)
+        if part is None:
+          await asyncio.to_thread(self._pull_full_repo, hf_id, progress)
+          msg = f"Đã tải {model_name} -> {hf_id} (Hugging Face cache)"
+        else:
+          (start, end), files = part
+          msg = (f"Đã tải phần của node này: {model_name} -> {hf_id}, layer {start}-{end}, "
+                 f"{len(files)} file trọng số")
+          progress("complete", len(files), len(files))
+      except Exception:
+        progress("failed", 0, 0)
+        raise
       if is_new_discovery:
           msg += " [Đã lưu metadata cục bộ]"
-          
+
       return web.json_response({
         "success": True,
         "message": msg,
@@ -1054,6 +1062,37 @@ class ChatGPTAPI:
       if DEBUG >= 2:
         traceback.print_exc()
       return web.json_response({"success": False, "message": str(e)}, status=500)
+
+  def _download_reporter(self, model_name: str, hf_id: str):
+    """progress(status, done, total), callable from any thread: forwards to the
+    shard downloader's on_progress (the node's own map, broadcast to peers)."""
+    loop = asyncio.get_running_loop()
+    downloader = getattr(getattr(self, "node", None), "shard_downloader", None)
+    report = getattr(downloader, "report", None)
+    shard = build_base_shard(model_name, self.inference_engine_classname)
+
+    def progress(status: str, done: int, total: int) -> None:
+      if callable(report):
+        loop.call_soon_threadsafe(report, shard, hf_id, status, done, total)
+    return progress
+
+  @staticmethod
+  def _pull_full_repo(hf_id: str, progress) -> None:
+    """snapshot_download the whole repo; its file-count bar drives progress."""
+    from huggingface_hub import snapshot_download
+    from tqdm.auto import tqdm
+
+    done = [0, 0]  # files done, total: counted here (a disabled tqdm stops counting)
+
+    class _Bar(tqdm):
+      def update(self, n=1):
+        done[0] += n or 0
+        done[1] = int(self.total or 0)
+        progress("in_progress", done[0], done[1])
+        return super().update(n)
+
+    snapshot_download(repo_id=hf_id, tqdm_class=_Bar)
+    progress("complete", done[0], done[1])
 
   async def handle_post_models_delete(self, request):
     """Xóa model khỏi HF cache (danh sách từ HF_MODELS)."""

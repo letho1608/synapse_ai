@@ -49,6 +49,16 @@ class HFShardDownloader:
             self._on_progress = AsyncCallbackSystem()
         return self._on_progress
 
+    def report(self, shard, repo_id: str, status: str, done: int = 0, total: int = 0) -> None:
+        """Publish one progress event (files done / total) to on_progress
+        observers. Call on the event loop thread (observers schedule tasks)."""
+        from synapse.loading import RepoProgressEvent
+        event = RepoProgressEvent(
+            shard=shard, repo_id=repo_id, revision="main", downloaded_files=done, total_files=total,
+            downloaded_bytes=0, downloaded_this_session_bytes=0, total_bytes=0,
+            download_speed=0.0, eta=None, file_progress={}, status=status)
+        self.on_progress.trigger_all(shard, event)
+
 
 _FORWARD_PARAMS: Dict[type, Any] = {}
 

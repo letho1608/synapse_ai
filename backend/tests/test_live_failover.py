@@ -92,8 +92,7 @@ def test_killing_a_stage_mid_answer_keeps_the_answer():
             procs[nid] = subprocess.Popen(
                 [sys.executable, os.path.join(ROOT, "main.py"), "--node-id", nid,
                  "--node-port", str(port), "--discovery-module", "manual",
-                 "--discovery-config-path", cfg_path, "--chatgpt-api-port", str(api),
-                 "--disable-tui"],
+                 "--discovery-config-path", cfg_path, "--chatgpt-api-port", str(api)],
                 cwd=ROOT, env=env, stdout=open(logs[nid], "w", encoding="utf-8"),
                 stderr=subprocess.STDOUT)
         api_a = NODES[0][2]

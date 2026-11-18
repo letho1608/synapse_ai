@@ -69,8 +69,7 @@ def test_two_processes_split_layers_and_answer_correctly():
             procs.append(subprocess.Popen(
                 [sys.executable, os.path.join(ROOT, "main.py"), "--node-id", nid,
                  "--node-port", str(port), "--discovery-module", "manual",
-                 "--discovery-config-path", cfg_path, "--chatgpt-api-port", str(api),
-                 "--disable-tui"],
+                 "--discovery-config-path", cfg_path, "--chatgpt-api-port", str(api)],
                 cwd=ROOT, env=env, stdout=open(logs[nid], "w", encoding="utf-8"),
                 stderr=subprocess.STDOUT))
         api_a = NODES[0][2]

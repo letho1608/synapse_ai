@@ -1,23 +1,25 @@
 import './style.css';
 import { api, ApiError, getApiKey, setApiKey, streamChat } from './api';
 import { live } from './live';
-import { LineChart, barList, heatColor, seriesColor, type Series } from './charts';
+import { LineChart, barList, heatStyle, patternClass, type Series } from './charts';
 import type {
   ActivityEntry, ClusterResources, Dataset, DistributedStatus, ModelsList, Pairing,
-  RequestMetric, Settings, SystemInfo, TrainingJob,
+  RequestMetric, Settings, SystemInfo, TopologyJson, TrainingJob,
 } from './types';
 
-type Page = 'dashboard' | 'cluster' | 'chat' | 'models' | 'training' | 'datasets' | 'logs' | 'settings';
+type Page = 'dashboard' | 'cluster' | 'chat' | 'models' | 'training' | 'datasets' | 'logs' | 'settings' | 'api';
 
-const PAGES: Array<{ id: Page; title: string; subtitle: string; section: string; icon: string }> = [
-  { id: 'dashboard', section: 'Cụm', title: 'Tổng quan', subtitle: 'Cụm, tốc độ sinh token và tài nguyên theo thời gian thực', icon: '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>' },
-  { id: 'cluster', section: 'Cụm', title: 'Node & chia layer', subtitle: 'Mỗi node giữ một dải layer; hidden state đi node này sang node kế', icon: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>' },
-  { id: 'chat', section: 'Model', title: 'Chat', subtitle: 'Gửi prompt qua cụm, đo TTFT và tok/s thật', icon: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>' },
-  { id: 'models', section: 'Model', title: 'Model', subtitle: 'Mỗi node chỉ tải phần trọng số của dải layer nó giữ', icon: '<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>' },
-  { id: 'training', section: 'Model', title: 'Huấn luyện', subtitle: 'Mỗi node train layer của mình (full hoặc LoRA)', icon: '<path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>' },
-  { id: 'datasets', section: 'Model', title: 'Dataset', subtitle: 'File .json / .jsonl để huấn luyện', icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>' },
-  { id: 'logs', section: 'Hệ thống', title: 'Log', subtitle: 'Hoạt động và log của node', icon: '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>' },
-  { id: 'settings', section: 'Hệ thống', title: 'Cài đặt', subtitle: 'Cài đặt node, ghép máy (TLS), API key', icon: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>' },
+/** Sections of the "paper"; n is the section number shown in the margin and headings. */
+const PAGES: Array<{ id: Page; n: string; title: string; subtitle: string }> = [
+  { id: 'dashboard', n: '1', title: 'Tổng quan', subtitle: 'Trạng thái cụm, tốc độ sinh token và tài nguyên, cập nhật mỗi 3 giây.' },
+  { id: 'cluster', n: '2', title: 'Node và chia layer', subtitle: 'Mỗi node giữ một dải layer liền nhau; hidden state đi từ node này sang node kế tiếp.' },
+  { id: 'chat', n: '3', title: 'Chat', subtitle: 'Gửi prompt qua cụm và đo thời gian tới token đầu (TTFT) cùng tốc độ sinh (tok/s).' },
+  { id: 'models', n: '4', title: 'Model', subtitle: 'Mỗi node chỉ tải phần trọng số thuộc dải layer nó giữ.' },
+  { id: 'training', n: '5', title: 'Huấn luyện', subtitle: 'Mỗi node huấn luyện các layer của mình, toàn bộ trọng số hoặc LoRA.' },
+  { id: 'datasets', n: '6', title: 'Dataset', subtitle: 'Tệp .json / .jsonl dùng để huấn luyện.' },
+  { id: 'logs', n: '7', title: 'Nhật ký', subtitle: 'Hoạt động và log của node.' },
+  { id: 'settings', n: '8', title: 'Cài đặt', subtitle: 'Cài đặt node, ghép máy (TLS), API key, tắt node.' },
+  { id: 'api', n: 'A', title: 'Phụ lục: API', subtitle: 'Giao diện lập trình tương thích OpenAI và các endpoint của node.' },
 ];
 
 function esc(v: unknown): string {
@@ -38,7 +40,7 @@ function median(xs: number[]): number | null {
 function errorBox(e: unknown): string {
   if (e instanceof ApiError && e.forbidden) {
     return `<div class="notice notice-warn">Mục này chỉ mở được từ chính máy chạy node, hoặc khi đã nhập API key
-      (<a data-nav="settings">Cài đặt</a>). Chi tiết: ${esc(e.message)}</div>`;
+      (<a data-nav="settings">§8 Cài đặt</a>). Chi tiết: ${esc(e.message)}</div>`;
   }
   return `<div class="notice notice-error">${esc(e instanceof Error ? e.message : e)}</div>`;
 }
@@ -58,15 +60,20 @@ function toast(msg: string, kind: 'ok' | 'error' = 'ok') {
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** A numbered subsection (§n.k is added by CSS counters). */
 function card(title: string, body: string, extra = '', cls = ''): string {
-  return `<section class="glass-panel ${cls}"><div class="card-title-bar"><h3>${title}</h3>${extra}</div>
+  return `<section class="sec ${cls}"><div class="card-title-bar"><h3>${title}</h3>${extra}</div>
     <div class="card-body">${body}</div></section>`;
+}
+
+/** A numbered figure ("Hình n." is added by CSS counters). */
+function fig(caption: string, body: string): string {
+  return `<figure class="fig">${body}<figcaption>${caption}</figcaption></figure>`;
 }
 
 function pill(status: string): string {
   const k = /complete|success|ok|done/.test(status) ? 'ok' : /fail|error/.test(status) ? 'error' : 'warn';
-  const icon = k === 'ok' ? '✓' : k === 'error' ? '✕' : '●';
-  return `<span class="pill pill-${k}">${icon} ${esc(status)}</span>`;
+  return `<span class="pill pill-${k}">${esc(status)}</span>`;
 }
 
 interface ChatMsg { role: 'user' | 'ai'; text: string; meta?: string; error?: boolean }
@@ -116,41 +123,35 @@ class App {
     location.hash = p;
     this.renderShell();
     this.show();
+    window.scrollTo({ top: 0 });
   }
 
   // -- shell ------------------------------------------------------------------
   private renderShell() {
     const app = document.getElementById('app')!;
     const meta = PAGES.find(p => p.id === this.page)!;
-    let section = '';
-    const nav = PAGES.map(p => {
-      const head = p.section !== section ? `<div class="nav-section-title">${p.section}</div>` : '';
-      section = p.section;
-      return `${head}<a class="nav-item ${p.id === this.page ? 'active' : ''}" data-nav="${p.id}" href="#${p.id}">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">${p.icon}</svg>${p.title}</a>`;
-    }).join('');
+    const toc = PAGES.map(p => `<li><a class="${p.id === this.page ? 'active' : ''}" data-nav="${p.id}" href="#${p.id}"
+        ${p.id === this.page ? 'aria-current="page"' : ''}><span class="n">${p.n}</span><span>${p.title}</span></a></li>`).join('');
     app.innerHTML = `
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-icon">⚡</div>
-          <div class="brand-info"><h1>SYNAPSE AI</h1><span class="badge" id="brand-version">v${esc(this.info?.version || '…')}</span></div>
-        </div>
-        <nav class="nav-menu">${nav}</nav>
-        <div class="sidebar-footer" id="sidebar-footer">Đang kết nối…</div>
-      </aside>
+      <header class="masthead">
+        <div class="masthead-title">Synapse AI<small>Một cụm suy luận và huấn luyện phân tán từ các máy tính thông thường</small></div>
+        <div class="masthead-meta" id="masthead-meta">Đang kết nối…</div>
+      </header>
+      <nav class="toc" aria-label="Mục lục">
+        <div class="toc-head">Mục lục</div>
+        <ol>${toc}</ol>
+        <div class="toc-status" id="sidebar-footer"></div>
+      </nav>
       <div class="main-wrapper">
-        <header class="top-nav">
-          <div class="nav-left"><div>
-            <div class="page-title">${meta.title}</div>
-            <div class="page-subtitle">${meta.subtitle}</div>
-          </div></div>
+        <div class="page-head">
+          <h2 class="page-title"><span class="n">${meta.n}</span>${meta.title}</h2>
           <div class="nav-right">
             <span class="live-dot" id="live-dot" title="Số liệu cập nhật mỗi 3 giây">Trực tiếp</span>
-            <button class="btn btn-glass" id="btn-refresh">Làm mới</button>
-            ${this.page !== 'chat' ? '<button class="btn btn-primary" data-nav="chat">Chat</button>' : ''}
+            <button class="btn btn-sm" id="btn-refresh">Làm mới</button>
           </div>
-        </header>
-        <main class="content-container" id="content"><div class="loading">Đang tải…</div></main>
+        </div>
+        <p class="page-subtitle">${meta.subtitle}</p>
+        <main class="content-container" id="content" style="--sec:'${meta.n}'"><div class="loading">Đang tải…</div></main>
       </div>`;
     document.getElementById('btn-refresh')!.onclick = () => { live.tick(); this.show(); };
     this.refreshFooter();
@@ -158,28 +159,26 @@ class App {
 
   private refreshFooter() {
     const el = document.getElementById('sidebar-footer');
+    const head = document.getElementById('masthead-meta');
     const dot = document.getElementById('live-dot');
-    if (dot) dot.classList.toggle('offline', !!live.error && !live.cluster);
-    if (!el) return;
+    const offline = !!live.error && !live.cluster;
+    if (dot) { dot.classList.toggle('offline', offline); dot.textContent = offline ? 'Mất kết nối' : 'Trực tiếp'; }
     const d = live.dist;
-    if (!d) {
-      el.innerHTML = live.error
-        ? '<div class="cluster-pill offline"><div class="cluster-dot"></div>Mất kết nối node</div>'
-        : 'Đang kết nối…';
-      return;
+    if (head) {
+      head.innerHTML = d
+        ? `Node <b>${esc(d.node_id || '?')}</b>${d.is_master ? ' (master)' : ''} · phiên bản <b>${esc(this.info?.version || '…')}</b><br>
+           ${d.partitions_count} node giữ layer · TLS ${esc(d.tls_mode || 'off')}${d.api_key_required ? ' · cần API key' : ''}
+           · ${new Date().toLocaleTimeString()}`
+        : (live.error ? '<b>Mất kết nối tới node</b>' : 'Đang kết nối…');
     }
-    el.innerHTML = `
-      <div class="cluster-pill"><div class="cluster-dot"></div>${d.partitions_count} node đang giữ layer</div>
-      <div>Node: <b>${esc(d.node_id || '?')}</b>${d.is_master ? ' (master)' : ''}</div>
-      <div>Master: ${esc(d.master_id || '—')}</div>
-      <div>TLS: ${esc(d.tls_mode || 'off')}${d.api_key_required ? ' · API key' : ''}</div>`;
+    if (el) {
+      el.innerHTML = d
+        ? `Master: <b>${esc(d.master_id || '—')}</b><br>Chia layer: ${esc(d.partition_objective || '—')}<br>Autoscale: ${esc(d.autoscale_mode || '—')}`
+        : '';
+    }
     if (!this.info) {
       this.info = {} as SystemInfo;
-      api.systemInfo().then(i => {
-        this.info = i;
-        const b = document.getElementById('brand-version');
-        if (b) b.textContent = `v${i.version}`;
-      }).catch(() => { this.info = null; });
+      api.systemInfo().then(i => { this.info = i; this.refreshFooter(); }).catch(() => { this.info = null; });
     }
   }
 
@@ -210,6 +209,7 @@ class App {
       case 'datasets': return this.viewDatasets();
       case 'logs': return this.viewLogs();
       case 'settings': return this.viewSettings();
+      case 'api': return this.viewApi();
     }
   }
 
@@ -222,6 +222,7 @@ class App {
     if (page === 'datasets') this.bindDatasets();
     if (page === 'logs') this.bindLogs();
     if (page === 'settings') this.bindSettings();
+    if (page === 'api') this.bindApi();
   }
 
   /** Run fn now and on every live tick until the page is left. */
@@ -247,13 +248,13 @@ class App {
   private nodeSeries(map: Map<string, Array<{ t: number; v: number | null }>>): Series[] {
     const names = new Map((live.cluster?.nodes || []).map(n => [n.node_id, n.name]));
     return live.nodeIds().map(id => ({
-      id, label: names.get(id) || id, color: seriesColor(live.slot(id)), points: map.get(id) || [],
+      id, label: names.get(id) || id, slot: live.slot(id), points: map.get(id) || [],
     }));
   }
 
   private requestSeries(key: 'tok_s' | 'ttft_s', label: string): Series[] {
     return [{
-      id: key, label, color: seriesColor(0),
+      id: key, label, slot: 0,
       points: live.requests.filter(r => !r.error).map(r => ({ t: r.at, v: r[key] })),
     }];
   }
@@ -262,19 +263,38 @@ class App {
   private async viewDashboard(): Promise<string> {
     const act = await attempt(() => api.activity());
     return `
+      <div class="abstract" id="dash-abstract">${this.abstract()}</div>
       <div class="kpi-grid" id="kpis">${this.kpis()}</div>
       <div class="grid-viz">
-        ${card('Cụm', '<div id="viz-dash" class="viz3d-host"></div>', '<a class="link" data-nav="cluster">Chi tiết →</a>', 'viz-card')}
+        ${card('Cụm', fig('Sơ đồ cụm theo thứ tự pipeline. Kích thước khối tỉ lệ với RAM; cung đậm quanh mỗi node là phần layer nó giữ; nét liền là chiều xuôi, nét đứt là token quay về node đầu.',
+          '<div id="viz-dash" class="viz3d-host"></div>'), '<a class="link" data-nav="cluster">xem §2</a>')}
         ${card('Trạng thái', `<div id="dash-cluster">${this.clusterSummary()}</div>`)}
       </div>
-      <div class="grid-charts">
-        ${card('Tốc độ sinh token (tok/s mỗi request)', '<div id="ch-toks"></div>')}
-        ${card('Thời gian tới token đầu (TTFT, giây)', '<div id="ch-ttft"></div>')}
-        ${card('CPU theo node (%)', '<div id="ch-cpu"></div>')}
-        ${card('RAM theo node (%)', '<div id="ch-ram"></div>')}
-      </div>
-      ${card('Request gần đây', '<div id="dash-requests"></div>', '<span class="muted small">Đo ở node nhận request</span>')}
-      ${card('Hoạt động gần đây', act.ok ? this.activityTable(act.v.slice(-8).reverse()) : errorBox(act.e), '<a class="link" data-nav="logs">Tất cả →</a>')}`;
+      ${card('Hiệu năng', `<div class="grid-charts">
+        ${fig('Tốc độ sinh token của mỗi request (tok/s).', '<div id="ch-toks"></div>')}
+        ${fig('Thời gian tới token đầu của mỗi request (TTFT, giây).', '<div id="ch-ttft"></div>')}
+        ${fig('Mức dùng CPU theo node (%).', '<div id="ch-cpu"></div>')}
+        ${fig('Mức dùng RAM theo node (%).', '<div id="ch-ram"></div>')}
+      </div>`)}
+      ${card('Request gần đây', '<div id="dash-requests" class="scroll-x"></div>', '<span class="muted small">đo ở node nhận request</span>')}
+      ${card('Hoạt động gần đây', `<div class="scroll-x">${act.ok ? this.activityTable(act.v.slice(-8).reverse()) : errorBox(act.e)}</div>`, '<a class="link" data-nav="logs">xem §7</a>')}`;
+  }
+
+  /** One paragraph that says what the numbers below say. */
+  private abstract(): string {
+    const c = live.cluster;
+    const d = live.dist;
+    if (!c) return `<b>Tóm tắt.</b> ${live.error ? 'Không đọc được trạng thái cụm từ node.' : 'Đang đọc trạng thái cụm…'}`;
+    const ok = live.requests.filter(r => !r.error).slice(-10);
+    const tps = median(ok.map(r => r.tok_s).filter((v): v is number => v !== null));
+    const ttft = median(ok.map(r => r.ttft_s).filter((v): v is number => v !== null));
+    const holders = c.nodes.filter(n => n.layer_start !== null).length;
+    const perf = ok.length
+      ? ` Trên ${ok.length} request gần nhất, tốc độ trung vị là ${tps === null ? '—' : tps.toFixed(1)} tok/s và TTFT trung vị ${ttft === null ? '—' : Math.round(ttft * 1000) + ' ms'}.`
+      : ' Chưa có request nào được đo kể từ khi mở trang.';
+    return `<b>Tóm tắt.</b> Cụm gồm ${c.total_nodes} node, trong đó ${holders} node đang giữ ${c.total_layers} layer của model
+      (chia theo ${esc(d?.partition_objective || c.strategy_name?.split(' (')[0] || '—')}); master là ${esc(d?.master_id || '—')}.${perf}
+      Truyền giữa các node ${d?.tls_mode && d.tls_mode !== 'off' ? `được mã hoá (${esc(d.tls_mode)})` : 'không mã hoá'}${d?.quant_active && d.quant_active !== 'none' ? `, trọng số lượng tử ${esc(d.quant_active)}` : ''}.`;
   }
 
   private kpis(): string {
@@ -287,7 +307,7 @@ class App {
     const failed = live.requests.length - ok.length;
     const s = live.stats;
     const kpi = (title: string, value: string, meta: string) =>
-      `<div class="kpi-card glass-panel"><div class="kpi-header"><span class="kpi-title">${title}</span></div>
+      `<div class="kpi-card"><div class="kpi-header"><span class="kpi-title">${title}</span></div>
        <div class="kpi-value">${value}</div><div class="kpi-meta">${meta}</div></div>`;
     return [
       kpi('Node', c ? String(c.total_nodes) : '—', d ? `master ${esc(d.master_id || '—')} · ${d.partitions_count} giữ layer` : ''),
@@ -321,7 +341,7 @@ class App {
       ${rows.map(r => `<tr><td class="mono">${new Date(r.at * 1000).toLocaleTimeString()}</td><td class="mono">${esc(r.model)}</td>
         <td class="right">${r.tokens}</td><td class="right">${r.ttft_s === null ? '—' : `${Math.round(r.ttft_s * 1000)} ms`}</td>
         <td class="right">${num(r.tok_s, 1)}</td><td class="right">${num(r.total_s, 1, ' s')}</td>
-        <td>${r.error ? `<span class="pill pill-error" title="${esc(r.error)}">✕ lỗi</span>` : '<span class="pill pill-ok">✓ xong</span>'}</td></tr>`).join('')}
+        <td>${r.error ? `<span class="pill pill-error" title="${esc(r.error)}">lỗi</span>` : '<span class="pill pill-ok">xong</span>'}</td></tr>`).join('')}
     </tbody></table>`;
   }
 
@@ -338,6 +358,7 @@ class App {
       cpu.update(this.nodeSeries(live.cpu));
       ram.update(this.nodeSeries(live.ram));
       const k = document.getElementById('kpis'); if (k) k.innerHTML = this.kpis();
+      const a = document.getElementById('dash-abstract'); if (a) a.innerHTML = this.abstract();
       const s = document.getElementById('dash-cluster'); if (s) s.innerHTML = this.clusterSummary();
       const r = document.getElementById('dash-requests'); if (r) r.innerHTML = this.requestTable(live.requests.slice(-8).reverse());
     });
@@ -349,9 +370,9 @@ class App {
     if (!nodes.length) return '<div class="muted">Chưa có node nào giữ layer.</div>';
     return `<div class="layer-bar" role="img" aria-label="Chia layer">${nodes.map(n => {
       const w = ((n.layer_end! - n.layer_start! + 1) / total) * 100;
-      return `<div class="layer-seg" style="width:${w}%;background:${seriesColor(live.slot(n.node_id))}"
-        title="${esc(n.name)}: layer ${n.layer_start}–${n.layer_end}">${esc(n.name)} · ${n.layer_start}–${n.layer_end}</div>`;
-    }).join('')}</div>`;
+      return `<div class="layer-seg ${patternClass(live.slot(n.node_id))}" style="width:${w}%"
+        title="${esc(n.name)}: layer ${n.layer_start}–${n.layer_end}"><span>${esc(n.name)} · ${n.layer_start}–${n.layer_end}</span></div>`;
+    }).join('')}</div><div class="layer-scale"><span>layer 0</span><span>${total - 1}</span></div>`;
   }
 
   private activityTable(rows: ActivityEntry[]): string {
@@ -364,7 +385,7 @@ class App {
 
   // -- cluster ------------------------------------------------------------------
   private async viewCluster(): Promise<string> {
-    const net = await attempt(() => api.networkNodes());
+    const [net, topo] = await Promise.all([attempt(() => api.networkNodes()), attempt(() => api.topology())]);
     const discovered = net.ok
       ? (net.v.data.length
         ? `<table class="data-table"><thead><tr><th>Node</th><th>Địa chỉ</th><th>Trạng thái</th></tr></thead><tbody>
@@ -373,15 +394,32 @@ class App {
         : `<div class="muted">Chưa phát hiện node nào khác qua ${esc(net.v.type)}.</div>`)
       : errorBox(net.e);
     return `
-      ${card('Sơ đồ cụm', '<div id="viz-cluster" class="viz3d-host viz3d-tall"></div><div class="muted small">Kéo để xoay, cuộn để phóng to. Vòng quanh mỗi node là phần layer nó giữ; hạt sáng chạy nhanh khi đang có request.</div>', '<span class="muted small" id="cluster-strategy"></span>')}
-      ${card('Chia layer', '<div id="cluster-bar"></div>')}
+      ${card('Sơ đồ cụm', fig('Các node theo thứ tự pipeline (kéo để xoay, cuộn để phóng to). Cung đậm quanh mỗi node là phần layer nó giữ; chấm đen chạy nhanh hơn khi đang có request.',
+        '<div id="viz-cluster" class="viz3d-host viz3d-tall"></div>'), '<span class="muted small" id="cluster-strategy"></span>')}
+      ${card('Chia layer', fig('Dải layer của từng node; độ rộng mỗi đoạn tỉ lệ với số layer. Mẫu nền của đoạn trùng với mẫu ở bảng node và sơ đồ.', '<div id="cluster-bar"></div>'))}
       ${card('Node', '<div id="cluster-nodes" class="scroll-x"></div>')}
       <div class="grid-2col">
-        ${card('Độ trễ đo được (ms)', '<div id="cluster-latency" class="scroll-x"></div>')}
-        ${card('Đường truyền (số lượt)', '<div id="cluster-transport"></div>')}
-        ${card('Điều phối', '<div id="cluster-orch"></div>')}
-        ${card(`Phát hiện qua mạng`, discovered)}
+        <div>
+          ${card('Độ trễ giữa các node', fig('Độ trễ đo được từ node hàng tới node cột (ms); ô càng đậm, độ trễ càng cao.', '<div id="cluster-latency" class="scroll-x"></div>'))}
+          ${card('Kết nối', this.peerGraph(topo))}
+        </div>
+        <div>
+          ${card('Điều phối', '<div id="cluster-orch"></div>')}
+          ${card('Đường truyền', fig('Số lượt truyền tensor theo từng kiểu đường truyền.', '<div id="cluster-transport"></div>'))}
+          ${card('Phát hiện qua mạng', `<div class="scroll-x">${discovered}</div>`)}
+        </div>
       </div>`;
+  }
+
+  /** Peer links as the node's topology reports them (/v1/topology). */
+  private peerGraph(r: { ok: true; v: TopologyJson } | { ok: false; e: unknown }): string {
+    if (!r.ok) return errorBox(r.e);
+    const edges = Object.values(r.v.peer_graph || {}).flat();
+    if (!edges.length) return '<div class="muted">Node này chưa ghi nhận kết nối nào tới node khác.</div>';
+    return `<table class="data-table"><thead><tr><th>Từ</th><th>Tới</th><th>Mô tả</th></tr></thead><tbody>
+      ${edges.map(e => `<tr><td class="mono">${esc(e.from_id)}${e.from_id === r.v.active_node_id ? ' <span class="pill pill-muted">máy này</span>' : ''}</td>
+        <td class="mono">${esc(e.to_id)}</td><td>${esc(e.description || '—')}</td></tr>`).join('')}
+      </tbody></table>`;
   }
 
   private bindCluster() {
@@ -404,7 +442,7 @@ class App {
     return `<table class="data-table"><thead><tr><th>Node</th><th>Chip</th><th class="right">RAM</th><th class="right">VRAM</th>
         <th class="right">CPU</th><th>Layer</th><th class="right">Tỉ lệ</th></tr></thead><tbody>
       ${c.nodes.map(n => `<tr>
-        <td><span class="swatch" style="background:${seriesColor(live.slot(n.node_id))}"></span><b>${esc(n.name)}</b>
+        <td class="nowrap"><span class="swatch ${patternClass(live.slot(n.node_id))}"></span><b>${esc(n.name)}</b>
           ${n.is_self ? ' <span class="pill pill-muted">máy này</span>' : ''}
           ${n.node_id === d?.master_id ? ' <span class="pill pill-ok">master</span>' : ''}
           ${d?.standby_nodes?.includes(n.node_id) ? ' <span class="pill pill-warn">dự phòng</span>' : ''}</td>
@@ -425,9 +463,9 @@ class App {
       ${ids.map(a => `<tr><th>${esc(a)}</th>${ids.map(b => {
         if (a === b) return '<td class="heat-self">—</td>';
         const v = c.latency_matrix[a]?.[b];
-        return v === undefined ? '<td>—</td>' : `<td style="background:${heatColor(v, max)}" title="${esc(a)} → ${esc(b)}: ${v.toFixed(2)} ms">${v.toFixed(1)}</td>`;
+        return v === undefined ? '<td>—</td>' : `<td style="${heatStyle(v, max)}" title="${esc(a)} → ${esc(b)}: ${v.toFixed(2)} ms">${v.toFixed(1)}</td>`;
       }).join('')}</tr>`).join('')}
-      </tbody></table><div class="muted small">Ô càng sáng, độ trễ càng cao (cao nhất ${max.toFixed(1)} ms).</div>`;
+      </tbody></table>`;
   }
 
   private orchestration(d: DistributedStatus | null): string {
@@ -461,11 +499,11 @@ class App {
       : '<div class="muted center">Chưa có tin nhắn. Câu trả lời đi qua mọi node đang giữ layer của model.</div>';
     return `
       <div class="chat-layout">
-        <div class="chat-container glass-panel">
+        <div class="chat-container">
           <div class="chat-toolbar">
             <label>Model <input list="chat-models" id="chat-model" value="${esc(this.chatModel)}" placeholder="repo id trên Hugging Face"></label>
             <datalist id="chat-models">${names.map(n => `<option value="${esc(n)}">`).join('')}</datalist>
-            <button class="btn btn-glass" id="chat-clear">Xoá hội thoại</button>
+            <button class="btn" id="chat-clear">Xoá hội thoại</button>
           </div>
           <div class="chat-messages" id="chat-messages" aria-live="polite">${bubbles}</div>
           <div class="chat-input-bar">
@@ -479,7 +517,7 @@ class App {
             <label>Số token tối đa <input id="chat-max" type="number" min="1" max="4096" value="${this.chatMax}"></label>
             <label>System prompt <textarea id="chat-system" rows="3" placeholder="Để trống = dùng cài đặt node">${esc(this.chatSystem)}</textarea></label>
           </div>`)}
-          ${card('Tốc độ các câu trả lời', '<div id="ch-chat"></div>')}
+          ${card('Tốc độ', fig('Tốc độ sinh của các câu trả lời (tok/s).', '<div id="ch-chat"></div>'))}
         </aside>
       </div>`;
   }
@@ -580,7 +618,7 @@ class App {
   }
 
   private async modelTabBody(): Promise<string> {
-    const pullBtn = (n: string) => `<button class="btn btn-glass btn-sm" data-pull-model="${esc(n)}">Tải</button>`;
+    const pullBtn = (n: string) => `<button class="btn btn-sm" data-pull-model="${esc(n)}">Tải</button>`;
     if (this.modelTab === 'downloaded' || this.modelTab === 'catalog') {
       const r = await attempt(() => api.models());
       if (!r.ok) return errorBox(r.e);
@@ -589,7 +627,7 @@ class App {
         return card(`Đã có trên máy này (${m.downloaded.length})`, m.downloaded.length
           ? `<div class="scroll-x"><table class="data-table"><thead><tr><th>Model</th><th>Tham số</th><th>Kiến trúc</th><th></th></tr></thead><tbody>
             ${m.downloaded.map(x => `<tr><td class="mono">${esc(x.name)}</td><td>${esc(x.parameter_size || '—')}</td><td>${esc(x.architecture || '—')}</td>
-              <td class="right"><button class="btn btn-glass btn-sm" data-chat-model="${esc(x.name)}">Chat</button>
+              <td class="right"><button class="btn btn-sm" data-chat-model="${esc(x.name)}">Chat</button>
               <button class="btn btn-danger btn-sm" data-delete-model="${esc(x.name)}">Xoá</button></td></tr>`).join('')}
             </tbody></table></div>` : '<div class="muted">Chưa có model nào trong cache.</div>');
       }
@@ -610,7 +648,7 @@ class App {
         ? `<div class="scroll-x"><table class="data-table"><thead><tr><th>Repo</th><th>Loại</th><th class="right">Lượt tải</th><th class="right">Thích</th><th></th></tr></thead><tbody>
           ${r.v.map(x => `<tr><td class="mono">${esc(x.repo || x.name)}</td><td>${esc(x.pipeline_tag || '—')}</td>
             <td class="right">${(x.downloads ?? 0).toLocaleString()}</td><td class="right">${x.likes ?? 0}</td>
-            <td class="right">${x.isDownloaded ? '<span class="pill pill-ok">✓ đã có</span>' : pullBtn(x.repo || x.name)}</td></tr>`).join('')}
+            <td class="right">${x.isDownloaded ? '<span class="pill pill-ok">đã có</span>' : pullBtn(x.repo || x.name)}</td></tr>`).join('')}
           </tbody></table></div>` : '<div class="muted">Không có kết quả.</div>') : errorBox(r.e)));
     }
     if (this.modelTab === 'fit') {
@@ -618,7 +656,7 @@ class App {
       if (!r.ok) return errorBox(r.e);
       const c = r.v;
       const opts = ['', 'Perfect', 'Good', 'Marginal', 'Too Tight'];
-      const fitPill = (f: string) => `<span class="pill pill-${f === 'Perfect' || f === 'Good' ? 'ok' : f === 'Marginal' ? 'warn' : 'error'}">${f === 'Perfect' || f === 'Good' ? '✓' : f === 'Marginal' ? '!' : '✕'} ${esc(f)}</span>`;
+      const fitPill = (f: string) => `<span class="pill pill-${f === 'Perfect' || f === 'Good' ? 'ok' : f === 'Marginal' ? 'warn' : 'error'}">${esc(f)}</span>`;
       return card(`Model vừa máy này (${c.total})`, `
         <div class="muted small">Ngân sách bộ nhớ ${num(c.budget_gb, 1)} GB · RAM ${num(c.hardware.ram_total_gb, 1)} GB (còn ${num(c.hardware.ram_available_gb, 1)} GB)
           ${c.hardware.gpu ? ` · ${esc(c.hardware.gpu)} ${num(c.hardware.gpu_vram_gb, 1)} GB` : ''}. Chia cho nhiều node thì chạy được model lớn hơn.</div>
@@ -626,9 +664,9 @@ class App {
           ${c.models.map(x => `<tr><td class="mono">${esc(x.name)}</td><td>${esc(x.parameters)}</td><td class="right">${num(x.memory_needed_gb, 1, ' GB')}</td>
             <td>${fitPill(x.fit)}</td><td class="right">${num(x.estimated_speed, 0, ' tok/s')}</td><td class="right">${pullBtn(x.name)}</td></tr>`).join('')}
         </tbody></table></div>
-        <div class="pager"><button class="btn btn-glass btn-sm" data-fit-page="${c.page - 1}" ${c.page <= 1 ? 'disabled' : ''}>←</button>
+        <div class="pager"><button class="btn btn-sm" data-fit-page="${c.page - 1}" ${c.page <= 1 ? 'disabled' : ''}>←</button>
           <span>Trang ${c.page} / ${c.total_pages}</span>
-          <button class="btn btn-glass btn-sm" data-fit-page="${c.page + 1}" ${c.page >= c.total_pages ? 'disabled' : ''}>→</button></div>`,
+          <button class="btn btn-sm" data-fit-page="${c.page + 1}" ${c.page >= c.total_pages ? 'disabled' : ''}>→</button></div>`,
         `<select id="fit-filter">${opts.map(o => `<option value="${o}" ${o === this.fitFilter ? 'selected' : ''}>${o || 'Mọi mức'}</option>`).join('')}</select>`);
     }
     const [cps, models] = await Promise.all([attempt(() => api.checkpoints()), attempt(() => api.models())]);
@@ -718,9 +756,13 @@ class App {
     const r = await attempt(() => api.downloadProgress());
     if (!r.ok) { el.innerHTML = ''; return; }
     const rows = Object.entries(r.v.progress || {});
+    const STATUS: Record<string, string> = { in_progress: 'đang tải', complete: 'xong', failed: 'lỗi' };
     el.innerHTML = rows.map(([node, p]: [string, any]) => {
-      const pct = p.total_bytes ? (100 * (p.downloaded_bytes || 0) / p.total_bytes) : 0;
-      return `<div class="progress-row"><span>${esc(node)}: ${esc(p.repo_id || '')} ${esc(p.status || '')} ${pct ? `${pct.toFixed(0)}%` : ''}</span>
+      const pct = p.status === 'complete' ? 100
+        : p.total_bytes ? (100 * (p.downloaded_bytes || 0) / p.total_bytes)
+        : p.total_files ? (100 * (p.downloaded_files || 0) / p.total_files) : 0;
+      const files = p.total_files && p.status !== 'complete' ? ` · ${p.downloaded_files || 0}/${p.total_files} file` : '';
+      return `<div class="progress-row"><span>${esc(node)}: <span class="mono">${esc(p.repo_id || '')}</span>, ${esc(STATUS[p.status] || p.status || '')}${files}${pct && p.status !== 'complete' ? ` (${pct.toFixed(0)}%)` : ''}</span>
         <div class="progress-bar-container" role="progressbar" aria-valuenow="${pct.toFixed(0)}" aria-valuemin="0" aria-valuemax="100"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div></div>`;
     }).join('');
   }
@@ -762,7 +804,7 @@ class App {
           <div class="muted small">Mỗi node train đúng dải layer nó đang phục vụ; hidden state đi xuôi, gradient đi ngược giữa các node.</div>`)}
         <div>
           ${card('Trạng thái', '<div id="train-status"><div class="loading">Đang tải…</div></div>')}
-          ${card('Loss theo bước', '<div id="ch-loss"></div>')}
+          ${card('Loss', fig('Loss huấn luyện theo bước của job hiện tại.', '<div id="ch-loss"></div>'))}
         </div>
       </div>`;
   }
@@ -804,7 +846,7 @@ class App {
       if (!r.ok) { el.innerHTML = errorBox(r.e); return; }
       el.innerHTML = this.trainingStatus(r.v.job);
       const h = r.v.job?.loss_history || [];
-      loss.update([{ id: 'loss', label: 'loss', color: seriesColor(1), points: h.map(([t, v]) => ({ t, v })) }]);
+      loss.update([{ id: 'loss', label: 'loss', slot: 0, points: h.map(([t, v]) => ({ t, v })) }]);
     };
     update();
     const t = window.setInterval(update, 2000);
@@ -846,24 +888,24 @@ class App {
         ${card('Dùng file có sẵn', `<form id="ds-link" class="form-grid one">
             <label>Đường dẫn trên máy node<input name="path" required placeholder="D:\\data\\train.jsonl"></label>
             <label>Tên hiển thị<input name="name" placeholder="tuỳ chọn"></label>
-            <button class="btn btn-glass" type="submit">Liên kết</button></form>`)}
+            <button class="btn" type="submit">Liên kết</button></form>`)}
       </div>
       ${card(`Dataset (${ds.length})`, ds.length ? `<div class="scroll-x"><table class="data-table"><thead><tr><th>Tên</th><th class="right">Mẫu</th><th class="right">Dung lượng</th><th>Tạo lúc</th><th></th></tr></thead><tbody>
           ${ds.map(d => `<tr><td class="mono">${esc(d.name)}${d.type === 'link' ? ' <span class="pill pill-muted">liên kết</span>' : ''}</td>
             <td class="right">${d.sample_count ?? '—'}</td><td class="right">${num(d.size_mb, 2, ' MB')}</td><td>${esc(d.created)}</td>
             <td class="right nowrap">
-              <button class="btn btn-glass btn-sm" data-ds-act="preview" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Xem</button>
-              <button class="btn btn-glass btn-sm" data-ds-act="edit" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Sửa</button>
-              <button class="btn btn-glass btn-sm" data-ds-act="validate" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Kiểm tra</button>
-              <button class="btn btn-glass btn-sm" data-ds-act="download" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Tải về</button>
-              <button class="btn btn-glass btn-sm" data-ds-act="rename" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Đổi tên</button>
+              <button class="btn btn-sm" data-ds-act="preview" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Xem</button>
+              <button class="btn btn-sm" data-ds-act="edit" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Sửa</button>
+              <button class="btn btn-sm" data-ds-act="validate" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Kiểm tra</button>
+              <button class="btn btn-sm" data-ds-act="download" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Tải về</button>
+              <button class="btn btn-sm" data-ds-act="rename" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Đổi tên</button>
               <button class="btn btn-danger btn-sm" data-ds-act="delete" data-path="${esc(d.path)}" data-name="${esc(d.name)}">Xoá</button></td></tr>`).join('')}
         </tbody></table></div>` : '<div class="muted">Chưa có dataset.</div>')}
       <div id="ds-validate"></div>
       ${p ? card(p.edit ? `Sửa ${esc(p.name)}` : `Xem trước ${esc(p.name)}`, p.edit
         ? `<textarea id="ds-editor" class="editor" spellcheck="false" aria-label="Nội dung dataset">${esc(p.lines.join('\n'))}</textarea>
-           <div class="form-row"><button class="btn btn-primary" id="ds-save">Lưu</button><button class="btn btn-glass" id="ds-close">Đóng</button></div>`
-        : `<pre class="terminal-window">${esc(p.lines.join('\n'))}</pre><div class="form-row"><button class="btn btn-glass" id="ds-close">Đóng</button></div>`) : ''}`;
+           <div class="form-row"><button class="btn btn-primary" id="ds-save">Lưu</button><button class="btn" id="ds-close">Đóng</button></div>`
+        : `<pre class="terminal-window">${esc(p.lines.join('\n'))}</pre><div class="form-row"><button class="btn" id="ds-close">Đóng</button></div>`) : ''}`;
   }
 
   private bindDatasets() {
@@ -908,7 +950,7 @@ class App {
             <div class="kv-grid"><div><span>Định dạng</span><b>${esc(r.v.format_detected || '—')}</b></div>
               <div><span>Mẫu hợp lệ</span><b>${r.v.valid_count ?? 0}${r.v.total_lines !== undefined ? ` / ${r.v.total_lines}` : ''}</b></div>
               <div><span>Lỗi</span><b>${(r.v.errors || []).length}</b></div></div>
-            ${(r.v.errors || []).length ? `<ul class="plain">${(r.v.errors as any[]).slice(0, 20).map(er => `<li>${typeof er === 'string' ? esc(er) : `Dòng ${esc(er.line)}: ${esc(er.message)}`}</li>`).join('')}</ul>` : '<div class="notice notice-ok">✓ Không có lỗi.</div>'}`)
+            ${(r.v.errors || []).length ? `<ul class="plain">${(r.v.errors as any[]).slice(0, 20).map(er => `<li>${typeof er === 'string' ? esc(er) : `Dòng ${esc(er.line)}: ${esc(er.message)}`}</li>`).join('')}</ul>` : '<div class="notice notice-ok">Không có lỗi.</div>'}`)
             : errorBox(r.e);
           el.scrollIntoView({ behavior: 'smooth', block: 'center' });
           break;
@@ -993,13 +1035,13 @@ class App {
         ${v.error ? `<div class="notice notice-error">${esc(v.error)}</div>` : ''}
         ${v.restart_needed ? '<div class="notice notice-warn">Khởi động lại node để áp dụng thay đổi ghép máy.</div>' : ''}
         ${v.code ? `<div class="code-box"><span class="mono" id="pair-code">${esc(v.code)}</span>
-            <button class="btn btn-glass btn-sm" id="pair-copy">Sao chép</button></div>
+            <button class="btn btn-sm" id="pair-copy">Sao chép</button></div>
           <div class="muted small">Nhập mã này ở trang Cài đặt của các máy khác. Máy không có mã không kết nối được với cụm.</div>
           <div class="form-row"><button class="btn btn-danger" id="pair-forget">Bỏ ghép (về plaintext)</button></div>`
         : `<div class="muted small">Không bắt buộc trên LAN tin cậy: các node tự tìm nhau. Ghép máy để mã hoá đường truyền (Tailscale, mạng lạ).</div>
            <div class="form-row"><button class="btn btn-primary" id="pair-create">Tạo mã cho cụm mới</button></div>
            <div class="form-row"><input id="pair-join-code" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" aria-label="Mã ghép máy">
-           <button class="btn btn-glass" id="pair-join">Tham gia cụm</button></div>`}`;
+           <button class="btn" id="pair-join">Tham gia cụm</button></div>`}`;
     })() : errorBox(p.e);
 
     const key = getApiKey();
@@ -1020,7 +1062,7 @@ class App {
             <div class="muted small">Node đặt SYNAPSE_API_KEY thì mọi lệnh cần key. Không đặt key thì các thao tác quản trị chỉ được phép
               từ chính máy chạy node. Key chỉ lưu trong trình duyệt này.</div>
             <div class="form-row"><input id="api-key" type="password" value="${esc(key)}" placeholder="SYNAPSE_API_KEY" aria-label="API key">
-              <button class="btn btn-glass" id="api-key-save">Lưu</button>${key ? '<button class="btn btn-danger" id="api-key-clear">Xoá</button>' : ''}</div>`)}
+              <button class="btn" id="api-key-save">Lưu</button>${key ? '<button class="btn btn-danger" id="api-key-clear">Xoá</button>' : ''}</div>`)}
           ${card('Tắt node', `<div class="muted small">Dừng node trên máy này. Các node khác sẽ chia lại layer không có nó.</div>
             <div class="form-row"><button class="btn btn-danger" id="node-quit">Tắt node</button></div>`)}
         </div>
@@ -1061,6 +1103,63 @@ class App {
       if (!confirm('Tắt node trên máy này?')) return;
       try { await api.quit(); } catch { /* the connection drops as the node exits */ }
       toast('Đã gửi lệnh tắt node');
+    });
+  }
+
+  // -- appendix: API -------------------------------------------------------------------------
+  private async viewApi(): Promise<string> {
+    const [status, health, s] = await Promise.all([
+      attempt(() => api.modelsStatus()), attempt(() => api.health()), attempt(() => api.settings()),
+    ]);
+    const base = status.ok ? status.v.base_url : location.origin;
+    const model = (s.ok && s.v.default_model) || (status.ok && status.v.models[0]) || 'HuggingFaceTB/SmolLM2-135M-Instruct';
+    const keyed = !!live.dist?.api_key_required;
+    const auth = keyed ? ` \\\n  -H "Authorization: Bearer $SYNAPSE_API_KEY"` : '';
+    const curl = `curl ${base}/v1/chat/completions \\\n  -H "Content-Type: application/json"${auth} \\\n  -d '{"model": "${model}", "stream": true,\n       "messages": [{"role": "user", "content": "Xin chào"}]}'`;
+    const py = `from openai import OpenAI\n\nclient = OpenAI(base_url="${base}/v1", api_key=${keyed ? '"<SYNAPSE_API_KEY>"' : '"không-cần"'})\nfor chunk in client.chat.completions.create(\n        model="${model}", stream=True,\n        messages=[{"role": "user", "content": "Xin chào"}]):\n    print(chunk.choices[0].delta.content or "", end="")`;
+    const routes: Array<[string, string, string]> = [
+      ['POST', '/v1/chat/completions', 'Chat (tương thích OpenAI, có stream)'],
+      ['GET', '/v1/models', 'Danh sách model (tương thích OpenAI)'],
+      ['GET', '/healthcheck', 'Node còn sống, engine đã sẵn sàng'],
+      ['GET', '/v1/cluster/resources', 'Node, tài nguyên, chia layer, ma trận độ trễ'],
+      ['GET', '/v1/distributed/status', 'Master, TLS, autoscale, đường truyền, phiên bản peer'],
+      ['GET', '/v1/topology', 'Topology và kết nối giữa các node'],
+      ['GET', '/v1/metrics/requests', '200 request gần nhất: token, TTFT, tok/s, lỗi'],
+      ['GET', '/v1/system/info · /v1/system/stats', 'Phần cứng và mức dùng tài nguyên của máy này'],
+      ['POST', '/v1/models/pull · /v1/models/delete', 'Tải phần trọng số của node / xoá model (quản trị)'],
+      ['GET', '/v1/models/search · /compatibility · /checkpoints', 'Tìm trên Hugging Face, model vừa máy, checkpoint'],
+      ['POST', '/v1/models/merge', 'Gộp LoRA adapter vào model gốc (quản trị)'],
+      ['POST', '/v1/training/start · /distributed/start', 'Bắt đầu huấn luyện (quản trị)'],
+      ['GET', '/v1/training/status', 'Tiến độ, loss theo bước'],
+      ['GET·POST', '/v1/datasets/…', 'Liệt kê, tải lên, tạo, liên kết, sửa, kiểm tra, đổi tên, tải về, xoá (quản trị)'],
+      ['GET·POST', '/v1/settings · /v1/cluster/pairing', 'Cài đặt node, ghép máy (quản trị)'],
+      ['GET', '/v1/activity · /v1/logs/terminal', 'Hoạt động và log (quản trị)'],
+      ['POST', '/quit', 'Tắt node (quản trị)'],
+    ];
+    return `
+      ${card('Địa chỉ và trạng thái', `<div class="kv-grid">
+          <div><span>Base URL</span><b class="mono">${esc(base)}/v1</b></div>
+          <div><span>Healthcheck</span><b>${health.ok ? `${esc(health.v.status)}${health.v.model_loaded ? ' · đã nạp model' : ' · chưa nạp model'}` : 'không phản hồi'}</b></div>
+          <div><span>Model trong registry</span><b>${status.ok ? status.v.models.length : '—'}</b></div>
+          <div><span>Xác thực</span><b>${keyed ? 'Bearer SYNAPSE_API_KEY' : 'không (quản trị chỉ từ máy local)'}</b></div>
+        </div>
+        ${status.ok ? '' : errorBox(status.e)}`)}
+      ${card('Gọi từ dòng lệnh', `<pre class="listing" id="ex-curl">${esc(curl)}</pre>
+        <div class="form-row"><button class="btn btn-sm" data-copy="ex-curl">Sao chép</button></div>`)}
+      ${card('Gọi từ Python (thư viện openai)', `<pre class="listing" id="ex-py">${esc(py)}</pre>
+        <div class="form-row"><button class="btn btn-sm" data-copy="ex-py">Sao chép</button></div>
+        <div class="muted small">Mọi ứng dụng chat hỗ trợ "OpenAI-compatible endpoint" đều dùng được base URL ở trên.</div>`)}
+      ${card('Endpoint', `<div class="scroll-x"><table class="data-table"><thead><tr><th>Phương thức</th><th>Đường dẫn</th><th>Chức năng</th></tr></thead><tbody>
+          ${routes.map(([m, p, d]) => `<tr><td class="mono">${m}</td><td class="mono">${esc(p)}</td><td>${esc(d)}</td></tr>`).join('')}
+        </tbody></table></div>
+        <div class="muted small">“Quản trị”: không đặt SYNAPSE_API_KEY thì chỉ gọi được từ chính máy chạy node; có key thì mọi route trừ / và /healthcheck cần Bearer.</div>`)}
+      ${status.ok && status.v.models.length ? card('Model trong registry', `<details class="fold"><summary>Hiện ${status.v.models.length} model mà engine PyTorch/HF nhận</summary><ul class="dash mono">${status.v.models.map(m => `<li>${esc(m)}</li>`).join('')}</ul></details>`) : ''}`;
+  }
+
+  private bindApi() {
+    this.content().querySelectorAll<HTMLElement>('[data-copy]').forEach(b => b.onclick = async () => {
+      try { await navigator.clipboard.writeText(document.getElementById(b.dataset.copy!)!.textContent || ''); toast('Đã sao chép'); }
+      catch { toast('Không sao chép được: hãy chọn và copy tay', 'error'); }
     });
   }
 }

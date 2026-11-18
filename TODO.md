@@ -1,6 +1,6 @@
 # TODO — Synapse AI
 
-Cập nhật: 2026-11-02 · nhánh `distributed-v2`. Chi tiết kỹ thuật và số đo: `PLAN.md`, `README.md`.
+Cập nhật: 2026-11-18 · nhánh `distributed-v2`. Chi tiết kỹ thuật và số đo: `PLAN.md`, `README.md`.
 
 ## Mục tiêu
 
@@ -29,9 +29,9 @@ Cập nhật: 2026-11-02 · nhánh `distributed-v2`. Chi tiết kỹ thuật và
 | Tự phát hiện thiết bị | Có | UDP, Tailscale, file cấu hình tay |
 | Tự chia model theo tài nguyên | Có | Chia theo dải layer, trọng số theo bộ nhớ / tốc độ đo được |
 | Mỗi node chỉ giữ layer của mình trong RAM | Có | `partial_loader` |
-| Mỗi node chỉ tải phần trọng số nó cần | Có | Checkpoint chia nhiều file: chỉ tải file chứa tensor của node, lúc cần (`partial_loader`). Model một file thì vẫn phải tải cả file |
+| Mỗi node chỉ tải phần trọng số nó cần | Có | Checkpoint chia nhiều file: chỉ tải file chứa tensor của node, lúc cần. Model một file: chỉ đọc header và đoạn byte của tensor node cần qua HTTP Range (`partial_loader`) |
 | API tương thích ChatGPT | Có | `/v1/chat/completions`, cổng 52415 |
-| Giao diện | Có | Web UI do node phục vụ tại :52415 (chat, node, model, huấn luyện, dataset, log, cài đặt) |
+| Giao diện | Có | Web UI do node phục vụ tại :52415 (chat, node, model, huấn luyện, dataset, log, cài đặt, phụ lục API) |
 | Nhiều loại máy / GPU | Một phần | PyTorch CPU (CUDA chưa kiểm kỹ); chưa có MLX cho Mac |
 | Nhiều họ model | Một phần | Chạy qua HF; đường nhanh chỉ llama / mistral / qwen2 / qwen3 |
 | Không có master (các node ngang hàng) | Khác | Synapse bầu master; exo thì các node ngang hàng |
@@ -108,6 +108,9 @@ Các bước từng bước: `MULTI_MACHINE.md`.
 
 ### Việc vặt đang mở
 - [x] Toàn bộ test sạch sau đợt sửa chịu lỗi: 439 qua (2026-11-04, chia 4 lượt để không hết RAM).
+- [x] Kiểm lại 2026-11-18: 438 qua, 1 lỗi (`test_backend_exits_after_launcher_hard_kill`: tiến trình con thoát giữa
+      `children()` và `cmdline()`, cổng cố định 59731). Đã sửa test (bỏ qua tiến trình đã thoát, cổng OS cấp).
+      Sau đợt sửa 2026-11-18: toàn bộ 442 test qua (4 lượt), 0 lỗi.
 
 ## Tính năng hỗ trợ mục tiêu nhưng chưa hoàn thiện
 
@@ -149,6 +152,24 @@ Giao diện: chỉ còn web UI. Console/TUI/CLI (`console.py`, `tui.py`, `cli.py
 `viz/topology_viz.py` đã gỡ.
 
 ## Đã làm
+
+### Web UI kiểu bài báo trắng đen, tiến độ tải thật (2026-11-18)
+- Giao diện làm lại theo kiểu bài báo: chữ có chân (font hệ thống, chạy được khi node không có Internet), mục lục đánh số ở
+  lề, mục con §n.k và "Hình n." đánh số tự động, bảng kiểu booktabs, đoạn "Tóm tắt" viết từ số liệu thật. Không dùng màu:
+  đường trên biểu đồ khác nhau bằng nét đứt + hình đánh dấu, node khác nhau bằng mẫu nền (giống nhau trên thanh layer,
+  bảng node, sơ đồ 3D), bảng độ trễ thang xám, trạng thái bằng chữ. Sơ đồ 3D vẽ nét mực như hình kỹ thuật.
+- Thêm: bảng kết nối giữa các node (`/v1/topology`), trang Phụ lục API (base URL, healthcheck, ví dụ curl / Python
+  `openai`, bảng endpoint, model trong registry).
+- Kiểm bằng Chrome headless qua DevTools (giả lập điện thoại 390px thật, không phải cửa sổ hẹp: Chrome headless trên
+  Windows không cho cửa sổ < ~500px nên ảnh chụp cũ ở 390px thật ra là 500px bị cắt): 9 trang × 1440/390px, không lỗi JS,
+  không tràn ngang. Tìm và sửa: form Huấn luyện tràn 31px trên điện thoại, khoảng trắng trên tiêu đề khi trang ngắn.
+- Tiến độ tải model chưa từng chạy: `HFShardDownloader.on_progress` có người nghe (broadcast trong `main.py`) nhưng không
+  ai phát, nên `/v1/download/progress` luôn rỗng. Giờ `/v1/models/pull` báo số file đã tải / tổng (tải phần của node: từng
+  file của `PartialModel.prefetch`; tải cả repo: thanh đếm file của `snapshot_download`), node ghi tiến độ của chính mình,
+  peer nhận qua broadcast. Bộ lọc broadcast so sánh thời điểm với trạng thái (luôn sai) và hỏng khi shard là None: đã sửa
+  (`test_download_progress.py`).
+- Dọn: `ShardDownloader` (ABC đòi `ensure_shard` mà không lớp nào cài) thành Protocol đúng với code; bỏ cờ `--disable-tui`
+  (TUI đã gỡ), mô tả "GRPC Discovery" và comment cổng 5678 cũ trong `main.py`. `PLAN.md` đánh dấu là lịch sử.
 
 ### Web UI có biểu đồ trực tiếp + 3D, sửa /quit (2026-11-04)
 - Backend: `/v1/metrics/requests` (200 request gần nhất: token, TTFT, tok/s, lỗi), `loss_history` trong trạng thái train.

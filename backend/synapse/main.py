@@ -49,7 +49,7 @@ def configure_event_loop():
     return loop
 
 # parse args
-parser = argparse.ArgumentParser(description="Initialize GRPC Discovery")
+parser = argparse.ArgumentParser(description="Synapse AI node")
 parser.add_argument("command", nargs="?", choices=["run", "eval", "train"], help="Command to run")
 parser.add_argument("model_name", nargs="?", help="Model name to run")
 parser.add_argument("--default-model", type=str, default=None, help="Default model")
@@ -73,7 +73,6 @@ parser.add_argument("--chatgpt-api-response-timeout", type=int, default=600, hel
 parser.add_argument("--max-generate-tokens", type=int, default=10000, help="Max tokens to generate in each request")
 parser.add_argument("--inference-engine", type=str, default="pytorch", help="Inference engine (pytorch)")
 # Accepted for old scripts; the terminal UIs were replaced by the web UI.
-parser.add_argument("--disable-tui", action=argparse.BooleanOptionalAction, default=True, help=argparse.SUPPRESS)
 parser.add_argument("--run-model", type=str, help="Specify a model to run directly")
 parser.add_argument("--prompt", type=str, help="Prompt for the model when using --run-model", default="")
 parser.add_argument("--default-temp", type=float, help="Default token sampling temperature", default=0.7)
@@ -137,7 +136,6 @@ inference_engine_name = args.inference_engine if hasattr(args, "inference_engine
 inference_engine = get_inference_engine(inference_engine_name, None)
 shard_downloader: ShardDownloader = inference_engine.shard_downloader
 
-# node_port is now defaulted to 5678 in argparse
 if DEBUG >= 1: print(f"Using node port: {args.node_port}")
 
 args.node_id = args.node_id or get_or_create_node_id(args.node_port or 5678)
@@ -264,12 +262,14 @@ event_router.subscribe("synapse/cluster/status", lambda ev: preemptively_load_sh
 
 last_events: dict[str, tuple[float, RepoProgressEvent]] = {}
 def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
+  """Tell peers about our download progress: at most every 0.2 s per repo,
+  but every status change (in_progress -> complete / failed) goes out."""
   current_time = time.time()
   if event.status == "not_started": return
-  last_event = last_events.get(shard.model_id)
-  if last_event and last_event[1].status == "complete" and event.status == "complete": return
-  if last_event and last_event[0] == event.status and current_time - last_event[0] < 0.2: return
-  last_events[shard.model_id] = (current_time, event)
+  last_event = last_events.get(event.repo_id)
+  if last_event and last_event[1].status == event.status:
+    if event.status != "in_progress" or current_time - last_event[0] < 0.2: return
+  last_events[event.repo_id] = (current_time, event)
   asyncio.create_task(event_router.publish("synapse/cluster/status", json.dumps({"type": "download_progress", "node_id": node.id, "progress": event.to_dict()})))
 shard_downloader.on_progress.register("broadcast").on_next(throttled_broadcast)
 

@@ -27,7 +27,7 @@ from __future__ import annotations
 import copy
 import json
 import os
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
 from torch import nn
@@ -397,13 +397,17 @@ class PartialModel:
         files = {self.index[ck] for ck in map(self._ckpt_name, names) if ck is not None}
         return sorted(files)
 
-    def prefetch(self, start: int, end: int, first: bool, last: bool) -> List[str]:
+    def prefetch(self, start: int, end: int, first: bool, last: bool,
+                 on_file: Optional[Callable[[int, int], None]] = None) -> List[str]:
         """Download (into the HF cache) only the files a shard needs. Files
-        read over HTTP ranges are skipped: their bytes are fetched at load."""
+        read over HTTP ranges are skipped: their bytes are fetched at load.
+        on_file(done, total) is called after each file (progress reporting)."""
         files = self.files_for(start, end, first, last)
-        for name in files:
+        for i, name in enumerate(files, 1):
             if name not in self.remote:
                 self._file(name)
+            if on_file:
+                on_file(i, len(files))
         return files
 
     @staticmethod

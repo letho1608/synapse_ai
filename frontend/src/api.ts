@@ -3,7 +3,7 @@
 import type {
   ActivityEntry, Checkpoint, ClusterResources, Compatibility, Dataset, DatasetValidation,
   DistributedStatus, ModelsList, Pairing, RequestMetric, SearchResult, Settings, SystemInfo,
-  SystemStats, TrainingStatus,
+  SystemStats, TopologyJson, TrainingStatus,
 } from './types';
 
 const KEY_STORAGE = 'synapse.apiKey';
@@ -126,6 +126,10 @@ export const api = {
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   },
+
+  topology: () => call<TopologyJson>('GET', '/v1/topology'),
+  modelsStatus: () => call<{ enabled: boolean; models: string[]; base_url: string }>('GET', '/v1/models/status'),
+  health: () => call<{ status: string; inference_ready?: boolean; model_loaded?: boolean }>('GET', '/healthcheck'),
 
   startDistributedTraining: (body: Record<string, unknown>) =>
     call<{ job_id?: string; message?: string }>('POST', '/v1/training/distributed/start', body),

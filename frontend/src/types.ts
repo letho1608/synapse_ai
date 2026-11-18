@@ -235,3 +235,10 @@ export interface Pairing {
   error: string | null;
   restart_needed: boolean;
 }
+
+/** /v1/topology: Topology.to_dict() */
+export interface TopologyJson {
+  nodes?: Record<string, unknown>;
+  peer_graph?: Record<string, Array<{ from_id: string; to_id: string; description?: string | null }>>;
+  active_node_id?: string | null;
+}

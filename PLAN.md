@@ -1,3 +1,7 @@
+> **Lịch sử, không còn là kế hoạch hiện hành (2026-11-18).** Việc cần làm và hiện trạng nằm ở `TODO.md`. Một số quyết định
+> dưới đây đã bị thay: hướng "CLI-first, không dashboard" (Phần E) đã đổi thành web UI và console/TUI/CLI đã gỡ (2026-11-03);
+> cổng node mặc định là 46051 (không còn 50051); số test ở đây là số của thời điểm đó.
+
 # PLAN.md — Việc còn lại với synapse_ai
 
 **Nguồn:** deep-dive phase 4 (ngày 2026-07-31) + đối chiếu code ngày 2026-09-11.

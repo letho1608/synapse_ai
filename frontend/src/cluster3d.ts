@@ -1,8 +1,11 @@
-// 3D view of the cluster: nodes on a ring in pipeline order, links between
-// consecutive stages, particles flowing along them (faster while requests run),
-// a ring per node showing its share of the layers, HTML labels projected on top.
+// 3D view of the cluster drawn as a technical figure in black ink: nodes on a
+// ring in pipeline order (white solids with wire edges, size ~ RAM), solid
+// links between consecutive stages and a dashed return path, dots flowing
+// along them (faster while requests run), an arc per node for its share of the
+// layers, HTML labels projected on top.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { patternClass } from './charts';
 import type { ClusterResources, DistributedStatus } from './types';
 
 export interface NodeView {
@@ -18,12 +21,9 @@ export interface NodeView {
   standby: boolean;
 }
 
-function cssColor(name: string, fallback: string): THREE.Color {
-  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  try { return new THREE.Color(v || fallback); } catch { return new THREE.Color(fallback); }
-}
-
-const SLOT_VARS = ['--series-1', '--series-2', '--series-3', '--series-4', '--series-5', '--series-6', '--series-7', '--series-8'];
+const INK = 0x111111;
+const HAIR = 0xc8c8c8;
+const PAPER = 0xffffff;
 
 export function nodeViews(c: ClusterResources | null, d: DistributedStatus | null, slot: (id: string) => number): NodeView[] {
   if (!c) return [];
@@ -47,16 +47,14 @@ export function nodeViews(c: ClusterResources | null, d: DistributedStatus | nul
 interface NodeObj {
   view: NodeView;
   group: THREE.Group;
-  core: THREE.Mesh;
-  halo: THREE.Mesh;
-  ring: THREE.Mesh;
+  body: THREE.Group;      // solid + edges, pulses with load
   label: HTMLDivElement;
 }
 
 export class Cluster3D {
   private renderer: THREE.WebGLRenderer | null = null;
   private scene = new THREE.Scene();
-  private camera = new THREE.PerspectiveCamera(45, 1, 0.1, 200);
+  private camera = new THREE.PerspectiveCamera(40, 1, 0.1, 200);
   private controls: OrbitControls | null = null;
   private nodes: NodeObj[] = [];
   private links: THREE.Object3D[] = [];
@@ -88,28 +86,22 @@ export class Cluster3D {
       return;
     }
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setClearColor(0x000000, 0);
+    this.renderer.setClearColor(PAPER, 1);
     host.append(this.renderer.domElement, this.labels);
 
-    this.camera.position.set(0, 7, 13);
+    this.camera.position.set(0, 7, 14);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.autoRotate = !this.reduced;
-    this.controls.autoRotateSpeed = 0.6;
+    this.controls.autoRotateSpeed = 0.4;
     this.controls.minDistance = 6;
     this.controls.maxDistance = 30;
     this.controls.maxPolarAngle = Math.PI * 0.48;
 
-    this.scene.add(new THREE.AmbientLight(0xffffff, 0.35));
-    const key = new THREE.PointLight(0x9fd8ff, 60, 60);
-    key.position.set(0, 10, 6);
-    this.scene.add(key);
-    const grid = new THREE.GridHelper(40, 40, 0x1d3550, 0x14243a);
-    (grid.material as THREE.Material).transparent = true;
-    (grid.material as THREE.Material).opacity = 0.5;
+    const grid = new THREE.GridHelper(40, 40, HAIR, 0xe6e6e3);
     grid.position.y = -1.6;
     this.scene.add(grid);
-    this.scene.fog = new THREE.Fog(0x0a0e1a, 18, 42);
+    this.scene.fog = new THREE.Fog(PAPER, 16, 40);
 
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(host);
@@ -165,7 +157,7 @@ export class Cluster3D {
   private labelHtml(v: NodeView): string {
     const tags = [v.master ? 'master' : '', v.self ? 'máy này' : '', v.standby ? 'dự phòng' : ''].filter(Boolean);
     const esc = (s: string) => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
-    return `<div class="viz3d-name"><i style="background:var(${SLOT_VARS[Math.min(v.slot, 7)]})"></i>${esc(v.name)}</div>
+    return `<div class="viz3d-name"><span class="swatch ${patternClass(v.slot)}"></span>${esc(v.name)}</div>
       <div class="viz3d-meta">layer ${esc(v.layers)} · CPU ${v.cpu === null ? '—' : Math.round(v.cpu) + '%'}</div>
       ${tags.length ? `<div class="viz3d-tags">${tags.map(t => `<span>${t}</span>`).join('')}</div>` : ''}`;
   }
@@ -176,46 +168,46 @@ export class Cluster3D {
     const R = n <= 1 ? 0 : Math.max(3.2, n * 1.15);
     const maxRam = Math.max(...views.map(v => v.ramGb), 1);
     const pos: THREE.Vector3[] = [];
+    const ink = new THREE.LineBasicMaterial({ color: INK });
     views.forEach((v, i) => {
       // start on the left so the first stages read left to right from the default camera
       const a = (i / Math.max(1, n)) * Math.PI * 2 + Math.PI;
       const p = new THREE.Vector3(Math.cos(a) * R, 0, Math.sin(a) * R);
       pos.push(p);
-      const color = cssColor(SLOT_VARS[Math.min(v.slot, 7)], '#3987e5');
       const size = 0.55 + 0.45 * Math.sqrt(v.ramGb / maxRam);
       const group = new THREE.Group();
       group.position.copy(p);
-      const core = new THREE.Mesh(
-        new THREE.SphereGeometry(size, 40, 28),
-        new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.2 }),
-      );
-      const halo = new THREE.Mesh(
-        new THREE.SphereGeometry(size * 1.55, 32, 20),
-        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.08, depthWrite: false }),
-      );
-      // ring arc = this node's share of the layers
-      const ring = new THREE.Mesh(
-        new THREE.TorusGeometry(size * 1.35, 0.045, 10, 96, Math.max(0.05, v.share) * Math.PI * 2),
-        new THREE.MeshBasicMaterial({ color }),
-      );
-      ring.rotation.x = Math.PI / 2;
+      // white solid hides what is behind it; its wire edges are the drawing
+      const geo = new THREE.IcosahedronGeometry(size, 1);
+      const solid = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+        color: PAPER, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+      }));
+      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 1), ink.clone());
+      const body = new THREE.Group();
+      body.add(solid, edges);
+      // arc = this node's share of the layers, on a pale full track
       const track = new THREE.Mesh(
-        new THREE.TorusGeometry(size * 1.35, 0.02, 8, 96),
-        new THREE.MeshBasicMaterial({ color: 0x2a3b55, transparent: true, opacity: 0.7 }),
+        new THREE.TorusGeometry(size * 1.4, 0.012, 6, 96),
+        new THREE.MeshBasicMaterial({ color: HAIR }),
       );
       track.rotation.x = Math.PI / 2;
-      // pillar to the floor anchors the node in space
-      const pillar = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.02, 0.02, 1.6, 6),
-        new THREE.MeshBasicMaterial({ color: 0x2a3b55 }),
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(size * 1.4, 0.045, 8, 96, Math.max(0.05, v.share) * Math.PI * 2),
+        new THREE.MeshBasicMaterial({ color: INK }),
       );
-      pillar.position.y = -0.8;
-      group.add(core, halo, track, ring, pillar);
+      ring.rotation.x = Math.PI / 2;
+      // leader line to the floor anchors the node in space
+      const pillar = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, -size, 0), new THREE.Vector3(0, -1.6, 0)]),
+        new THREE.LineDashedMaterial({ color: INK, dashSize: 0.08, gapSize: 0.08 }),
+      );
+      pillar.computeLineDistances();
+      group.add(body, track, ring, pillar);
       this.scene.add(group);
       const label = document.createElement('div');
       label.className = 'viz3d-label';
       this.labels.appendChild(label);
-      this.nodes.push({ view: v, group, core, halo, ring, label });
+      this.nodes.push({ view: v, group, body, label });
     });
 
     // pipeline links: stage i -> i+1, and the last stage back to the first
@@ -231,17 +223,24 @@ export class Cluster3D {
         if (n === 2) mid.z += isReturn ? 1.6 : -1.6;
         const curve = new THREE.CatmullRomCurve3([a.clone(), mid, b.clone()]);
         this.curves.push(curve);
-        const tube = new THREE.Mesh(
-          new THREE.TubeGeometry(curve, 48, isReturn ? 0.02 : 0.035, 8, false),
-          new THREE.MeshBasicMaterial({ color: isReturn ? 0x3b4d68 : 0x5aa9e6, transparent: true, opacity: isReturn ? 0.5 : 0.75 }),
-        );
-        this.scene.add(tube);
-        this.links.push(tube);
-        const count = isReturn ? 2 : 5;
+        let link: THREE.Object3D;
+        if (isReturn) {
+          const line = new THREE.Line(
+            new THREE.BufferGeometry().setFromPoints(curve.getPoints(64)),
+            new THREE.LineDashedMaterial({ color: INK, dashSize: 0.18, gapSize: 0.14 }),
+          );
+          line.computeLineDistances();
+          link = line;
+        } else {
+          link = new THREE.Mesh(new THREE.TubeGeometry(curve, 48, 0.022, 6, false), new THREE.MeshBasicMaterial({ color: INK }));
+        }
+        this.scene.add(link);
+        this.links.push(link);
+        const count = isReturn ? 2 : 4;
         for (let k = 0; k < count; k++) {
           const mesh = new THREE.Mesh(
-            new THREE.SphereGeometry(isReturn ? 0.06 : 0.09, 12, 8),
-            new THREE.MeshBasicMaterial({ color: isReturn ? 0x9fb3cc : 0xbfe6ff }),
+            new THREE.SphereGeometry(isReturn ? 0.06 : 0.085, 12, 8),
+            new THREE.MeshBasicMaterial({ color: INK }),
           );
           this.scene.add(mesh);
           this.particles.push({ mesh, curve: this.curves.length - 1, t: k / count });
@@ -254,7 +253,7 @@ export class Cluster3D {
     this.raf = requestAnimationFrame(this.loop);
     if (!this.renderer) return;
     const dt = Math.min(0.05, this.clock.getDelta());
-    const speed = (this.busy ? 0.55 : 0.12) * (this.reduced ? 0.3 : 1);
+    const speed = (this.busy ? 0.55 : 0.1) * (this.reduced ? 0.3 : 1);
     for (const p of this.particles) {
       p.t = (p.t + dt * speed) % 1;
       p.mesh.position.copy(this.curves[p.curve].getPointAt(p.t));
@@ -262,10 +261,8 @@ export class Cluster3D {
     const t = this.clock.elapsedTime;
     for (const n of this.nodes) {
       const load = (n.view.cpu ?? 0) / 100;
-      const pulse = 1 + (this.reduced ? 0 : 0.04 * Math.sin(t * (1.5 + 3 * load)));
-      n.core.scale.setScalar(pulse);
-      (n.core.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.35 + 0.65 * load;
-      (n.halo.material as THREE.MeshBasicMaterial).opacity = 0.05 + 0.12 * load;
+      n.body.scale.setScalar(1 + (this.reduced ? 0 : 0.035 * load * Math.sin(t * (1.5 + 3 * load))));
+      n.body.rotation.y += dt * (0.1 + 0.6 * load) * (this.reduced ? 0 : 1);
     }
     this.controls?.update();
     this.renderer.render(this.scene, this.camera);
@@ -275,7 +272,7 @@ export class Cluster3D {
     const h = this.renderer.domElement.clientHeight;
     for (const n of this.nodes) {
       const p = n.group.position.clone();
-      p.y += 1.3;
+      p.y += 1.4;
       p.project(this.camera);
       const behind = p.z > 1;
       n.label.style.display = behind ? 'none' : '';

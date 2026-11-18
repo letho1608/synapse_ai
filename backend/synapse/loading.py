@@ -4,9 +4,8 @@ Handles loading models from HuggingFace cache.
 """
 
 import os
-from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Dict, Optional, Protocol
 from dataclasses import dataclass
 from synapse.inference.shard import Shard
 from synapse.helpers import AsyncCallbackSystem
@@ -47,16 +46,14 @@ class RepoProgressEvent:
         )
 
 
-class ShardDownloader(ABC):
+class ShardDownloader(Protocol):
+    """Download progress hub (HFShardDownloader). Weights themselves are fetched
+    by the engine's PartialModel, only the files of the layers a node serves."""
 
     @property
-    @abstractmethod
-    def on_progress(self) -> AsyncCallbackSystem[str, tuple[Shard, RepoProgressEvent]]:
-        pass
+    def on_progress(self) -> AsyncCallbackSystem[str, tuple[Shard, RepoProgressEvent]]: ...
 
-    @abstractmethod
-    async def ensure_shard(self, shard: Shard, inference_engine_name: str) -> Path:
-        pass
+    def report(self, shard: Optional[Shard], repo_id: str, status: str, done: int = 0, total: int = 0) -> None: ...
 
 
 def get_models_dir():

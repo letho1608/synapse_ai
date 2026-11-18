@@ -17,6 +17,8 @@ import psutil
 
 from synapse.helpers import PARENT_PID_ENV, start_parent_watchdog
 
+from _ports import free_ports
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -45,20 +47,29 @@ def test_watchdog_inert_without_valid_parent(monkeypatch):
     assert start_parent_watchdog(_exit=lambda c: None) is None
 
 
+def _is_backend(proc) -> bool:
+    # A child can exit between children() and cmdline() (the launcher spawns
+    # short-lived helpers too); that one is simply not the backend.
+    try:
+        return "synapse" in " ".join(proc.cmdline())
+    except psutil.Error:
+        return False
+
+
 def test_backend_exits_after_launcher_hard_kill():
-    port = 59731
+    api_port, node_port = free_ports(2)
     env = dict(os.environ)
     env.pop(PARENT_PID_ENV, None)
     launcher = subprocess.Popen(
-        [sys.executable, os.path.join(ROOT, "main.py"), "--chatgpt-api-port", str(port),
-         "--disable-tui"],
+        [sys.executable, os.path.join(ROOT, "main.py"), "--chatgpt-api-port", str(api_port),
+         "--node-port", str(node_port)],
         cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     backend = None
     try:
         deadline = time.time() + 60
         while time.time() < deadline and backend is None:
             kids = psutil.Process(launcher.pid).children()
-            backend = next((k for k in kids if "synapse" in " ".join(k.cmdline())), None)
+            backend = next((k for k in kids if _is_backend(k)), None)
             time.sleep(0.2)
         assert backend is not None, "launcher never spawned the backend"
         launcher.kill()  # hard kill: no finally/atexit in the launcher runs
